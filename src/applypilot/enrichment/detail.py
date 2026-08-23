@@ -19,6 +19,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 from urllib.parse import urljoin
 
+import httpx
 from bs4 import BeautifulSoup
 from playwright.sync_api import sync_playwright
 
@@ -33,6 +34,46 @@ UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
 
 # Sites that block scraping -- skip detail extraction entirely
 SKIP_DETAIL_SITES = {"glassdoor", "google", "Workopolis"}
+
+# Confirmed live 2026-08-23: two "score >=8" LinkedIn jobs were tailored,
+# cover-lettered, and only THEN found expired at apply time -- burning a
+# full local-LLM tailor+cover cycle (minutes, real compute) on a posting
+# that was never applyable. LinkedIn marks a closed listing with this class
+# in the raw server-rendered HTML, visible to a plain HTTP GET (no
+# JS/browser needed) -- verified against both a known-expired posting (hit)
+# and the job actively being tailored at the time (no hit, no false
+# positive). Cheap enough to run right before tailoring, not just at apply.
+_LINKEDIN_CLOSED_MARKER = "closed-job"
+
+
+def check_listing_still_open(url: str, site: str = "", timeout: float = 8.0) -> bool | None:
+    """Best-effort check for whether a job listing is still accepting
+    applications, without spinning up a browser.
+
+    Only LinkedIn has a confirmed, reliable marker right now (see
+    _LINKEDIN_CLOSED_MARKER) -- other sites return None (unknown) rather
+    than risk a false "closed" skip on a site whose HTML wasn't verified.
+    A network failure also returns None: "couldn't check" must never be
+    treated the same as "confirmed closed".
+
+    Args:
+        url: The job listing URL to check.
+        site: The job's site field, used to pick the right detector.
+        timeout: Request timeout in seconds.
+
+    Returns:
+        False if confirmed closed, True if confirmed open, None if this
+        site/URL isn't supported or the check couldn't complete.
+    """
+    if "linkedin.com" not in url and (site or "").lower() != "linkedin":
+        return None
+    try:
+        resp = httpx.get(url, headers={"User-Agent": UA}, timeout=timeout, follow_redirects=True)
+        resp.raise_for_status()
+    except httpx.HTTPError:
+        log.debug("check_listing_still_open: request failed for %s", url, exc_info=True)
+        return None
+    return _LINKEDIN_CLOSED_MARKER not in resp.text
 
 # Module-level proxy config (set from CLI or caller)
 _PROXY_CONFIG: dict | None = None

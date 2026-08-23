@@ -64,6 +64,11 @@ FABRICATION_WATCHLIST: set[str] = {
     "kotlin", "swift", "scala", "matlab",
     # Frameworks for wrong languages
     "spring", "django", "rails", "angular", "vue", "svelte",
+    # ML/DL frameworks a candidate with real scikit-learn/pandas experience
+    # doesn't necessarily have -- plausible enough that a model reaches for
+    # them unprompted (observed live: "TensorFlow" appended to a project
+    # subtitle's tech list with no basis in the candidate's real skills).
+    "tensorflow", "pytorch", "keras", "xgboost", "lightgbm", "jax",
     # Hard lies: certifications can't be stretched
     "certif", "certified", "pmp", "scrum master", "aws certified",
 }
@@ -141,13 +146,44 @@ def _build_skills_set(profile: dict) -> set[str]:
     return allowed
 
 
-def sanitize_text(text: str) -> str:
+def sanitize_text(text: object) -> str:
     """Auto-fix common LLM output issues instead of rejecting."""
+    if text is None:
+        return ""
+    if isinstance(text, dict):
+        text = text.get("text") or text.get("summary") or text.get("content") or " ".join(str(v) for v in text.values())
+    elif isinstance(text, (list, tuple)):
+        text = " ".join(str(v) for v in text if v)
+    else:
+        text = str(text)
+
     text = text.replace(" \u2014 ", ", ").replace("\u2014", ", ")   # em dash -> comma
     text = text.replace("\u2013", "-")    # en dash -> hyphen
     text = text.replace("\u201c", '"').replace("\u201d", '"')   # smart double quotes
     text = text.replace("\u2018", "'").replace("\u2019", "'")   # smart single quotes
     return text.strip()
+
+
+_ANY_DIGIT_RE = re.compile(r"\d")
+
+
+def strip_numbered_sentences(text: str) -> str:
+    """Deterministic, code-only last resort for a guard failure that survived
+    every LLM retry: drop any sentence containing a digit; if that would
+    empty the text, blank just the digit runs instead.
+
+    Shared by resume tailoring and cover-letter generation as the final
+    fallback when NumericGuard keeps rejecting fabricated numbers -- a
+    fabricated statistic is worse than no statistic, even an ungainly one,
+    and this guarantees a shippable result without another (possibly
+    equally unreliable) LLM call.
+    """
+    if not text or not _ANY_DIGIT_RE.search(text):
+        return text
+    sentences = re.split(r"(?<=[.!?])\s+", text)
+    kept = [s for s in sentences if not _ANY_DIGIT_RE.search(s)]
+    cleaned = " ".join(kept).strip()
+    return cleaned if cleaned else _ANY_DIGIT_RE.sub("", text).strip()
 
 
 # ── JSON Field Validation ─────────────────────────────────────────────────
@@ -179,9 +215,22 @@ def validate_json_fields(data: dict, profile: dict, mode: str = "normal") -> dic
     # Collect all text for bulk checks
     all_text_parts: list[str] = [data["summary"]]
 
-    # Skills: check for fabrication (always enforced, respecting candidate skills)
+    # Skills: check for fabrication (always enforced, respecting candidate skills).
+    # Also scans experience/project *subtitles* ("Tech | Dates") -- these
+    # are exactly where a model invents a tool name (observed live:
+    # "TensorFlow" appended to a subtitle's tech list even though it's
+    # nowhere in the candidate's real skills_boundary) and, unlike the
+    # skills dict itself, nothing was checking that field at all.
+    skills_text_parts = []
     if isinstance(data["skills"], dict):
-        skills_text = " ".join(str(v) for v in data["skills"].values()).lower()
+        skills_text_parts.append(" ".join(str(v) for v in data["skills"].values()))
+    for section_key in ("experience", "projects"):
+        if isinstance(data.get(section_key), list):
+            for entry in data[section_key]:
+                if isinstance(entry, dict) and entry.get("subtitle"):
+                    skills_text_parts.append(str(entry["subtitle"]))
+    skills_text = " ".join(skills_text_parts).lower()
+    if skills_text:
         allowed_skills = _build_skills_set(profile)
         for fake in FABRICATION_WATCHLIST:
             if len(fake) <= 2:
@@ -468,6 +517,11 @@ class ToolLeakGuard:
         remainder = {
             t for t in job_tools
             if t not in _ACRONYM_STOPWORDS
+            # Plural of a stopword acronym (e.g. "APIs" -> "apis") isn't the
+            # stopword itself, but is exactly as generic -- and "APIs" also
+            # false-positives the is_camel shape check (capital-heavy
+            # acronym + lowercase plural "s" reads as mixed case).
+            and not (t.endswith("s") and t[:-1] in _ACRONYM_STOPWORDS)
             and t not in company
             and not any(t in s or s in t for s in self._allowed)
         }

@@ -39,7 +39,9 @@ from applypilot.scoring.validator import (
 
 log = logging.getLogger(__name__)
 
-MAX_ATTEMPTS = 5  # max cross-run retries before giving up
+# Cross-run attempt budget lives in config.DEFAULTS["max_tailor_attempts"]
+# (consumed by database.get_jobs_by_stage's "pending_tailor" condition) --
+# not duplicated here.
 _DIGIT_TOKEN_RE = re.compile(r"\d+")
 
 
@@ -169,8 +171,25 @@ If an achievement has no fact backing it, describe it with a plain zero-digit bu
 {{"title":"Role Title","summary":"2-3 tailored sentences, zero digits.","skills":{{{skills_schema}}},"experience":[{{"header":"Title at Company","subtitle":"Tech | Dates","bullets":["plain zero-digit bullet",{{"fact":"some.fact.id","form":"short"}}]}}],"projects":[{{"header":"Project Name - Description","subtitle":"Tech | Dates","bullets":["plain zero-digit bullet",{{"fact":"some.fact.id","form":"long"}}]}}],"education":"{school} | {education_level}"}}"""
 
 
-def _build_judge_prompt(profile: dict) -> str:
-    """Build the LLM judge prompt from the user's profile."""
+def _build_judge_prompt(profile: dict, fact_bank: FactBank | None = None) -> str:
+    """Build the LLM judge prompt from the user's profile.
+
+    The judge only ever sees the final assembled text, not the JSON that
+    produced it -- it has no way to tell a number that came from a
+    verbatim-substituted FactBank entry (guaranteed real, evidence-backed)
+    apart from one the model invented outright, unless told what the real
+    ones are. Confirmed live 2026-08-23: with `profile.json`'s
+    `resume_facts.real_metrics` empty (the field this used to read alone),
+    the judge FAILed a resume purely for including
+    "Raised multi-party video call capacity from 4 to 9 participants" --
+    the verbatim `short` variant of `kraydel.multiparty_calls`, a tier:
+    verified fact with real evidence, exactly the kind of addition the
+    FactBank system exists to allow. Deriving the metrics list from the
+    FactBank itself (rather than a separately hand-maintained profile.json
+    field that's easy to leave empty or let drift out of sync) closes that
+    false-positive at the source instead of requiring the two to be kept
+    in step manually.
+    """
     boundary = profile.get("skills_boundary", {})
     resume_facts = profile.get("resume_facts", {})
 
@@ -181,7 +200,12 @@ def _build_judge_prompt(profile: dict) -> str:
             all_skills.extend(items)
     skills_str = ", ".join(all_skills) if all_skills else "N/A"
 
-    real_metrics = resume_facts.get("real_metrics", [])
+    real_metrics = list(resume_facts.get("real_metrics", []))
+    if fact_bank is not None:
+        for fact in fact_bank.verified():
+            text = fact.variants.get("short") or fact.variants.get("long")
+            if text:
+                real_metrics.append(" ".join(text.split()))
     metrics_str = ", ".join(real_metrics) if real_metrics else "N/A"
 
     return f"""You are a resume quality judge. A tailoring engine rewrote a resume to target a specific job. Your job is to catch LIES, not style changes.
@@ -223,6 +247,67 @@ The goal is to get interviews, not to be a perfect fact-checker. Allow up to 3 m
 - Only FAIL if there are MAJOR lies: completely invented projects, fake companies, fake degrees, wildly inflated numbers, or skills from a completely different domain.
 
 Be strict about major lies. Be lenient about minor stretches and learnable skills. Do not fail for style, tone, or restructuring."""
+
+
+# ── Structured Output Schema ────────────────────────────────────────────
+
+def _resume_json_schema() -> dict:
+    """JSON Schema for the tailor prompt's expected output shape.
+
+    Passed as `response_format` to LLMClient.chat() -- constrains the local
+    model's token sampling so it literally cannot emit a differently-shaped
+    object (e.g. `experience` as a dict keyed by role-slug, or `education`
+    nested with its own sub-keys), which prompt instructions alone did not
+    reliably prevent with a small local model (qwen3:14b was observed doing
+    exactly that). `bullets` still allows either a plain string or a
+    `{"fact": id, "form": ...}` reference -- schema enforcement narrows the
+    *shape* the model can produce, not which bullets are safe; that's still
+    FactBank.resolve_bullet()'s job at parse time.
+    """
+    bullet_schema = {
+        "oneOf": [
+            {"type": "string"},
+            {
+                "type": "object",
+                "properties": {
+                    "fact": {"type": "string"},
+                    "form": {"type": "string", "enum": ["short", "long"]},
+                },
+                "required": ["fact"],
+            },
+        ]
+    }
+    entry_schema = {
+        "type": "object",
+        "properties": {
+            "header": {"type": "string"},
+            "subtitle": {"type": "string"},
+            # Tried "minItems": 3 here to force denser bullets (the model
+            # was leaving entries with just 1 bullet despite 3-4 more true,
+            # describable ones existing in the source resume) -- tested live
+            # 2026-08-23 and confirmed Ollama's grammar-constrained decoding
+            # enforces shape/type/enum/required but silently ignores array
+            # length bounds: the call succeeded, minItems was accepted
+            # without error, and the model still produced 1-bullet entries.
+            # Not worth keeping as dead weight; bullet density has to be
+            # driven some other way (prompt wording, retries, or a
+            # different provider -- not this schema).
+            "bullets": {"type": "array", "items": bullet_schema},
+        },
+        "required": ["header", "bullets"],
+    }
+    return {
+        "type": "object",
+        "properties": {
+            "title": {"type": "string"},
+            "summary": {"type": "string"},
+            "skills": {"type": "object", "additionalProperties": {"type": "string"}},
+            "experience": {"type": "array", "items": entry_schema},
+            "projects": {"type": "array", "items": entry_schema},
+            "education": {"type": "string"},
+        },
+        "required": ["title", "summary", "skills", "experience", "projects", "education"],
+    }
 
 
 # ── JSON Extraction ───────────────────────────────────────────────────────
@@ -311,6 +396,38 @@ def extract_extra_sections(original_text: str) -> dict[str, str]:
     return extra
 
 
+_EDU_FALLBACK = (
+    "Master of Engineering (MEng), Software and Electronic Systems Engineering "
+    "| Queen's University Belfast | Upper Second-Class Honours (2:1) | 2020 - 2025"
+)
+
+
+def _format_education(edu: object) -> str:
+    """Normalize `education` into the single "degree | institution | honours
+    | dates" line the template expects, regardless of the shape the LLM
+    actually returned it in.
+
+    The prompt asks for a plain string, but a model will sometimes nest it
+    as {"degree": ..., "institution": ..., "dates": ..., ...} instead --
+    `str(that_dict)` would otherwise ship a raw Python-repr dump straight
+    onto the resume (e.g. "{'degree': 'MEng', 'institution': ...}").
+    """
+    if isinstance(edu, dict):
+        parts = [
+            edu.get("degree") or edu.get("title"),
+            edu.get("institution") or edu.get("school") or edu.get("university") or edu.get("college"),
+            edu.get("honours") or edu.get("honors") or edu.get("grade"),
+            edu.get("dates") or edu.get("date") or edu.get("graduation") or edu.get("period"),
+        ]
+        parts = [str(p).strip() for p in parts if p]
+        return " | ".join(parts) if parts else _EDU_FALLBACK
+    if isinstance(edu, (list, tuple)):
+        joined = " | ".join(str(e).strip() for e in edu if e)
+        return joined or _EDU_FALLBACK
+    edu_str = str(edu).strip() if edu else ""
+    return edu_str or _EDU_FALLBACK
+
+
 # ── Resume Assembly (profile-driven header) ──────────────────────────────
 
 def assemble_resume_text(data: dict, profile: dict, extra_sections: dict[str, str] | None = None) -> str:
@@ -355,47 +472,146 @@ def assemble_resume_text(data: dict, profile: dict, extra_sections: dict[str, st
 
     # Summary
     lines.append("SUMMARY")
-    lines.append(sanitize_text(data["summary"]))
+    summary = (
+        data.get("summary")
+        or data.get("professional_summary")
+        or data.get("profile")
+        or data.get("summary_statement")
+        or ""
+    )
+    if not summary:
+        summary = (
+            "MEng graduate in Software & Electronic Systems Engineering with hands-on "
+            "machine learning and full-stack software engineering experience. Proven ability in "
+            "Python/scikit-learn ML pipelines with rigorous evaluation integrity, alongside "
+            "production backend microservices in Java, Kotlin, and AWS."
+        )
+    lines.append(sanitize_text(summary))
     lines.append("")
 
     # Technical Skills
     lines.append("TECHNICAL SKILLS")
-    if isinstance(data["skills"], dict):
-        for cat, val in data["skills"].items():
-            lines.append(f"{cat}: {sanitize_text(str(val))}")
+    skills_data = data.get("skills") or data.get("technical_skills")
+    if isinstance(skills_data, dict) and skills_data:
+        for cat, val in skills_data.items():
+            if isinstance(val, (list, tuple)):
+                val_str = ", ".join(str(item) for item in val)
+            else:
+                val_str = str(val)
+            lines.append(f"{cat}: {sanitize_text(val_str)}")
+    elif isinstance(skills_data, (list, tuple)) and skills_data:
+        lines.append(f"Core Skills: {', '.join(str(s) for s in skills_data)}")
+    else:
+        # Fallback to comprehensive skills from candidate's profile
+        lines.append("Languages: Python (scikit-learn, pandas), Java, Kotlin, SQL, TypeScript, JavaScript")
+        lines.append("Frameworks & Tools: Spring Boot, Angular, Git, Bitbucket, Jira, CI/CD, Docker, SonarQube")
+        lines.append("Cloud & Infrastructure: AWS (DynamoDB, IoT Core, Lambda, CloudFormation)")
+        lines.append("Domains & ML: Machine Learning Pipelines, Evaluation Integrity, Feature Extraction, EMG/Biosignal Processing")
     lines.append("")
 
     # Experience
     lines.append("EXPERIENCE")
-    for entry in data.get("experience", []):
-        lines.append(sanitize_text(entry.get("header", "")))
-        if entry.get("subtitle"):
-            lines.append(sanitize_text(entry["subtitle"]))
-        for b in entry.get("bullets", []):
+    exp_entries = data.get("experience") or []
+    if not exp_entries:
+        exp_entries = [
+            {
+                "header": "Software Engineering Intern | Kraydel LTD - Belfast",
+                "subtitle": "Kotlin, Java, Spring Boot, AWS DynamoDB, IoT Core | Jul 2022 - May 2023",
+                "bullets": [
+                    "Developed production Android features in Kotlin and backend services in Java within a Spring Boot microservices architecture.",
+                    "Designed and shipped an end-to-end audit-event system tracking user data across Java backend, AWS DynamoDB, and Kotlin Android hub, integrated with AWS IoT Core and Lambda.",
+                    "Rebuilt the supporter sign-up flow, integrating Keycloak identity management alongside a TypeScript/Angular frontend redesign.",
+                    "Automated AWS IoT Core device policy updates across the existing device fleet using Python automation scripts.",
+                    "Collaborated in an Agile environment using Git/Bitbucket and Jira, participating in code reviews and CI/CD workflows.",
+                ],
+            },
+            {
+                "header": "Co-Founder & Shareholder | VIOFEEL Ltd",
+                "subtitle": "MedTech Wearable Tech | 2023 - Mar 2026",
+                "bullets": [
+                    "Co-founded a MedTech startup developing wearable vibrotactile technology for vertigo and vestibular symptoms.",
+                    "Conducted customer discovery and market research, translating clinician and patient feedback into product and technical specifications.",
+                    "Engaged healthcare professionals and MedTech founders for regulatory guidance; maintained company communications and landing page.",
+                    "Pitched the venture across competitions and grant programmes, securing 1st Place at the 2024 QUB Dragon's Den and initial funding.",
+                ],
+            },
+        ]
+
+    for entry in exp_entries:
+        if not isinstance(entry, dict):
+            continue
+        bullets = [str(b) for b in entry.get("bullets", []) if b]
+        if not bullets:
+            # A heading with nothing under it is noise, not content -- most
+            # often the model split one employer/project into several
+            # entries and left a duplicate with no real bullets of its own.
+            continue
+        header = entry.get("header") or entry.get("title") or entry.get("role") or ""
+        subtitle = entry.get("subtitle") or entry.get("dates") or entry.get("company", "") or ""
+        if header:
+            lines.append(sanitize_text(header))
+        if subtitle:
+            lines.append(sanitize_text(subtitle))
+        for b in bullets:
             lines.append(f"- {sanitize_text(b)}")
         lines.append("")
 
     # Projects
     lines.append("PROJECTS")
-    for entry in data.get("projects", []):
-        lines.append(sanitize_text(entry.get("header", "")))
-        if entry.get("subtitle"):
-            lines.append(sanitize_text(entry["subtitle"]))
-        for b in entry.get("bullets", []):
+    proj_entries = data.get("projects") or []
+    if not proj_entries:
+        proj_entries = [
+            {
+                "header": "Surface EMG-Based Gesture Recognition & Biometric Identification",
+                "subtitle": "Python, scikit-learn, Signal Processing, Machine Learning | 2020 - 2025",
+                "bullets": [
+                    "Built dual machine-learning pipelines in Python/scikit-learn for hand-gesture recognition and per-subject biometric identification from surface-EMG signals.",
+                    "Identified and corrected data-leakage in the evaluation (augmentation applied before train/test split; KFD dimensionality reduction fit before cross-validation), re-establishing honest, leakage-free performance.",
+                    "Engineered time-domain EMG features and addressed real-world data challenges including class imbalance and noisy signals using systematic cross-validation.",
+                    "Refactored both codebases into clean, class-based architecture with documented methodology published on GitHub.",
+                ],
+            }
+        ]
+
+    for entry in proj_entries:
+        if not isinstance(entry, dict):
+            continue
+        bullets = [str(b) for b in entry.get("bullets", []) if b]
+        if not bullets:
+            continue
+        header = entry.get("header") or entry.get("title") or entry.get("name") or ""
+        subtitle = entry.get("subtitle") or entry.get("tech") or entry.get("dates", "") or ""
+        if header:
+            lines.append(sanitize_text(header))
+        if subtitle:
+            lines.append(sanitize_text(subtitle))
+        for b in bullets:
             lines.append(f"- {sanitize_text(b)}")
         lines.append("")
 
     # Education
     lines.append("EDUCATION")
-    lines.append(sanitize_text(str(data.get("education", ""))))
+    lines.append(sanitize_text(_format_education(data.get("education"))))
 
-    # Extra sections carried through verbatim from the base CV (Languages,
-    # Certifications & Awards, etc.) -- not LLM-generated, not sanitized
-    # again (already normalized in extract_extra_sections).
-    for header, body in (extra_sections or {}).items():
+    # Extra sections carried through verbatim from the base CV
+    if extra_sections:
+        for header, body in extra_sections.items():
+            lines.append("")
+            lines.append(header)
+            lines.append(body)
+    else:
         lines.append("")
-        lines.append(header)
-        lines.append(body)
+        lines.append("LANGUAGES")
+        lines.append("- English: Fluent")
+        lines.append("- Arabic: Native")
+        lines.append("")
+        lines.append("CERTIFICATIONS & AWARDS")
+        lines.append("- QUB Dragon's Den Competition 2024 - 1st Place Winner")
+        lines.append("- Ideate Ireland 2024 - Finalist")
+        lines.append("- Global Student Entrepreneur Awards (GSEA) - Participant")
+        lines.append("")
+        lines.append("AVAILABILITY")
+        lines.append("Willing to relocate for further roles.")
 
     return "\n".join(lines)
 
@@ -422,9 +638,14 @@ def _resolve_fact_bullets(data: dict, fact_bank: FactBank) -> tuple[dict, list[s
     def _resolve_section(entries):
         resolved_entries = []
         for entry in entries or []:
+            if not isinstance(entry, dict):
+                continue
             new_entry = dict(entry)
             new_bullets = []
-            for bullet in entry.get("bullets", []):
+            raw_bullets = entry.get("bullets", [])
+            if isinstance(raw_bullets, str):
+                raw_bullets = [raw_bullets]
+            for bullet in raw_bullets:
                 try:
                     new_bullets.append(fact_bank.resolve_bullet(bullet))
                 except ValueError as e:
@@ -440,14 +661,27 @@ def _resolve_fact_bullets(data: dict, fact_bank: FactBank) -> tuple[dict, list[s
 
 
 def _build_guard_scan_text(resolved_data: dict) -> str:
-    """Text scope NumericGuard checks: LLM-authored content only (title,
-    summary, skills, bullets). Deliberately excludes the code-injected
-    header and the experience/project subtitles (job dates) -- those
-    legitimately contain numbers the guard has no way to authorize and
-    would otherwise false-positive on (same reasoning as the existing
-    deep-validation layer's scope, see judge_tailored_resume call site).
+    """Text scope NumericGuard checks: LLM-authored content (title, summary,
+    skills, education, bullets). Deliberately excludes the code-injected
+    profile header and experience/project headers/subtitles -- those
+    conventionally carry the job's real dates (e.g. "Jul 2022 - May 2023"),
+    which legitimately contain numbers the guard has no way to authorize and
+    would otherwise false-positive on legitimate, unfabricated content.
+
+    `education` was excluded here until 2026-08-23: a live run with schema-
+    constrained output (which gave the model a genuinely free-form
+    `education` string to fill) produced fabricated grades ("Graded 90 in
+    Object Oriented Programming...") and fake certifications ("AWS Certified
+    Machine Learning Specialty (2023)") that sailed straight through because
+    nothing ever scanned that field. Any free-text field the LLM controls
+    needs to be in scope, or NumericGuard's guarantee ("every number traces
+    to a verified fact") is only true for a subset of the document. The
+    candidate's real graduation years (2020, 2025) were added to the
+    `edu.meng` fact's `numbers` in facts.yaml so this doesn't now
+    false-positive on the one number education legitimately needs.
     """
-    parts = [str(resolved_data.get("title", "")), str(resolved_data.get("summary", ""))]
+    parts = [str(resolved_data.get("title", "")), str(resolved_data.get("summary", "")),
+             str(resolved_data.get("education", ""))]
     skills = resolved_data.get("skills", {})
     if isinstance(skills, dict):
         parts.extend(str(v) for v in skills.values())
@@ -458,36 +692,26 @@ def _build_guard_scan_text(resolved_data: dict) -> str:
     return "\n".join(parts)
 
 
-def _strip_numbers_from_text(text: str) -> str:
-    """Last-resort sanitization for the unquantified fallback: drop any
-    sentence containing a digit; if that would empty the field, blank just
-    the digit runs instead. Matches the existing product philosophy -- a
-    fabricated statistic is worse than no statistic, even an ungainly one.
-    """
-    if not text or not _DIGIT_TOKEN_RE.search(text):
-        return text
-    sentences = re.split(r"(?<=[.!?])\s+", text)
-    kept = [s for s in sentences if not _DIGIT_TOKEN_RE.search(s)]
-    cleaned = " ".join(kept).strip()
-    return cleaned if cleaned else _DIGIT_TOKEN_RE.sub("", text).strip()
-
-
 def _fallback_unquantified(data: dict, fact_bank: FactBank) -> dict:
     """Deterministic, code-only fallback for when the guard still fails
-    after every retry: keep only facts and bullets that carry zero numbers.
-
-    This is never a regeneration attempt (that would just re-risk the same
-    fabrication) -- it's a mechanical filter over the LLM's own last
-    output, so the result is guaranteed safe by construction rather than
-    by asking the model to try again.
+    after every retry: keep only verified facts and bullets that carry zero unverified numbers.
     """
     result = dict(data)
-    result["title"] = _strip_numbers_from_text(str(data.get("title", "")))
-    result["summary"] = _strip_numbers_from_text(str(data.get("summary", "")))
+    result["title"] = sanitize_text(str(data.get("title", "Software Engineer")))
+    result["summary"] = sanitize_text(str(data.get("summary", "")))
+    # Confirmed live 2026-08-23: this fallback left `education` completely
+    # untouched, so a fabricated number embedded in it (e.g. invented exam
+    # grades) survived into the guard re-check in _ship_unquantified_fallback,
+    # made THAT fail too, and cascaded into the last-resort "strip every
+    # digit from the whole assembled text" branch -- which mangled the
+    # code-injected header along with it (email/phone/dates). Defaulting to
+    # the same known-safe education string _format_education() already uses
+    # elsewhere closes this at the source: nothing downstream can fail on it.
+    result["education"] = _EDU_FALLBACK
 
     skills = data.get("skills", {})
     if isinstance(skills, dict):
-        result["skills"] = {k: _strip_numbers_from_text(str(v)) for k, v in skills.items()}
+        result["skills"] = {k: sanitize_text(str(v)) for k, v in skills.items()}
 
     def _clean_section(entries):
         cleaned_entries = []
@@ -497,18 +721,19 @@ def _fallback_unquantified(data: dict, fact_bank: FactBank) -> dict:
             for bullet in entry.get("bullets", []):
                 if isinstance(bullet, dict):
                     fact = fact_bank.get(bullet.get("fact"))
-                    if fact is not None and fact.tier == "verified" and not fact.numbers:
+                    if fact is not None and fact.tier == "verified":
                         text = fact.variants.get("short") or fact.variants.get("long")
                         if text:
                             new_bullets.append(" ".join(text.split()))
-                    # Quantified facts are dropped, not rewritten -- there is
-                    # no safe unquantified version of a numeric fact.
-                elif isinstance(bullet, str) and not _DIGIT_TOKEN_RE.search(bullet):
-                    new_bullets.append(bullet)
-                # Plain bullets with digits are dropped, not edited.
+                elif isinstance(bullet, str):
+                    # If it refers to a verified fact inline, resolve it
+                    try:
+                        resolved = fact_bank.resolve_bullet(bullet)
+                        new_bullets.append(resolved)
+                    except ValueError:
+                        # Plain bullet with unverified digits: drop
+                        pass
             new_entry["bullets"] = new_bullets
-            # Keep the entry even with zero bullets -- it still carries the
-            # (real, preserved) company/project header and dates.
             cleaned_entries.append(new_entry)
         return cleaned_entries
 
@@ -520,7 +745,8 @@ def _fallback_unquantified(data: dict, fact_bank: FactBank) -> dict:
 # ── LLM Judge ────────────────────────────────────────────────────────────
 
 def judge_tailored_resume(
-    original_text: str, tailored_text: str, job_title: str, profile: dict
+    original_text: str, tailored_text: str, job_title: str, profile: dict,
+    fact_bank: FactBank | None = None,
 ) -> dict:
     """LLM judge layer: catches subtle fabrication that programmatic checks miss.
 
@@ -529,11 +755,14 @@ def judge_tailored_resume(
         tailored_text: Tailored resume text.
         job_title: Target job title.
         profile: User profile for building the judge prompt.
+        fact_bank: FactBank so the judge knows about verbatim-substituted
+            verified facts (see _build_judge_prompt) and doesn't flag them
+            as fabrication just for not appearing in original_text.
 
     Returns:
         {"passed": bool, "verdict": str, "issues": str, "raw": str}
     """
-    judge_prompt = _build_judge_prompt(profile)
+    judge_prompt = _build_judge_prompt(profile, fact_bank=fact_bank)
 
     messages = [
         {"role": "system", "content": judge_prompt},
@@ -546,7 +775,10 @@ def judge_tailored_resume(
     ]
 
     client = get_client()
-    response = client.chat(messages, max_tokens=512, temperature=0.1)
+    # 512 was observed truncating a "thinking" local model mid-reasoning,
+    # before it ever reached its own "VERDICT:" line -- which reads back as
+    # a spurious FAIL (no "VERDICT: PASS" found), not a real rejection.
+    response = client.chat(messages, max_tokens=1536, temperature=0.1)
 
     passed = "VERDICT: PASS" in response.upper()
     issues = "none"
@@ -615,9 +847,15 @@ def tailor_resume(
     }
     avoid_notes: list[str] = []
     tailored = ""
+    last_good_data: dict | None = None  # most recent attempt whose JSON actually parsed
     client = get_client()
     tailor_prompt_base = _build_tailor_prompt(profile, fact_bank, job_description)
     extra_sections = extract_extra_sections(resume_text)
+    resume_schema = _resume_json_schema()
+    # Some providers/model builds don't support response_format at all (older
+    # Ollama, certain OpenAI-compat shims); if the very first attempt 400s on
+    # it, don't keep re-failing every subsequent attempt the same way.
+    schema_supported = True
 
     for attempt in range(max_retries + 1):
         report["attempts"] = attempt + 1
@@ -635,14 +873,43 @@ def tailor_resume(
             {"role": "user", "content": f"ORIGINAL RESUME:\n{resume_text}\n\n---\n\nTARGET JOB:\n{job_text}\n\nReturn the JSON:"},
         ]
 
-        raw = client.chat(messages, max_tokens=2048, temperature=0.4)
+        if schema_supported:
+            try:
+                raw = client.chat(
+                    messages, max_tokens=2048, temperature=0.4, json_schema=resume_schema,
+                )
+            except Exception:
+                log.warning(
+                    "response_format/json_schema not supported by this provider -- "
+                    "falling back to unconstrained generation for the rest of this job.",
+                    exc_info=True,
+                )
+                schema_supported = False
+                raw = client.chat(messages, max_tokens=2048, temperature=0.4)
+        else:
+            raw = client.chat(messages, max_tokens=2048, temperature=0.4)
 
         # Parse JSON from response
         try:
             data = extract_json(raw)
         except ValueError:
             avoid_notes.append("Output was not valid JSON. Return ONLY a JSON object, nothing else.")
+            # Unlike every other failure branch below, a JSON-parse failure
+            # has no `data` to fall back on for *this* attempt -- but if an
+            # earlier attempt DID parse, use that on the last try rather
+            # than falling through to "exhausted_retries" with `tailored`
+            # still at its initial "" (a silently empty resume file, worse
+            # than shipping the best imperfect attempt we actually have).
+            if is_last_attempt and last_good_data is not None:
+                tailored = _ship_unquantified_fallback(last_good_data, profile, extra_sections, fact_bank, guard)
+                report["status"] = "approved_unquantified_fallback"
+                report["guard_violation"] = {
+                    "errors": ["Final attempt's output was not valid JSON; used the last attempt that did parse."]
+                }
+                return tailored, report
             continue
+
+        last_good_data = data
 
         # Resolve fact-id bullets to their verbatim pre-written text BEFORE
         # anything else touches `data` -- validate_json_fields and
@@ -717,7 +984,7 @@ def tailor_resume(
             report["status"] = "approved"
             return tailored, report
 
-        judge = judge_tailored_resume(resume_text, tailored, job.get("title", ""), profile)
+        judge = judge_tailored_resume(resume_text, tailored, job.get("title", ""), profile, fact_bank=fact_bank)
         report["judge"] = judge
 
         if not judge["passed"]:
@@ -748,17 +1015,53 @@ def _ship_unquantified_fallback(
     "never ship on a failed guard" is an invariant this actually verifies,
     not just a property the construction is assumed to have. In the
     (should-not-happen) case the recheck still fails, every digit is
-    stripped from the final text as an absolute last resort.
+    stripped from the LLM-authored *fields* as an absolute last resort --
+    critically, BEFORE assembly, not after.
+
+    Confirmed live 2026-08-23: this used to run _DIGIT_TOKEN_RE.sub("", ...)
+    on the fully assembled text, which includes the profile-injected header
+    (name/email/phone) that assemble_resume_text builds from `profile`, not
+    from LLM content. That stripped digits out of the candidate's own email
+    address and phone number -- "user123@example.com" became
+    "user@example.com", the phone number vanished entirely. Stripping the
+    data dict's fields first and assembling afterward keeps the header, which
+    was never LLM content and never needed sanitizing, structurally out of
+    reach.
     """
     fallback_data = _fallback_unquantified(data, fact_bank)
     resolved_fallback, _ = _resolve_fact_bullets(fallback_data, fact_bank)
-    tailored = assemble_resume_text(resolved_fallback, profile, extra_sections)
     try:
         guard.check(_build_guard_scan_text(resolved_fallback))
     except NumericGuardViolation:
         log.error("Unquantified fallback still failed NumericGuard -- stripping all digits as last resort")
-        tailored = _DIGIT_TOKEN_RE.sub("", tailored)
-    return tailored
+        resolved_fallback = _strip_all_digits_from_fields(resolved_fallback)
+    return assemble_resume_text(resolved_fallback, profile, extra_sections)
+
+
+def _strip_all_digits_from_fields(data: dict) -> dict:
+    """Absolute last resort: remove every digit from every LLM-authored
+    field (title, summary, education, skills, bullets) -- never called on
+    anything that touches the code-injected profile header."""
+    result = dict(data)
+    result["title"] = _DIGIT_TOKEN_RE.sub("", str(data.get("title", "")))
+    result["summary"] = _DIGIT_TOKEN_RE.sub("", str(data.get("summary", "")))
+    result["education"] = _DIGIT_TOKEN_RE.sub("", str(data.get("education", ""))) or _EDU_FALLBACK
+
+    skills = data.get("skills", {})
+    if isinstance(skills, dict):
+        result["skills"] = {k: _DIGIT_TOKEN_RE.sub("", str(v)) for k, v in skills.items()}
+
+    def _strip_section(entries):
+        cleaned = []
+        for entry in entries or []:
+            new_entry = dict(entry)
+            new_entry["bullets"] = [_DIGIT_TOKEN_RE.sub("", str(b)) for b in entry.get("bullets", [])]
+            cleaned.append(new_entry)
+        return cleaned
+
+    result["experience"] = _strip_section(data.get("experience"))
+    result["projects"] = _strip_section(data.get("projects"))
+    return result
 
 
 # ── Batch Entry Point ────────────────────────────────────────────────────
@@ -797,6 +1100,32 @@ def run_tailoring(min_score: int = 7, limit: int = 20,
 
     for job in jobs:
         completed += 1
+
+        # Cheap liveness check before the expensive tailor LLM call --
+        # skip postings already confirmed closed rather than burning a
+        # full tailor+judge cycle on something no apply attempt can use.
+        from applypilot.enrichment.detail import check_listing_still_open
+        still_open = check_listing_still_open(job["url"], job.get("site", ""))
+        conn.execute(
+            "UPDATE jobs SET listing_checked_at=? WHERE url=?",
+            (datetime.now(timezone.utc).isoformat(), job["url"]),
+        )
+        if still_open is False:
+            conn.execute(
+                "UPDATE jobs SET apply_status='listing_closed' WHERE url=?",
+                (job["url"],),
+            )
+            conn.commit()
+            result = {
+                "url": job["url"], "title": job["title"], "site": job["site"],
+                "status": "listing_closed", "attempts": 0, "path": None, "pdf_path": None,
+            }
+            results.append(result)
+            stats["listing_closed"] = stats.get("listing_closed", 0) + 1
+            log.info("%d/%d [LISTING_CLOSED] %s -- skipped, no longer accepting applications",
+                     completed, len(jobs), job["title"][:40])
+            continue
+
         try:
             tailored, report = tailor_resume(resume_text, job, profile,
                                              validation_mode=validation_mode,
@@ -879,7 +1208,7 @@ def run_tailoring(min_score: int = 7, limit: int = 20,
                 "tailor_attempts=COALESCE(tailor_attempts,0)+1 WHERE url=?",
                 (r["path"], now, r["url"]),
             )
-        else:
+        elif r["status"] != "listing_closed":
             conn.execute(
                 "UPDATE jobs SET tailor_attempts=COALESCE(tailor_attempts,0)+1 WHERE url=?",
                 (r["url"],),

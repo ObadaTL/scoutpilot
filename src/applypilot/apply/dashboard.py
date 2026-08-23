@@ -42,7 +42,7 @@ class WorkerState:
 _worker_states: dict[int, WorkerState] = {}
 _events: list[str] = []
 _lock = threading.Lock()
-MAX_EVENTS = 8
+MAX_EVENTS = 14
 
 
 # ---------------------------------------------------------------------------

@@ -207,7 +207,18 @@ def load_base_urls() -> dict[str, str | None]:
 DEFAULTS = {
     "min_score": 7,
     "max_apply_attempts": 3,
-    "max_tailor_attempts": 5,
+    # Cross-run attempt budget per job before it's excluded from further
+    # tailor/cover-letter runs. Each single run already retries internally
+    # (see tailor.py's own max_retries), so this only governs how many
+    # separate `applypilot run tailor`/`run cover` invocations a job gets
+    # across sessions. Lowered from 5 -> 3 (2026-08-23): live testing showed
+    # tailoring failures are dominated by the LLM not following the
+    # requested JSON schema, not transient issues -- repeating a
+    # structurally-hard job 5x across runs rarely helps beyond what 3
+    # already captures, and the extra 2 attempts were mostly wasted compute
+    # on jobs that were never going to succeed.
+    "max_tailor_attempts": 3,
+    "max_cover_attempts": 3,
     "poll_interval": 60,
     "apply_timeout": 300,
     "viewport": "1280x900",

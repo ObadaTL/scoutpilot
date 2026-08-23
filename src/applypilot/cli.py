@@ -327,24 +327,160 @@ def jobs(
     min_fit: int = typer.Option(0, "--min-fit", help="Minimum fit score."),
     limit: int = typer.Option(20, "--limit", "-l", help="Max jobs to show."),
     site: Optional[str] = typer.Option(None, "--site", help="Filter to one source site."),
+    status: Optional[str] = typer.Option(None, "--status", help="Filter by status (applied, ready, failed, in_progress)."),
+    tailored: bool = typer.Option(False, "--tailored", help="Show only jobs with a tailored resume."),
 ) -> None:
-    """List individual jobs with fit score and company context."""
+    """List individual jobs with fit score, company context, CV/cover letter links, and application status."""
     _bootstrap()
 
     from applypilot.terminal_view import list_jobs, render_jobs
 
-    matched = list_jobs(min_fit=min_fit, limit=limit, site=site)
+    matched = list_jobs(min_fit=min_fit, limit=limit, site=site, status=status, tailored_only=tailored)
     render_jobs(matched, console)
 
 
 @app.command()
-def dashboard() -> None:
-    """Generate and open the HTML dashboard in your browser."""
+def logs(
+    worker: int = typer.Option(0, "--worker", "-w", help="Worker ID to show logs for."),
+    lines: int = typer.Option(50, "--lines", "-n", help="Number of lines to show from the end."),
+    follow: bool = typer.Option(False, "--follow", "-f", help="Follow log output in real-time."),
+    stderr: bool = typer.Option(False, "--stderr", help="View stderr log instead of main worker log."),
+) -> None:
+    """View or stream worker logs in real time."""
+    import time
+    from applypilot.config import LOG_DIR
+
+    log_filename = f"worker-{worker}-stderr.log" if stderr else f"worker-{worker}.log"
+    log_path = LOG_DIR / log_filename
+
+    if not log_path.exists():
+        console.print(f"[yellow]No log file found at:[/yellow] {log_path}")
+        return
+
+    console.print(f"[bold cyan]ApplyPilot Log:[/bold cyan] {log_path}\n")
+
+    import sys
+
+    def _safe_print(text: str) -> None:
+        try:
+            console.print(text, highlight=False, markup=False, emoji=False)
+        except Exception:
+            sys.stdout.buffer.write(f"{text}\n".encode("utf-8", errors="replace"))
+            sys.stdout.buffer.flush()
+
+    try:
+        with open(log_path, "r", encoding="utf-8", errors="replace") as f:
+            all_lines = f.readlines()
+            for line in all_lines[-lines:]:
+                _safe_print(line.rstrip())
+
+            if follow:
+                f.seek(0, 2)
+                while True:
+                    line = f.readline()
+                    if line:
+                        _safe_print(line.rstrip())
+                    else:
+                        time.sleep(0.5)
+    except KeyboardInterrupt:
+        pass
+
+
+@app.command()
+def events(
+    limit: int = typer.Option(30, "--limit", "-l", help="Number of recent events to display."),
+    url: Optional[str] = typer.Option(None, "--url", help="Filter events to a specific job URL."),
+) -> None:
+    """Show structured event timeline from recent apply attempts."""
+    import json
+    _bootstrap()
+    from applypilot.database import get_connection
+
+    conn = get_connection()
+    if url:
+        query = """
+            SELECT e.ts, e.event_type, e.tool_name, e.input_json, e.text, a.job_url, j.title
+            FROM attempt_events e
+            JOIN attempts a ON e.attempt_id = a.id
+            JOIN jobs j ON a.job_url = j.url
+            WHERE a.job_url = ?
+            ORDER BY e.id DESC LIMIT ?
+        """
+        rows = conn.execute(query, (url, limit)).fetchall()
+    else:
+        query = """
+            SELECT e.ts, e.event_type, e.tool_name, e.input_json, e.text, a.job_url, j.title
+            FROM attempt_events e
+            JOIN attempts a ON e.attempt_id = a.id
+            JOIN jobs j ON a.job_url = j.url
+            ORDER BY e.id DESC LIMIT ?
+        """
+        rows = conn.execute(query, (limit,)).fetchall()
+
+    if not rows:
+        console.print("[dim]No attempt events recorded in database yet.[/dim]")
+        return
+
+    events_table = Table(title="Recent Application Events", show_header=True, header_style="bold cyan")
+    events_table.add_column("Time", width=10)
+    events_table.add_column("Job", min_width=20, max_width=35, no_wrap=True)
+    events_table.add_column("Type", width=12)
+    events_table.add_column("Details", min_width=30)
+
+    for row in reversed(rows):
+        ts = row["ts"][11:19] if row["ts"] and len(row["ts"]) >= 19 else (row["ts"] or "")
+        ev_type = row["event_type"]
+        details = ""
+        if ev_type == "tool_use":
+            tool_name = (row["tool_name"] or "").replace("mcp__playwright__", "").replace("mcp__gmail__", "gmail:")
+            inp = json.loads(row["input_json"]) if row["input_json"] else {}
+            if "url" in inp:
+                details = f"[cyan]{tool_name}[/cyan] {inp['url'][:50]}"
+            elif "element" in inp or "text" in inp:
+                details = f"[cyan]{tool_name}[/cyan] {inp.get('element', inp.get('text', ''))[:40]}"
+            elif "fields" in inp:
+                details = f"[cyan]{tool_name}[/cyan] ({len(inp['fields'])} fields)"
+            else:
+                details = f"[cyan]{tool_name}[/cyan]"
+        elif ev_type == "text":
+            details = (row["text"] or "").strip().replace("\n", " ")[:60]
+        elif ev_type == "system_init":
+            details = "[dim]Claude session initialized[/dim]"
+        elif ev_type == "result":
+            details = "[bold green]Application completed[/bold green]"
+        else:
+            details = ev_type
+
+        events_table.add_row(ts, row["title"] or "Unknown", ev_type, details)
+
+    console.print(events_table)
+
+
+@app.command()
+def dashboard(
+    static: bool = typer.Option(
+        False, "--static",
+        help="Write a one-shot HTML snapshot and open it, instead of serving it live. "
+             "The in-page Refresh button won't pull new data in this mode -- the file "
+             "only updates the next time this command runs.",
+    ),
+) -> None:
+    """Open the HTML dashboard in your browser.
+
+    Serves it live by default (regenerates from the DB on every load, so
+    the in-page Refresh button and browser reload both show current data)
+    and keeps running until you press Ctrl+C.
+    """
     _bootstrap()
 
-    from applypilot.view import open_dashboard
+    if static:
+        from applypilot.view import open_dashboard
+        open_dashboard()
+        return
 
-    open_dashboard()
+    from applypilot.view import serve_dashboard
+
+    serve_dashboard()
 
 
 @app.command()

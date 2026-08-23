@@ -22,6 +22,7 @@ from pathlib import Path
 
 from rich.console import Console
 from rich.live import Live
+from rich.markup import escape
 
 from applypilot import config
 from applypilot.database import (
@@ -140,6 +141,7 @@ def acquire_job(target_url: str | None = None, min_score: int = 7,
                   AND (apply_status IS NULL OR apply_status = 'failed' OR apply_status = 'skipped')
                   AND (apply_attempts IS NULL OR apply_attempts < ?)
                   AND fit_score >= ?
+                  AND duplicate_of IS NULL
                   {site_clause}
                   {url_clauses}
                 ORDER BY fit_score DESC, url
@@ -510,6 +512,7 @@ def run_job(job: dict, port: int, worker_id: int = 0,
                             update_state(worker_id,
                                          actions=cur_actions + 1,
                                          last_action=desc[:35])
+                            add_event(f"[W{worker_id}] [cyan]>>[/cyan] {escape(desc[:45])}")
                             log_event(conn, attempt_id, _next_seq(), "tool_use",
                                      tool_name=block.get("name", ""),
                                      tool_use_id=block.get("id"),

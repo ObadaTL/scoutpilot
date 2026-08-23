@@ -4,12 +4,60 @@ Parses the structured text resume format, renders via an HTML/CSS template,
 and exports to PDF using headless Chromium via Playwright.
 """
 
+import base64
 import logging
+from functools import lru_cache
 from pathlib import Path
 
 from applypilot.config import TAILORED_DIR
 
 log = logging.getLogger(__name__)
+
+# ── Embedded Fonts ───────────────────────────────────────────────────────
+# Extracted 2026-08-23 from the candidate's real baseline documents
+# (baseline_cv.docx -> Palatino Linotype / Century Gothic,
+# CoverLetter.DOCX -> Roboto Condensed) so generated PDFs render with the
+# actual fonts those documents use, not a generic substitute -- Century
+# Gothic/Palatino Linotype/Roboto Condensed aren't standard fonts a viewer's
+# system or Chromium's default set would otherwise have, so without
+# embedding them the browser would silently fall back to something else
+# regardless of what font-family the CSS names.
+_FONTS_DIR = Path(__file__).resolve().parent / "fonts"
+
+
+@lru_cache(maxsize=None)
+def _font_b64(filename: str) -> str:
+    return base64.b64encode((_FONTS_DIR / filename).read_bytes()).decode("ascii")
+
+
+def _font_face(family: str, filename: str, weight: str = "normal", style: str = "normal") -> str:
+    return (
+        f"@font-face {{ font-family: '{family}'; "
+        f"src: url(data:font/ttf;base64,{_font_b64(filename)}) format('truetype'); "
+        f"font-weight: {weight}; font-style: {style}; }}"
+    )
+
+
+def _cv_font_faces() -> str:
+    return "\n".join([
+        _font_face("Palatino Linotype", "PalatinoLinotype-regular.ttf"),
+        _font_face("Palatino Linotype", "PalatinoLinotype-bold.ttf", weight="bold"),
+        _font_face("Palatino Linotype", "PalatinoLinotype-italic.ttf", style="italic"),
+        _font_face("Palatino Linotype", "PalatinoLinotype-boldItalic.ttf", weight="bold", style="italic"),
+        _font_face("Century Gothic", "CenturyGothic-regular.ttf"),
+        _font_face("Century Gothic", "CenturyGothic-bold.ttf", weight="bold"),
+        _font_face("Century Gothic", "CenturyGothic-italic.ttf", style="italic"),
+        _font_face("Century Gothic", "CenturyGothic-boldItalic.ttf", weight="bold", style="italic"),
+    ])
+
+
+def _cover_letter_font_faces() -> str:
+    return "\n".join([
+        _font_face("Roboto Condensed", "RobotoCondensed-regular.ttf"),
+        _font_face("Roboto Condensed", "RobotoCondensed-bold.ttf", weight="bold"),
+        _font_face("Roboto Condensed", "RobotoCondensed-italic.ttf", style="italic"),
+        _font_face("Roboto Condensed", "RobotoCondensed-boldItalic.ttf", weight="bold", style="italic"),
+    ])
 
 
 # ── Resume Parser ────────────────────────────────────────────────────────
@@ -192,8 +240,48 @@ def parse_entries(text: str) -> list[dict]:
 
 KNOWN_SECTIONS: set[str] = {"SUMMARY", "TECHNICAL SKILLS", "EXPERIENCE", "PROJECTS", "EDUCATION"}
 
+# Layouts tried in order by _fit_resume_html(). "spacious" is the default --
+# font size, name size, and margins parsed exactly out of the candidate's
+# real baseline CV's own DOCX XML (baseline_cv.docx: word/document.xml
+# section properties + run properties), not estimated -- 11pt body/headers
+# (w:sz 22, half-points), 34pt name (w:sz 68), 0.417in/0.556in margins
+# (600/800 dxa, 1440 dxa/in). Font *family* (Palatino Linotype for the name
+# and section headers, Century Gothic for body text) and colors (#0069a5
+# headers, #231f20 body) are set directly in the CSS below, embedded via
+# _cv_font_faces() -- Century Gothic/Palatino Linotype aren't fonts a
+# viewer's system or Chromium's defaults would have, so without embedding
+# them the font-family CSS would silently fall back to something else no
+# matter what these numbers say. "normal"/"compact" are a step-down safety
+# net, not the goal: they only kick in if a resume has enough content that
+# "spacious" would spill past 2 pages, stepping down just far enough to land
+# back at 2.
+_DENSITY_PRESETS: tuple[dict, ...] = (
+    {
+        "name": "spacious", "margin_v": 600 / 1440, "margin_h": 800 / 1440, "font": 11.0,
+        "line": 1.25, "name_size": 34, "section_mt": 15, "entry_mb": 12,
+        "li_mb": 3, "li_line": 1.3,
+    },
+    {
+        "name": "normal", "margin_v": 0.55, "margin_h": 0.65, "font": 10.0,
+        "line": 1.15, "name_size": 28, "section_mt": 10, "entry_mb": 9,
+        "li_mb": 2, "li_line": 1.2,
+    },
+    {
+        "name": "compact", "margin_v": 0.45, "margin_h": 0.55, "font": 9.5,
+        "line": 1.1, "name_size": 24, "section_mt": 6, "entry_mb": 6,
+        "li_mb": 1, "li_line": 1.15,
+    },
+)
 
-def build_html(resume: dict, page_size: str = "Letter") -> str:
+_PAGE_DIMS_IN: dict[str, tuple[float, float]] = {
+    "Letter": (8.5, 11.0),
+    "A4": (8.27, 11.69),
+}
+
+_TARGET_MAX_PAGES = 2
+
+
+def build_html(resume: dict, page_size: str = "Letter", density: dict | None = None) -> str:
     """Build professional resume/CV HTML from parsed data.
 
     Any section beyond the five standard ones (e.g. LANGUAGES,
@@ -204,10 +292,12 @@ def build_html(resume: dict, page_size: str = "Letter") -> str:
     Args:
         resume: Parsed resume dict from parse_resume().
         page_size: "Letter" (US) or "A4" (most of the rest of the world).
+        density: One of _DENSITY_PRESETS, or None for the default ("normal").
 
     Returns:
         Complete HTML string ready for PDF rendering.
     """
+    d = density or _DENSITY_PRESETS[0]
     sections = resume["sections"]
 
     # Skills
@@ -278,9 +368,10 @@ def build_html(resume: dict, page_size: str = "Letter") -> str:
 <head>
 <meta charset="utf-8">
 <style>
+{_cv_font_faces()}
 @page {{
     size: {page_size};
-    margin: 0.5in 0.6in;
+    margin: {d['margin_v']}in {d['margin_h']}in;
 }}
 * {{
     margin: 0;
@@ -288,94 +379,104 @@ def build_html(resume: dict, page_size: str = "Letter") -> str:
     box-sizing: border-box;
 }}
 body {{
-    font-family: 'Calibri', 'Segoe UI', Arial, sans-serif;
-    font-size: 10.5pt;
-    line-height: 1.4;
-    color: #1a1a1a;
+    font-family: 'Century Gothic', 'Century Gothic Std', Verdana, sans-serif;
+    font-size: {d['font']}pt;
+    line-height: {d['line']};
+    color: #231f20;
+    background: #ffffff;
 }}
 .header {{
     text-align: center;
-    margin-bottom: 4px;
-    padding-bottom: 4px;
-    border-bottom: 1.5px solid #2a7ab5;
+    margin-bottom: 6px;
+    padding-bottom: 6px;
+    border-bottom: 1.5px solid #0069a5;
 }}
 .name {{
-    font-size: 18pt;
+    font-family: 'Palatino Linotype', Georgia, serif;
+    font-size: {d['name_size']}pt;
     font-weight: 700;
-    color: #1a3a5c;
-    letter-spacing: 0.5px;
+    color: #0069a5;
+    letter-spacing: 0.3px;
+    margin-bottom: 3px;
 }}
 .title {{
-    font-size: 10.5pt;
-    color: #3a6b8c;
-    margin: 1px 0;
+    font-family: 'Century Gothic', Verdana, sans-serif;
+    font-size: {d['font'] + 2}pt;
+    font-weight: 700;
+    color: #0069a5;
+    margin-bottom: 3px;
 }}
 .location {{
-    font-size: 9pt;
-    color: #555;
+    font-size: {d['font'] - 1}pt;
+    color: #231f20;
 }}
 .contact {{
-    font-size: 9pt;
-    color: #444;
-    margin-top: 1px;
+    font-size: {d['font'] - 1}pt;
+    color: #231f20;
+    margin-top: 2px;
 }}
 .contact a {{
-    color: #2c3e50;
+    color: #0069a5;
     text-decoration: none;
 }}
 .section {{
-    margin-top: 5px;
+    margin-top: {d['section_mt']}px;
 }}
 .section-title {{
-    font-size: 10pt;
+    font-family: 'Palatino Linotype', Georgia, serif;
+    font-size: {d['font']}pt;
     font-weight: 700;
-    color: #1a3a5c;
+    color: #0069a5;
     text-transform: uppercase;
-    letter-spacing: 0.8px;
-    border-bottom: 1.5px solid #2a7ab5;
-    padding-bottom: 1px;
-    margin-bottom: 3px;
+    letter-spacing: 0.5px;
+    border-bottom: 1.5px solid #0069a5;
+    padding-bottom: 2px;
+    margin-bottom: 6px;
 }}
 .summary {{
-    font-size: 9.5pt;
-    color: #333;
-    line-height: 1.4;
+    font-size: {d['font']}pt;
+    color: #231f20;
+    line-height: {d['line']};
+    text-align: justify;
 }}
 .skill-row {{
-    font-size: 9.5pt;
-    margin: 0;
-    line-height: 1.35;
+    font-size: {d['font']}pt;
+    margin-bottom: 3px;
+    line-height: {d['line']};
 }}
 .skill-cat {{
-    font-weight: 600;
-    color: #1a3a5c;
+    font-weight: 700;
+    color: #0069a5;
 }}
 .entry {{
-    margin-bottom: 4px;
+    margin-bottom: {d['entry_mb']}px;
     break-inside: avoid;
 }}
 .entry-title {{
-    font-weight: 600;
-    font-size: 10pt;
-    color: #1a3a5c;
+    font-weight: 700;
+    font-size: {d['font']}pt;
+    color: #231f20;
 }}
 .entry-subtitle {{
-    font-size: 9pt;
-    color: #4a7a9b;
-    font-style: italic;
-    margin-bottom: 1px;
+    font-size: {d['font'] - 0.5}pt;
+    color: #231f20;
+    margin-bottom: 3px;
 }}
 ul {{
-    margin-left: 14px;
+    margin-left: 16px;
     padding: 0;
 }}
 li {{
-    font-size: 9.5pt;
-    margin-bottom: 1px;
-    line-height: 1.35;
+    font-size: {d['font']}pt;
+    margin-bottom: {d['li_mb']}px;
+    line-height: {d['li_line']};
+    color: #231f20;
+    text-align: justify;
 }}
 .edu {{
-    font-size: 10pt;
+    font-size: {d['font']}pt;
+    line-height: {d['line']};
+    color: #231f20;
 }}
 </style>
 </head>
@@ -394,6 +495,202 @@ li {{
 {extra_html}
 </body>
 </html>"""
+
+
+def build_cover_letter_html(text: str, profile: dict | None = None, page_size: str = "A4") -> str:
+    """Build a beautifully styled, professional 1-page cover letter HTML."""
+    from datetime import datetime
+    from html import escape
+
+    personal = (profile or {}).get("personal", {}) if profile else {}
+    name = personal.get("full_name") or "Applicant"
+    # Plain-text parts get escaped individually; link parts are already-safe
+    # HTML (the URL itself is escaped inside), so the final join must NOT
+    # re-escape everything -- that was the bug: LinkedIn/GitHub were
+    # appended as bare label text with no href at all, so there was never a
+    # link to click regardless of how the join happened.
+    contact_parts = []
+    if personal.get("email"):
+        contact_parts.append(escape(personal["email"]))
+    if personal.get("phone"):
+        contact_parts.append(escape(personal["phone"]))
+    city = personal.get("city", "")
+    country = personal.get("country", "")
+    if city or country:
+        contact_parts.append(escape(f"{city}, {country}".strip(", ")))
+    if personal.get("linkedin_url"):
+        contact_parts.append(f'<a href="{escape(personal["linkedin_url"])}">LinkedIn</a>')
+    if personal.get("github_url"):
+        contact_parts.append(f'<a href="{escape(personal["github_url"])}">GitHub</a>')
+
+    contact_line = " &nbsp;|&nbsp; ".join(contact_parts)
+    today = datetime.now().strftime("%d %B %Y")
+
+    # Split text into paragraphs
+    raw_paras = [p.strip() for p in text.strip().split("\n\n") if p.strip()]
+    if not raw_paras:
+        raw_paras = [p.strip() for p in text.strip().split("\n") if p.strip()]
+
+    body_paras = []
+    salutation = "Dear Hiring Team,"
+    signoff_name = personal.get("preferred_name") or personal.get("full_name") or name
+    _signoff_phrases = ("sincerely", "best regards", "kind regards", "warm regards", "regards")
+
+    for i, p in enumerate(raw_paras):
+        p_clean = p.replace("\r", "").strip()
+        if i == 0 and p_clean.lower().startswith("dear "):
+            salutation = p_clean
+            continue
+        # "Sincerely,\nName" with no blank line between them lands as ONE
+        # paragraph chunk here rather than two -- strip the signoff phrase
+        # off the front first, or it both fails the exact-match skip below
+        # AND gets misread as the whole signoff name (rendering as
+        # "Sincerely, / Sincerely, Name" -- the static template's own
+        # "Sincerely," plus this chunk's, both showing).
+        lines = [ln.strip() for ln in p_clean.split("\n") if ln.strip()]
+        if lines and lines[0].lower().rstrip(",") in _signoff_phrases:
+            if len(lines) > 1:
+                signoff_name = " ".join(lines[1:])
+            continue
+        if i == len(raw_paras) - 1 and len(p_clean.split()) <= 4 and not p_clean.endswith("."):
+            signoff_name = p_clean
+        elif p_clean.lower().rstrip(",") in _signoff_phrases:
+            continue
+        else:
+            body_paras.append(f"<p>{escape(p_clean)}</p>")
+
+    body_html = "\n".join(body_paras)
+
+    return f"""<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<style>
+{_cover_letter_font_faces()}
+@page {{
+    size: {page_size};
+    margin: {300 / 1440}in {1280 / 1440}in;
+}}
+* {{
+    margin: 0;
+    padding: 0;
+    box-sizing: border-box;
+}}
+body {{
+    font-family: 'Roboto Condensed', 'Arial Narrow', Arial, sans-serif;
+    font-size: 11pt;
+    line-height: 1.5;
+    color: #000000;
+    background: #ffffff;
+}}
+.letterhead {{
+    text-align: center;
+    padding-bottom: 10px;
+    margin-bottom: 16px;
+    border-bottom: 1.5px solid #7f8183;
+}}
+.name {{
+    font-size: 18pt;
+    font-weight: 700;
+    color: #000000;
+    letter-spacing: 0.3px;
+    margin-bottom: 4px;
+}}
+.contact {{
+    font-size: 9.5pt;
+    color: #7f8183;
+}}
+.contact a {{
+    color: #7f8183;
+    text-decoration: none;
+}}
+.date {{
+    font-size: 11pt;
+    color: #000000;
+    margin-bottom: 16px;
+}}
+.salutation {{
+    font-size: 11pt;
+    font-weight: 700;
+    color: #000000;
+    margin-bottom: 14px;
+}}
+.content p {{
+    margin-bottom: 12px;
+    text-align: justify;
+    color: #000000;
+    line-height: 1.5;
+}}
+.signoff {{
+    margin-top: 20px;
+    font-size: 11pt;
+    font-weight: 700;
+    font-style: italic;
+}}
+.signoff-name {{
+    margin-top: 12px;
+    font-weight: 700;
+    color: #000000;
+    font-size: 11pt;
+}}
+</style>
+</head>
+<body>
+<div class="letterhead">
+    <div class="name">{escape(name)}</div>
+    <div class="contact">{contact_line}</div>
+</div>
+
+<div class="date">{today}</div>
+
+<div class="salutation">{escape(salutation)}</div>
+
+<div class="content">
+{body_html}
+</div>
+
+<div class="signoff">
+    <div>Sincerely,</div>
+    <div class="signoff-name">{escape(signoff_name)}</div>
+</div>
+</body>
+</html>"""
+
+
+def _fit_resume_html(resume: dict, page_size: str) -> str:
+    """Render `resume` at the loosest density that still fits within
+    `_TARGET_MAX_PAGES` pages (2, matching the candidate's real baseline CV).
+
+    Chromium's print layout has no built-in "shrink to fit N pages" for
+    @page-based pagination, so this does it manually: render each density
+    preset ("spacious" first) at the page's actual content width in a single
+    headless-Chromium session, measure the resulting content height, and
+    stop at the first preset whose content fits within `_TARGET_MAX_PAGES`
+    pages' worth of content height. Falls back to the most compact preset if
+    even that overflows -- a genuinely long resume will legitimately need
+    more room, but this keeps it as close to 2 pages as the presets allow
+    rather than sprawling further unchecked.
+    """
+    from playwright.sync_api import sync_playwright
+
+    page_w_in, page_h_in = _PAGE_DIMS_IN.get(page_size, _PAGE_DIMS_IN["Letter"])
+
+    with sync_playwright() as p:
+        browser = p.chromium.launch()
+        try:
+            for i, density in enumerate(_DENSITY_PRESETS):
+                html = build_html(resume, page_size=page_size, density=density)
+                content_w_px = round((page_w_in - 2 * density["margin_h"]) * 96)
+                content_h_px = round((page_h_in - 2 * density["margin_v"]) * 96) * _TARGET_MAX_PAGES
+                page = browser.new_page(viewport={"width": content_w_px, "height": 100})
+                page.set_content(html, wait_until="networkidle")
+                height = page.evaluate("document.body.scrollHeight")
+                page.close()
+                if height <= content_h_px or i == len(_DENSITY_PRESETS) - 1:
+                    return html
+        finally:
+            browser.close()
+    return build_html(resume, page_size=page_size)  # unreachable, keeps type-checkers happy
 
 
 # ── PDF Renderer ─────────────────────────────────────────────────────────
@@ -426,7 +723,7 @@ def render_pdf(html: str, output_path: str, page_size: str = "Letter") -> None:
 def convert_to_pdf(
     text_path: Path, output_path: Path | None = None, html_only: bool = False
 ) -> Path:
-    """Convert a text resume/cover letter to PDF.
+    """Convert a text resume or cover letter to a formatted PDF.
 
     Args:
         text_path: Path to the .txt file to convert.
@@ -439,16 +736,29 @@ def convert_to_pdf(
     """
     text_path = Path(text_path)
     text = text_path.read_text(encoding="utf-8")
-    resume = parse_resume(text)
 
-    page_size = "Letter"
+    profile = None
+    page_size = "A4"
     try:
         from applypilot.config import get_locale_style, load_profile
-        page_size = get_locale_style(load_profile())["page_size"]
+        profile = load_profile()
+        page_size = get_locale_style(profile)["page_size"]
     except Exception:
-        log.debug("Could not load profile for page-size detection, defaulting to Letter", exc_info=True)
+        log.debug("Could not load profile for locale detection, defaulting to A4", exc_info=True)
 
-    html = build_html(resume, page_size=page_size)
+    # Detect whether this is a cover letter or a resume
+    is_cover_letter = (
+        text_path.name.endswith("_CL.txt")
+        or "cover_letter" in text_path.name.lower()
+        or text.strip().startswith("Dear ")
+        or "\nDear " in text[:200]
+    )
+
+    if is_cover_letter:
+        html = build_cover_letter_html(text, profile=profile, page_size=page_size)
+    else:
+        resume = parse_resume(text)
+        html = _fit_resume_html(resume, page_size=page_size)
 
     if html_only:
         out = output_path or text_path.with_suffix(".html")

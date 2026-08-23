@@ -99,11 +99,21 @@ def _build_location_check(profile: dict, search_config: dict) -> str:
 
     Uses the accept_patterns from search config to determine which cities
     are acceptable for hybrid/onsite roles.
+
+    searches.yaml's real schema (see queries/location_accept/
+    location_reject_non_remote at the top level) has no nested "location"
+    dict at all -- this used to read search_config["location"]["accept_
+    patterns"], a key path that never existed, so accept_patterns was
+    always empty and every job fell back to "only the candidate's home
+    city is acceptable." Confirmed live 2026-08-23: a Bristol posting was
+    auto-rejected as not_eligible_location even though the user's own
+    searches.yaml explicitly lists "Bristol" in location_accept -- the
+    apply stage was silently ignoring cities the search/discovery stage
+    had already been told were fine.
     """
     personal = profile["personal"]
-    location_cfg = search_config.get("location", {})
-    accept_patterns = location_cfg.get("accept_patterns", [])
-    primary_city = personal.get("city", location_cfg.get("primary", "your city"))
+    accept_patterns = search_config.get("location_accept", [])
+    primary_city = personal.get("city", "your city")
 
     # Build the list of acceptable cities for hybrid/onsite
     if accept_patterns:

@@ -20,7 +20,7 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 
-from applypilot.config import COVER_LETTER_DIR, RESUME_PATH, get_locale_style, load_profile
+from applypilot.config import COVER_LETTER_DIR, DEFAULTS, RESUME_PATH, get_locale_style, load_profile
 from applypilot.database import get_connection
 from applypilot.facts import FactBank, NumericGuard, NumericGuardViolation
 from applypilot.llm import get_client
@@ -28,12 +28,13 @@ from applypilot.scoring.validator import (
     ToolLeakGuard,
     ToolLeakViolation,
     sanitize_text,
+    strip_numbered_sentences,
     validate_cover_letter,
 )
 
 log = logging.getLogger(__name__)
 
-MAX_ATTEMPTS = 5  # max cross-run retries before giving up
+MAX_ATTEMPTS = DEFAULTS["max_cover_attempts"]  # max cross-run retries before giving up
 
 # Short, hand-picked steer for the base prompt -- NOT the enforcement list.
 # validate_cover_letter (the full BANNED_WORDS/LLM_LEAK_PHRASES sets in
@@ -48,6 +49,21 @@ _PROMPT_BANNED_SAMPLE = [
 _PROMPT_LEAK_SAMPLE = [
     "i am sorry", "here is the", "as requested", "note:", "i have rewritten",
 ]
+
+# job['site'] is the *source* the posting was scraped from, not necessarily
+# the hiring company -- true for jobs pulled straight from a company's own
+# careers page (e.g. "Motorola Solutions", "NVIDIA"), but false for postings
+# aggregated through a job board, where site is the board's own name and the
+# real employer (if identifiable at all) is buried in free-text
+# full_description. Checking for the board's name in the letter is not just
+# unhelpful there, it's actively wrong -- and a hard-fails-every-retry check,
+# since a job board name will never legitimately appear in a cover letter
+# addressed to the actual employer. Skip the company-mention check for known
+# aggregators/boards rather than block generation on an unwinnable check.
+_AGGREGATOR_SITES = {
+    "linkedin", "indeed", "glassdoor", "dice", "remoteok", "welcometothejungle",
+    "job bank canada", "careerjet canada", "hacker news jobs", "builtin remote",
+}
 
 
 # ── Prompt Builder (profile-driven) ──────────────────────────────────────
@@ -195,7 +211,7 @@ def _check_company_mentioned(letter: str, job: dict) -> str | None:
         An error string if the company name is missing, else None.
     """
     company = str(job.get("site") or "").strip()
-    if not company or company.lower() in letter.lower():
+    if not company or company.lower() in _AGGREGATOR_SITES or company.lower() in letter.lower():
         return None
     return f"Company name '{company}' is never mentioned in the letter"
 
@@ -243,6 +259,26 @@ def generate_cover_letter(
     personal = profile.get("personal", {})
     sign_off_name = personal.get("preferred_name") or personal.get("full_name", "")
 
+    def _full_validate(candidate: str) -> dict:
+        base = validate_cover_letter(candidate, mode=validation_mode)
+        errors = list(base["errors"])
+        try:
+            numeric_guard.check(candidate)
+        except NumericGuardViolation as e:
+            errors.append(
+                f"Unverified number(s) {e.numbers} in: " + "; ".join(e.bullets[:3])
+            )
+        try:
+            tool_guard.check(job, candidate)
+        except ToolLeakViolation as e:
+            errors.append(
+                f"Tool(s) mentioned that aren't in the candidate's real skills: {', '.join(e.tools)}"
+            )
+        company_error = _check_company_mentioned(candidate, job)
+        if company_error:
+            errors.append(company_error)
+        return {"passed": not errors, "errors": errors, "warnings": base["warnings"]}
+
     avoid_notes: list[str] = []
     letter = ""
     validation: dict = {"passed": False, "errors": [], "warnings": []}
@@ -272,38 +308,48 @@ def generate_cover_letter(
         letter = _strip_preamble(letter)  # remove any "Here is the letter:" prefix
         letter = _strip_after_signoff(letter, sign_off_name)  # drop any trailing notes
 
-        base = validate_cover_letter(letter, mode=validation_mode)
-        errors = list(base["errors"])
-
-        try:
-            numeric_guard.check(letter)
-        except NumericGuardViolation as e:
-            errors.append(
-                f"Unverified number(s) {e.numbers} in: " + "; ".join(e.bullets[:3])
-            )
-
-        try:
-            tool_guard.check(job, letter)
-        except ToolLeakViolation as e:
-            errors.append(
-                f"Tool(s) mentioned that aren't in the candidate's real skills: {', '.join(e.tools)}"
-            )
-
-        company_error = _check_company_mentioned(letter, job)
-        if company_error:
-            errors.append(company_error)
-
-        validation = {"passed": not errors, "errors": errors, "warnings": base["warnings"]}
+        validation = _full_validate(letter)
 
         if validation["passed"]:
             return letter, validation
 
-        avoid_notes.extend(errors)
+        avoid_notes.extend(validation["errors"])
         # Warnings never block — only hard errors trigger a retry
         log.debug(
             "Cover letter attempt %d/%d failed: %s",
-            attempt + 1, max_retries + 1, errors,
+            attempt + 1, max_retries + 1, validation["errors"],
         )
+
+    # Retries exhausted. NumericGuard fabrication is the one failure mode a
+    # deterministic, code-only fix can safely resolve without yet another
+    # (possibly equally unreliable) LLM call: if every remaining error is a
+    # fabricated-number violation, strip the offending sentences and
+    # re-validate. Any other remaining error (banned words, missing company
+    # mention, wrong salutation, tool leak) still blocks -- those aren't
+    # safe to paper over mechanically.
+    numeric_only = validation["errors"] and all(
+        e.startswith("Unverified number(s)") for e in validation["errors"]
+    )
+    if numeric_only:
+        # Protect the mandatory "Dear ...," opening before stripping.
+        # strip_numbered_sentences splits on terminal punctuation (. ! ?)
+        # only -- a salutation ending in a comma has none, so it glues to
+        # whatever sentence follows it and gets dropped as one unit if that
+        # sentence has a digit, losing the salutation entirely. Confirmed
+        # live 2026-08-23: a fabrication-only failure that should have been
+        # rescued by this fallback came back still failing, on "Must start
+        # with 'Dear Hiring Manager,'" -- the fallback itself had eaten it.
+        first_line, _, rest = letter.partition("\n")
+        if first_line.strip().lower().startswith("dear"):
+            stripped = first_line + "\n" + strip_numbered_sentences(rest)
+        else:
+            stripped = strip_numbered_sentences(letter)
+        stripped_validation = _full_validate(stripped)
+        if stripped_validation["passed"]:
+            stripped_validation["warnings"] = list(stripped_validation["warnings"]) + [
+                "Fabricated number(s) removed by deterministic fallback after exhausting retries"
+            ]
+            return stripped, stripped_validation
 
     return letter, validation  # last attempt, still failed -- caller must not ship this
 

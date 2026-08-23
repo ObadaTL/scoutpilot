@@ -6,12 +6,13 @@ without migration ordering issues.
 """
 
 import json
+import re
 import sqlite3
 import threading
 from datetime import datetime, timezone
 from pathlib import Path
 
-from applypilot.config import DB_PATH
+from applypilot.config import DB_PATH, DEFAULTS
 
 # Thread-local connection storage — each thread gets its own connection
 # (required for SQLite thread safety with parallel workers)
@@ -257,6 +258,15 @@ _ALL_COLUMNS: dict[str, str] = {
     "apply_duration_ms": "INTEGER",
     "apply_task_id": "TEXT",
     "verification_confidence": "TEXT",
+    # Deduplication: the same real-world posting frequently gets discovered
+    # more than once -- same job scraped from two sites (LinkedIn + Indeed),
+    # or re-discovered on a later sweep under a new URL. Set to the
+    # canonical job's url when this row is a detected duplicate of it; NULL
+    # means either unique or not yet checked. Every stage-selection query
+    # (scoring, tailoring, apply) should filter `duplicate_of IS NULL` so a
+    # duplicate never gets its own separate tailor/apply cycle.
+    "duplicate_of": "TEXT",
+    "listing_checked_at": "TEXT",
 }
 
 
@@ -294,6 +304,159 @@ def ensure_columns(conn: sqlite3.Connection | None = None) -> list[str]:
         conn.commit()
 
     return added
+
+
+# ── Deduplication ────────────────────────────────────────────────────────
+# The same real-world posting is frequently discovered more than once --
+# scraped from two different sites (LinkedIn + Indeed), or re-discovered
+# under a new URL on a later sweep. Confirmed live 2026-08-23: "Junior
+# Application Software Engineer" at One Big Circle existed as both a
+# LinkedIn row and an Indeed row; the Indeed copy was scored, tailored, and
+# applied to, while the LinkedIn copy sat unscored -- if it had later
+# scored >=8 on its own, the pipeline would have tailored and applied to
+# the *same job* a second time with no way to know it already had.
+
+_TITLE_NORMALIZE_RE = re.compile(r"[^a-z0-9]+")
+
+
+def _normalize_title(title: str) -> str:
+    return _TITLE_NORMALIZE_RE.sub(" ", (title or "").lower()).strip()
+
+
+def find_duplicate_groups(conn: sqlite3.Connection | None = None,
+                          similarity_threshold: float = 0.85) -> list[list[dict]]:
+    """Group jobs that are likely the same real-world posting.
+
+    Groups by normalized title first (cheap, high-recall), then within each
+    group compares full_description pairwise with difflib -- title alone is
+    too weak a signal (many genuinely different postings share a generic
+    title like "Software Engineer"), so two jobs only count as duplicates
+    if their descriptions are also substantially similar.
+
+    Uses SequenceMatcher.ratio(), NOT quick_ratio(). Confirmed live
+    2026-08-23: quick_ratio() is a rough character-multiset upper bound, not
+    an actual similarity measure -- it scored two completely unrelated
+    "Machine Learning Engineer" postings at 0.634 (comfortably over a 0.6
+    threshold) when their real ratio() was 0.009. Grouping by quick_ratio
+    at any threshold under ~0.9 produced enormous false-positive clusters
+    (18 unrelated "Software Engineer" postings from different companies
+    lumped into one "duplicate" group). ratio() is slower (true alignment,
+    not an approximation) but correct: the same false-positive pair scores
+    0.009, while confirmed true positives score 0.94-1.0.
+
+    Args:
+        conn: Database connection. Uses get_connection() if None.
+        similarity_threshold: Minimum difflib.SequenceMatcher.ratio() (0-1)
+            between two full_description texts to treat them as the same
+            posting. 0.85 sits well above the false-positive ceiling (~0.01
+            observed) and below confirmed true positives (0.94-1.0), leaving
+            room for each site's own HTML-stripping/formatting differences.
+
+    Returns:
+        List of duplicate groups, each a list of job dicts (2+ per group)
+        sharing enough title + description similarity to be the same
+        posting. Does not modify the database.
+    """
+    import difflib
+
+    if conn is None:
+        conn = get_connection()
+
+    rows = conn.execute(
+        "SELECT url, title, site, location, full_description, fit_score, "
+        "tailored_resume_path, applied_at, discovered_at FROM jobs "
+        "WHERE full_description IS NOT NULL"
+    ).fetchall()
+    jobs = [dict(r) for r in rows]
+
+    by_title: dict[str, list[dict]] = {}
+    for j in jobs:
+        key = _normalize_title(j["title"])
+        if not key:
+            continue
+        by_title.setdefault(key, []).append(j)
+
+    groups: list[list[dict]] = []
+    for title_key, candidates in by_title.items():
+        if len(candidates) < 2:
+            continue
+        # Union-find over this title's candidates by description similarity.
+        parent = list(range(len(candidates)))
+
+        def find(i: int) -> int:
+            while parent[i] != i:
+                parent[i] = parent[parent[i]]
+                i = parent[i]
+            return i
+
+        for i in range(len(candidates)):
+            for j in range(i + 1, len(candidates)):
+                desc_i = (candidates[i]["full_description"] or "").strip().lower()
+                desc_j = (candidates[j]["full_description"] or "").strip().lower()
+                if not desc_i or not desc_j:
+                    continue
+                matcher = difflib.SequenceMatcher(None, desc_i, desc_j)
+                # quick_ratio() is a valid *upper bound* on the real ratio()
+                # (just not an accurate similarity score on its own -- see
+                # the false-positive note above) -- cheap enough to skip the
+                # expensive real ratio() computation for obviously-dissimilar
+                # pairs without risking a false negative.
+                if matcher.quick_ratio() < similarity_threshold:
+                    continue
+                if matcher.ratio() >= similarity_threshold:
+                    ri, rj = find(i), find(j)
+                    if ri != rj:
+                        parent[ri] = rj
+
+        clusters: dict[int, list[dict]] = {}
+        for i, c in enumerate(candidates):
+            clusters.setdefault(find(i), []).append(c)
+        groups.extend(g for g in clusters.values() if len(g) > 1)
+
+    return groups
+
+
+def apply_duplicate_marks(conn: sqlite3.Connection | None = None,
+                          groups: list[list[dict]] | None = None) -> int:
+    """Mark all but one job in each duplicate group with duplicate_of.
+
+    Picks the canonical (kept) job in each group by: already applied > has
+    a tailored resume > higher fit_score > earliest discovered_at -- so
+    real progress already made on a job is never the one thrown away.
+
+    Args:
+        conn: Database connection. Uses get_connection() if None.
+        groups: Duplicate groups from find_duplicate_groups(). Computed
+            fresh if not given.
+
+    Returns:
+        Number of jobs newly marked as duplicates.
+    """
+    if conn is None:
+        conn = get_connection()
+    if groups is None:
+        groups = find_duplicate_groups(conn)
+
+    def _rank(j: dict) -> tuple:
+        return (
+            0 if j.get("applied_at") else 1,
+            0 if j.get("tailored_resume_path") else 1,
+            -(j.get("fit_score") or -1),
+            j.get("discovered_at") or "9999",
+        )
+
+    marked = 0
+    for group in groups:
+        ranked = sorted(group, key=_rank)
+        canonical = ranked[0]
+        for dup in ranked[1:]:
+            conn.execute(
+                "UPDATE jobs SET duplicate_of = ? WHERE url = ? AND duplicate_of IS NULL",
+                (canonical["url"], dup["url"]),
+            )
+            marked += 1
+    conn.commit()
+    return marked
 
 
 def get_stats(conn: sqlite3.Connection | None = None) -> dict:
@@ -461,16 +624,22 @@ def get_jobs_by_stage(conn: sqlite3.Connection | None = None,
         "discovered": "1=1",
         "pending_detail": "detail_scraped_at IS NULL",
         "enriched": "full_description IS NOT NULL",
-        "pending_score": "full_description IS NOT NULL AND fit_score IS NULL",
+        # duplicate_of IS NULL on pending_score/pending_tailor: a detected
+        # duplicate of an already-handled posting shouldn't burn a second
+        # round of scoring/tailoring LLM calls on the same real job.
+        "pending_score": "full_description IS NOT NULL AND fit_score IS NULL AND duplicate_of IS NULL",
         "scored": "fit_score IS NOT NULL",
         "pending_tailor": (
             "fit_score >= ? AND full_description IS NOT NULL "
-            "AND tailored_resume_path IS NULL AND COALESCE(tailor_attempts, 0) < 5"
+            "AND tailored_resume_path IS NULL AND duplicate_of IS NULL "
+            "AND COALESCE(apply_status, '') != 'listing_closed' AND COALESCE(tailor_attempts, 0) < "
+            f"{DEFAULTS['max_tailor_attempts']}"
         ),
         "tailored": "tailored_resume_path IS NOT NULL",
         "pending_apply": (
             "tailored_resume_path IS NOT NULL AND applied_at IS NULL "
-            "AND application_url IS NOT NULL"
+            "AND application_url IS NOT NULL AND duplicate_of IS NULL "
+            "AND COALESCE(apply_status, '') != 'listing_closed'"
         ),
         "applied": "applied_at IS NOT NULL",
     }

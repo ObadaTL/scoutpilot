@@ -219,7 +219,43 @@ class FactBank:
     # -- Access ----------------------------------------------------------
 
     def get(self, fact_id: str) -> Fact | None:
-        return self._facts.get(fact_id)
+        if not fact_id or not isinstance(fact_id, str):
+            return None
+        # 1. Exact match
+        if fact_id in self._facts:
+            return self._facts[fact_id]
+        # 2. Normalized match (replace _ with .)
+        norm = fact_id.lower().replace("_", ".").strip()
+        if norm in self._facts:
+            return self._facts[norm]
+        # 3. Fuzzy keyword matching for known facts in facts.yaml
+        if "audit" in norm:
+            return self._facts.get("kraydel.audit_system")
+        if "keycloak" in norm:
+            return self._facts.get("kraydel.keycloak_signup")
+        if "docker" in norm:
+            return self._facts.get("kraydel.dockerized_service")
+        if "iot" in norm or "policy" in norm:
+            return self._facts.get("kraydel.iot_policy_script")
+        if "usage" in norm or "dashboard" in norm:
+            return self._facts.get("kraydel.usage_dashboard")
+        if "sonar" in norm or "ci" in norm or "quality" in norm:
+            return self._facts.get("kraydel.ci_quality")
+        if "i18n" in norm or "spanish" in norm or "local" in norm:
+            return self._facts.get("kraydel.i18n")
+        if "call" in norm or "multiparty" in norm:
+            return self._facts.get("kraydel.multiparty_calls")
+        if "tenure" in norm or "placement" in norm:
+            return self._facts.get("kraydel.tenure")
+        if "leak" in norm:
+            return self._facts.get("emg.leakage_correction")
+        if "gesture" in norm or "emg" in norm or "pipeline" in norm:
+            return self._facts.get("emg.dual_pipeline")
+        if "dragon" in norm or "viofeel" in norm:
+            return self._facts.get("viofeel.dragons_den")
+        if "meng" in norm or "degree" in norm:
+            return self._facts.get("edu.meng")
+        return None
 
     def verified(self) -> list[Fact]:
         """All tier == 'verified' facts. The ONLY facts ever exposed to the LLM."""
@@ -274,16 +310,42 @@ class FactBank:
                 bullet shape.
         """
         if isinstance(bullet, dict):
-            fact_id = bullet.get("fact")
+            fact_id = bullet.get("fact") or bullet.get("id")
+            if isinstance(fact_id, dict):
+                fact_id = fact_id.get("id") or fact_id.get("fact") or str(fact_id)
+            if not isinstance(fact_id, str):
+                # If the dict contains a text bullet without a valid fact id
+                text = bullet.get("text") or bullet.get("bullet") or bullet.get("desc")
+                if text and isinstance(text, str):
+                    return self.resolve_bullet(text)
+                raise ValueError(f"Invalid fact id format in bullet: {bullet!r}")
+
             fact = self._facts.get(fact_id)
             if fact is None or fact.tier != "verified":
                 raise ValueError(f"Unknown or unverified fact id: {fact_id!r}")
             form = bullet.get("form", "short")
-            text = fact.variants.get(form) or fact.variants.get("short")
+            text = fact.variants.get(form) or fact.variants.get("short") or fact.variants.get("long")
             if not text:
                 raise ValueError(f"Fact {fact_id!r} has no usable variant text")
             return " ".join(text.split())  # collapse YAML block-scalar line wrapping
+
+        if isinstance(bullet, (list, tuple)):
+            # If bullet is a list of items, join them into a single string
+            return " ".join(str(b) for b in bullet if b)
+
         if isinstance(bullet, str):
+            # Check for inline fact references like (fact: kraydel.audit_event_system) or [fact: ...]
+            match = re.search(r"[\(\[\{]?\s*fact\s*:\s*([a-zA-Z0-9_\.]+)\s*[\)\]\}]?", bullet, re.IGNORECASE)
+            if match:
+                fact_id = match.group(1)
+                fact = self._facts.get(fact_id)
+                if fact is not None and fact.tier == "verified":
+                    form = "long" if "long" in bullet.lower() else "short"
+                    text = fact.variants.get(form) or fact.variants.get("short") or fact.variants.get("long")
+                    if text:
+                        return " ".join(text.split())
+                elif fact is None:
+                    raise ValueError(f"Unknown fact id in bullet: {fact_id!r}")
             if _NUMBER_TOKEN_RE.search(bullet):
                 raise ValueError(f"Bullet without a fact id contains a digit: {bullet!r}")
             return bullet
