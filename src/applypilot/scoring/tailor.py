@@ -7,6 +7,13 @@ Zero hardcoded personal information.
 The LLM returns structured JSON, code assembles the final text. Header (name, contact)
 is always code-injected, never LLM-generated. Each retry starts a fresh conversation
 to avoid apologetic spirals.
+
+Numeric content is a separate control from the rest of the tailoring text: the LLM
+never writes a number itself. It selects a fact id + short/long form from the
+FactBank (facts.yaml) and code substitutes the pre-written text verbatim; any bullet
+with no fact id must contain zero digits. NumericGuard re-checks the assembled text
+against FactBank.allowed_numbers() after generation, deterministically -- this is
+enforcement, not just a prompt instruction the model could ignore.
 """
 
 import json
@@ -18,13 +25,13 @@ from pathlib import Path
 
 from applypilot.config import RESUME_PATH, TAILORED_DIR, get_locale_style, load_profile
 from applypilot.database import get_connection, get_jobs_by_stage
+from applypilot.facts import FactBank, NumericGuard, NumericGuardViolation
 from applypilot.llm import get_client
 from applypilot.scoring.pdf import split_sections
 from applypilot.scoring.validator import (
     BANNED_WORDS,
     FABRICATION_WATCHLIST,
     SECTION_VARIANTS,
-    find_fabricated_numbers,
     sanitize_text,
     validate_json_fields,
     validate_tailored_resume,
@@ -33,15 +40,37 @@ from applypilot.scoring.validator import (
 log = logging.getLogger(__name__)
 
 MAX_ATTEMPTS = 5  # max cross-run retries before giving up
+_DIGIT_TOKEN_RE = re.compile(r"\d+")
 
 
 # ── Prompt Builders (profile-driven) ──────────────────────────────────────
 
-def _build_tailor_prompt(profile: dict) -> str:
+def _format_facts_block(facts: list) -> str:
+    """Render verified facts as an id-keyed list of pre-written variants
+    for the prompt. The LLM selects among these; it never writes the text
+    itself, so nothing here can be reworded into a fabricated number."""
+    if not facts:
+        return "(none relevant to this job -- do not reference any fact id)"
+    lines = []
+    for fact in facts:
+        lines.append(f'- "{fact.id}"')
+        for form in ("short", "long"):
+            text = fact.variants.get(form)
+            if text:
+                lines.append(f'    {form}: "{" ".join(text.split())}"')
+    return "\n".join(lines)
+
+
+def _build_tailor_prompt(profile: dict, fact_bank: FactBank, job_description: str = "") -> str:
     """Build the resume tailoring system prompt from the user's profile.
 
     All skills boundaries, preserved entities, and formatting rules are
-    derived from the profile -- nothing is hardcoded.
+    derived from the profile -- nothing is hardcoded. Quantified content is
+    handled entirely through the FactBank: the prompt offers only the
+    verified facts relevant to this job (see FactBank.relevant_facts) and
+    tells the model to select among them by id rather than write numbers
+    itself. NumericGuard re-checks this after generation -- this prompt
+    text is not the enforcement, it's the instruction half of it.
     """
     boundary = profile.get("skills_boundary", {})
     resume_facts = profile.get("resume_facts", {})
@@ -64,11 +93,11 @@ def _build_tailor_prompt(profile: dict) -> str:
     companies = resume_facts.get("preserved_companies", [])
     projects = resume_facts.get("preserved_projects", [])
     school = resume_facts.get("preserved_school", "")
-    real_metrics = resume_facts.get("real_metrics", [])
 
     companies_str = ", ".join(companies) if companies else "N/A"
     projects_str = ", ".join(projects) if projects else "N/A"
-    metrics_str = ", ".join(real_metrics) if real_metrics else "N/A"
+
+    facts_block = _format_facts_block(fact_bank.relevant_facts(job_description))
 
     # Include ALL banned words from the validator so the LLM knows exactly
     # what will be rejected — the validator checks for these automatically.
@@ -105,31 +134,39 @@ SUMMARY: Rewrite from scratch. Lead with the 1-2 skills that matter most for THI
 
 SKILLS: Reorder each category so the job's must-haves appear first.
 
-Reframe EVERY bullet for this role. Same real work, different angle. Every bullet must be reworded. Never copy verbatim.
+Reframe EVERY bullet for this role. Same real work, different angle. Every bullet must be reworded. Never copy verbatim. (This applies to plain-text bullets -- a fact-id bullet's wording comes verbatim from the fact, see NUMBERS below, and is not yours to reword.)
 
 PROJECTS: Reorder by relevance. Drop irrelevant projects entirely. Never invent a new project -- only use projects that already appear in the original {doc}: {projects_str}
 
-BULLETS: Strong verb + what you built + quantified impact. Vary verbs (Built, Designed, Implemented, Reduced, Automated, Deployed, Operated, Optimized). Most relevant first. Max {max_bullets} per section.
+BULLETS: Strong verb + what you built + impact. Vary verbs (Built, Designed, Implemented, Reduced, Automated, Deployed, Operated, Optimized). Most relevant first. Max {max_bullets} per section.
 
 ## VOICE:
 - Write like a real engineer. Short, direct.
-- GOOD: "Automated financial reporting with Python + API integrations, cut processing time from 10 hours to 2"
+- GOOD: "Automated financial reporting with Python and API integrations, eliminating a manual end-of-month process"
 - BAD: "Leveraged cutting-edge AI technologies to drive transformative operational efficiencies"
 - Use {style["spelling"]} English spelling and terminology throughout. Call it a "{doc}", never the other term.
 - BANNED WORDS (using ANY of these = validation failure — do not use them even once):
   {banned_str}
 - No em dashes. Use commas, periods, or hyphens.
 
+## NUMBERS -- READ THIS CAREFULLY (hard constraint, enforced by an automated checker after you respond, not just this instruction):
+You do not write numbers. You select from a fixed list of pre-written, verified facts below. Every bullet is one of two shapes:
+1. A plain string, with ZERO digits anywhere in it -- not a rounded number, not a vague one, not a year, nothing. "Automated a manual reporting workflow" is fine. "Automated 5 reporting workflows" is NOT, even if you think 5 sounds plausible.
+2. A fact reference: {{"fact": "<id>", "form": "short"}} or {{"fact": "<id>", "form": "long"}}, using ONLY an id from VERIFIED FACTS below. Pick the id whose pre-written text best fits the bullet's slot; you do not edit or paraphrase that text, code substitutes it verbatim.
+If an achievement has no fact backing it, describe it with a plain zero-digit bullet. A fabricated statistic is worse than no statistic -- there is no partial credit for a plausible-sounding number.
+
+## VERIFIED FACTS (the only source of numbers -- reference by id, never invent your own):
+{facts_block}
+
 ## HARD RULES:
 - Do NOT invent work, companies, degrees, certifications, or projects
-- Do NOT invent NEW numbers, percentages, or counts. Only real numbers may appear: {metrics_str}. If a bullet has no real metric behind it, describe the work without a number -- a fabricated statistic is worse than no statistic.
 - Preserved companies: {companies_str} -- names stay as-is
 - Preserved school: {school}
 - Must fill {pages} full page{'s' if pages != 1 else ''} -- do not compress to fewer, do not pad with filler to reach more.
 
 ## OUTPUT: Return ONLY valid JSON. No markdown fences. No commentary. No "here is" preamble.
 
-{{"title":"Role Title","summary":"2-3 tailored sentences.","skills":{{{skills_schema}}},"experience":[{{"header":"Title at Company","subtitle":"Tech | Dates","bullets":["bullet 1","bullet 2","bullet 3","bullet 4"]}}],"projects":[{{"header":"Project Name - Description","subtitle":"Tech | Dates","bullets":["bullet 1","bullet 2"]}}],"education":"{school} | {education_level}"}}"""
+{{"title":"Role Title","summary":"2-3 tailored sentences, zero digits.","skills":{{{skills_schema}}},"experience":[{{"header":"Title at Company","subtitle":"Tech | Dates","bullets":["plain zero-digit bullet",{{"fact":"some.fact.id","form":"short"}}]}}],"projects":[{{"header":"Project Name - Description","subtitle":"Tech | Dates","bullets":["plain zero-digit bullet",{{"fact":"some.fact.id","form":"long"}}]}}],"education":"{school} | {education_level}"}}"""
 
 
 def _build_judge_prompt(profile: dict) -> str:
@@ -363,6 +400,123 @@ def assemble_resume_text(data: dict, profile: dict, extra_sections: dict[str, st
     return "\n".join(lines)
 
 
+# ── Fact-bullet resolution & NumericGuard integration ─────────────────────
+
+def _resolve_fact_bullets(data: dict, fact_bank: FactBank) -> tuple[dict, list[str]]:
+    """Resolve every experience/project bullet into literal text.
+
+    A fact-id bullet is replaced verbatim with that fact's pre-written
+    variant (see FactBank.resolve_bullet) -- the LLM's own wording for it
+    is discarded, so it cannot rewrite numeric content. A bad bullet
+    (unknown fact id, or a plain bullet with a digit) is dropped and
+    reported as an error rather than let through; assemble_resume_text
+    only ever sees plain strings, same as before this change.
+
+    Returns:
+        (resolved_data, errors) -- resolved_data is a shallow copy of data
+        with bullets replaced by their resolved text; errors describes any
+        bullet that had to be dropped.
+    """
+    errors: list[str] = []
+
+    def _resolve_section(entries):
+        resolved_entries = []
+        for entry in entries or []:
+            new_entry = dict(entry)
+            new_bullets = []
+            for bullet in entry.get("bullets", []):
+                try:
+                    new_bullets.append(fact_bank.resolve_bullet(bullet))
+                except ValueError as e:
+                    errors.append(str(e))
+            new_entry["bullets"] = new_bullets
+            resolved_entries.append(new_entry)
+        return resolved_entries
+
+    resolved = dict(data)
+    resolved["experience"] = _resolve_section(data.get("experience"))
+    resolved["projects"] = _resolve_section(data.get("projects"))
+    return resolved, errors
+
+
+def _build_guard_scan_text(resolved_data: dict) -> str:
+    """Text scope NumericGuard checks: LLM-authored content only (title,
+    summary, skills, bullets). Deliberately excludes the code-injected
+    header and the experience/project subtitles (job dates) -- those
+    legitimately contain numbers the guard has no way to authorize and
+    would otherwise false-positive on (same reasoning as the existing
+    deep-validation layer's scope, see judge_tailored_resume call site).
+    """
+    parts = [str(resolved_data.get("title", "")), str(resolved_data.get("summary", ""))]
+    skills = resolved_data.get("skills", {})
+    if isinstance(skills, dict):
+        parts.extend(str(v) for v in skills.values())
+    for entry in resolved_data.get("experience", []) or []:
+        parts.extend(entry.get("bullets", []))
+    for entry in resolved_data.get("projects", []) or []:
+        parts.extend(entry.get("bullets", []))
+    return "\n".join(parts)
+
+
+def _strip_numbers_from_text(text: str) -> str:
+    """Last-resort sanitization for the unquantified fallback: drop any
+    sentence containing a digit; if that would empty the field, blank just
+    the digit runs instead. Matches the existing product philosophy -- a
+    fabricated statistic is worse than no statistic, even an ungainly one.
+    """
+    if not text or not _DIGIT_TOKEN_RE.search(text):
+        return text
+    sentences = re.split(r"(?<=[.!?])\s+", text)
+    kept = [s for s in sentences if not _DIGIT_TOKEN_RE.search(s)]
+    cleaned = " ".join(kept).strip()
+    return cleaned if cleaned else _DIGIT_TOKEN_RE.sub("", text).strip()
+
+
+def _fallback_unquantified(data: dict, fact_bank: FactBank) -> dict:
+    """Deterministic, code-only fallback for when the guard still fails
+    after every retry: keep only facts and bullets that carry zero numbers.
+
+    This is never a regeneration attempt (that would just re-risk the same
+    fabrication) -- it's a mechanical filter over the LLM's own last
+    output, so the result is guaranteed safe by construction rather than
+    by asking the model to try again.
+    """
+    result = dict(data)
+    result["title"] = _strip_numbers_from_text(str(data.get("title", "")))
+    result["summary"] = _strip_numbers_from_text(str(data.get("summary", "")))
+
+    skills = data.get("skills", {})
+    if isinstance(skills, dict):
+        result["skills"] = {k: _strip_numbers_from_text(str(v)) for k, v in skills.items()}
+
+    def _clean_section(entries):
+        cleaned_entries = []
+        for entry in entries or []:
+            new_entry = dict(entry)
+            new_bullets = []
+            for bullet in entry.get("bullets", []):
+                if isinstance(bullet, dict):
+                    fact = fact_bank.get(bullet.get("fact"))
+                    if fact is not None and fact.tier == "verified" and not fact.numbers:
+                        text = fact.variants.get("short") or fact.variants.get("long")
+                        if text:
+                            new_bullets.append(" ".join(text.split()))
+                    # Quantified facts are dropped, not rewritten -- there is
+                    # no safe unquantified version of a numeric fact.
+                elif isinstance(bullet, str) and not _DIGIT_TOKEN_RE.search(bullet):
+                    new_bullets.append(bullet)
+                # Plain bullets with digits are dropped, not edited.
+            new_entry["bullets"] = new_bullets
+            # Keep the entry even with zero bullets -- it still carries the
+            # (real, preserved) company/project header and dates.
+            cleaned_entries.append(new_entry)
+        return cleaned_entries
+
+    result["experience"] = _clean_section(data.get("experience"))
+    result["projects"] = _clean_section(data.get("projects"))
+    return result
+
+
 # ── LLM Judge ────────────────────────────────────────────────────────────
 
 def judge_tailored_resume(
@@ -413,6 +567,7 @@ def judge_tailored_resume(
 def tailor_resume(
     resume_text: str, job: dict, profile: dict,
     max_retries: int = 3, validation_mode: str = "normal",
+    fact_bank: FactBank | None = None,
 ) -> tuple[str, dict]:
     """Generate a tailored resume via JSON output + fresh context on each retry.
 
@@ -421,6 +576,12 @@ def tailor_resume(
     - Each retry starts a FRESH conversation (no apologetic spiral)
     - Issues from previous attempts are noted in the system prompt
     - Em dashes and smart quotes are auto-fixed, not rejected
+    - The LLM never writes a number: bullets select a FactBank fact id + form
+      (verbatim substitution) or must be plain zero-digit text. NumericGuard
+      re-checks the assembled text deterministically after generation; a
+      violation feeds back as an explicit negative constraint on retry, and
+      if retries are exhausted this falls back to a code-only, guaranteed
+      zero-fabrication variant rather than shipping the guard failure.
 
     Args:
         resume_text:      Base resume text.
@@ -431,15 +592,21 @@ def tailor_resume(
                           strict  -- banned words trigger retries; judge must pass
                           normal  -- banned words = warnings only; judge can fail on last retry
                           lenient -- banned words ignored; LLM judge skipped
+        fact_bank:        FactBank to select quantified claims from. Loads
+                          the repo-root facts.yaml if not provided.
 
     Returns:
         (tailored_text, report) where report contains validation details.
     """
+    fact_bank = fact_bank or FactBank.load()
+    guard = NumericGuard(fact_bank, profile)
+
+    job_description = job.get("full_description") or ""
     job_text = (
         f"TITLE: {job['title']}\n"
         f"COMPANY: {job['site']}\n"
         f"LOCATION: {job.get('location', 'N/A')}\n\n"
-        f"DESCRIPTION:\n{(job.get('full_description') or '')[:6000]}"
+        f"DESCRIPTION:\n{job_description[:6000]}"
     )
 
     report: dict = {
@@ -449,11 +616,12 @@ def tailor_resume(
     avoid_notes: list[str] = []
     tailored = ""
     client = get_client()
-    tailor_prompt_base = _build_tailor_prompt(profile)
+    tailor_prompt_base = _build_tailor_prompt(profile, fact_bank, job_description)
     extra_sections = extract_extra_sections(resume_text)
 
     for attempt in range(max_retries + 1):
         report["attempts"] = attempt + 1
+        is_last_attempt = attempt == max_retries
 
         # Fresh conversation every attempt
         prompt = tailor_prompt_base
@@ -476,50 +644,69 @@ def tailor_resume(
             avoid_notes.append("Output was not valid JSON. Return ONLY a JSON object, nothing else.")
             continue
 
+        # Resolve fact-id bullets to their verbatim pre-written text BEFORE
+        # anything else touches `data` -- validate_json_fields and
+        # assemble_resume_text both expect plain-string bullets, and this is
+        # the point where an unknown fact id or a digit-bearing plain bullet
+        # gets caught in code (not just flagged by instruction).
+        resolved_data, resolution_errors = _resolve_fact_bullets(data, fact_bank)
+
+        if resolution_errors:
+            avoid_notes.extend(resolution_errors)
+            if not is_last_attempt:
+                continue
+            tailored = _ship_unquantified_fallback(data, profile, extra_sections, fact_bank, guard)
+            report["status"] = "approved_unquantified_fallback"
+            report["guard_violation"] = {"errors": resolution_errors}
+            return tailored, report
+
         # Layer 1: Validate JSON fields
-        validation = validate_json_fields(data, profile, mode=validation_mode)
+        validation = validate_json_fields(resolved_data, profile, mode=validation_mode)
         report["validator"] = validation
 
         if not validation["passed"]:
             # Only retry if there are hard errors (warnings never block)
             avoid_notes.extend(validation["errors"])
-            if attempt < max_retries:
+            if not is_last_attempt:
                 continue
-            # Last attempt — assemble whatever we got
-            tailored = assemble_resume_text(data, profile, extra_sections)
+            # Last attempt — assemble whatever we got (bullets are already
+            # resolved to plain text, so this is safe to ship structurally;
+            # the numeric guard below still runs before we return).
+            tailored = assemble_resume_text(resolved_data, profile, extra_sections)
             report["status"] = "failed_validation"
             return tailored, report
 
         # Assemble text (header injected by code, em dashes auto-fixed)
-        tailored = assemble_resume_text(data, profile, extra_sections)
+        tailored = assemble_resume_text(resolved_data, profile, extra_sections)
 
-        # Layer 1.5: Compare the LLM-generated content against the ORIGINAL --
-        # catches fabrication validate_json_fields can't see, since that layer
-        # only inspects the raw JSON and never looks at the source resume at
-        # all. This is where an invented "80%" or a new project actually gets
-        # caught. Deliberately scans only the LLM-authored fields, not the
-        # assembled text -- the header (name/contact) and extra sections are
-        # code-injected/verbatim, and checking them risks false positives
-        # (e.g. the profile's phone number formatted without spaces vs. the
-        # original resume's copy formatted with them).
-        real_metrics = profile.get("resume_facts", {}).get("real_metrics", [])
-        skills_data = data.get("skills", {})
-        llm_text = "\n".join([
-            data.get("summary", ""),
-            *([str(v) for v in skills_data.values()] if isinstance(skills_data, dict) else []),
-            *[b for e in data.get("experience", []) for b in e.get("bullets", [])],
-            *[b for e in data.get("projects", []) for b in e.get("bullets", [])],
-        ])
-        fake_numbers = find_fabricated_numbers(llm_text, resume_text, real_metrics)
+        # NumericGuard: deterministic post-generation check that every number
+        # in the LLM-authored content traces back to a verified fact (or the
+        # profile). This is the enforcement -- the prompt instruction above
+        # is only half the control.
+        scan_text = _build_guard_scan_text(resolved_data)
+        try:
+            guard.check(scan_text)
+        except NumericGuardViolation as e:
+            avoid_notes.append(
+                f"Unverified number(s) {e.numbers} in: " + "; ".join(e.bullets[:5])
+            )
+            if not is_last_attempt:
+                continue
+            tailored = _ship_unquantified_fallback(data, profile, extra_sections, fact_bank, guard)
+            report["status"] = "approved_unquantified_fallback"
+            report["guard_violation"] = {"numbers": e.numbers, "bullets": e.bullets}
+            return tailored, report
+
+        # Layer 1.5: Structural/preserved-entity checks against the original
+        # (companies, school, sections, banned words). Numeric fabrication is
+        # NumericGuard's job now, not this layer's.
         deep_validation = validate_tailored_resume(tailored, profile, original_text=resume_text)
         deep_errors = list(deep_validation["errors"])
-        if fake_numbers:
-            deep_errors.append(f"Fabricated numbers not in original resume: {', '.join(fake_numbers)}")
 
         if deep_errors:
             report["validator"] = {"passed": False, "errors": deep_errors, "warnings": deep_validation["warnings"]}
             avoid_notes.extend(deep_errors)
-            if attempt < max_retries:
+            if not is_last_attempt:
                 continue
             report["status"] = "failed_validation"
             return tailored, report
@@ -535,7 +722,7 @@ def tailor_resume(
 
         if not judge["passed"]:
             avoid_notes.append(f"Judge rejected: {judge['issues']}")
-            if attempt < max_retries:
+            if not is_last_attempt:
                 # In normal mode, only retry on judge failure if there are retries left
                 if validation_mode != "lenient":
                     continue
@@ -549,6 +736,29 @@ def tailor_resume(
 
     report["status"] = "exhausted_retries"
     return tailored, report
+
+
+def _ship_unquantified_fallback(
+    data: dict, profile: dict, extra_sections: dict, fact_bank: FactBank, guard: NumericGuard,
+) -> str:
+    """Build, assemble, and re-verify the unquantified fallback.
+
+    Called only after retries are exhausted with a numeric violation still
+    outstanding. Re-checks with the same NumericGuard before returning --
+    "never ship on a failed guard" is an invariant this actually verifies,
+    not just a property the construction is assumed to have. In the
+    (should-not-happen) case the recheck still fails, every digit is
+    stripped from the final text as an absolute last resort.
+    """
+    fallback_data = _fallback_unquantified(data, fact_bank)
+    resolved_fallback, _ = _resolve_fact_bullets(fallback_data, fact_bank)
+    tailored = assemble_resume_text(resolved_fallback, profile, extra_sections)
+    try:
+        guard.check(_build_guard_scan_text(resolved_fallback))
+    except NumericGuardViolation:
+        log.error("Unquantified fallback still failed NumericGuard -- stripping all digits as last resort")
+        tailored = _DIGIT_TOKEN_RE.sub("", tailored)
+    return tailored
 
 
 # ── Batch Entry Point ────────────────────────────────────────────────────
@@ -567,6 +777,9 @@ def run_tailoring(min_score: int = 7, limit: int = 20,
     """
     profile = load_profile()
     resume_text = RESUME_PATH.read_text(encoding="utf-8")
+    # Loaded once per batch (not per job) -- also means a bad facts.yaml
+    # entry fails loudly here, before any LLM calls, not mid-batch.
+    fact_bank = FactBank.load()
     conn = get_connection()
 
     jobs = get_jobs_by_stage(conn=conn, stage="pending_tailor", min_score=min_score, limit=limit)
@@ -586,7 +799,8 @@ def run_tailoring(min_score: int = 7, limit: int = 20,
         completed += 1
         try:
             tailored, report = tailor_resume(resume_text, job, profile,
-                                             validation_mode=validation_mode)
+                                             validation_mode=validation_mode,
+                                             fact_bank=fact_bank)
 
             # Build safe filename prefix
             safe_title = re.sub(r"[^\w\s-]", "", job["title"])[:50].strip().replace(" ", "_")
@@ -614,9 +828,11 @@ def run_tailoring(min_score: int = 7, limit: int = 20,
             report_path.write_text(json.dumps(report, indent=2), encoding="utf-8")
 
             # Generate PDF for approved resumes (best-effort)
-            # "approved_with_judge_warning" is also a success — resume was generated.
+            # "approved_with_judge_warning" and "approved_unquantified_fallback"
+            # are also successes — a real, safe resume was generated in both cases.
             pdf_path = None
-            if report["status"] in ("approved", "approved_with_judge_warning"):
+            if report["status"] in ("approved", "approved_with_judge_warning",
+                                    "approved_unquantified_fallback"):
                 try:
                     from applypilot.scoring.pdf import convert_to_pdf
                     pdf_path = str(convert_to_pdf(txt_path))
@@ -655,7 +871,7 @@ def run_tailoring(min_score: int = 7, limit: int = 20,
 
     # Persist to DB: increment attempt counter for ALL, save path only for approved
     now = datetime.now(timezone.utc).isoformat()
-    _success_statuses = {"approved", "approved_with_judge_warning"}
+    _success_statuses = {"approved", "approved_with_judge_warning", "approved_unquantified_fallback"}
     for r in results:
         if r["status"] in _success_statuses:
             conn.execute(

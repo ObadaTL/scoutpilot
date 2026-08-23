@@ -24,7 +24,11 @@ from rich.console import Console
 from rich.live import Live
 
 from applypilot import config
-from applypilot.database import get_connection
+from applypilot.database import (
+    get_connection, start_run, end_run, create_attempt, finish_attempt,
+    recover_orphaned_attempts, log_event, attach_tool_result,
+    set_attempt_session, set_attempt_cost,
+)
 from applypilot.apply import chrome, dashboard, prompt as prompt_mod
 from applypilot.apply.chrome import (
     launch_chrome, cleanup_worker, kill_all_chrome,
@@ -88,16 +92,17 @@ def _make_mcp_config(cdp_port: int) -> dict:
 # ---------------------------------------------------------------------------
 
 def acquire_job(target_url: str | None = None, min_score: int = 7,
-                worker_id: int = 0) -> dict | None:
-    """Atomically acquire the next job to apply to.
+                worker_id: int = 0, run_id: int | None = None) -> dict | None:
+    """Atomically acquire the next job to apply to and open an attempt for it.
 
     Args:
         target_url: Apply to a specific URL instead of picking from queue.
         min_score: Minimum fit_score threshold.
         worker_id: Worker claiming this job (for tracking).
+        run_id: The apply run this attempt belongs to.
 
     Returns:
-        Job dict or None if the queue is empty.
+        Job dict (with an 'attempt_id' key) or None if the queue is empty.
     """
     conn = get_connection()
     try:
@@ -111,7 +116,7 @@ def acquire_job(target_url: str | None = None, min_score: int = 7,
                 FROM jobs
                 WHERE (url = ? OR application_url = ? OR application_url LIKE ? OR url LIKE ?)
                   AND tailored_resume_path IS NOT NULL
-                  AND apply_status != 'in_progress'
+                  AND (apply_status IS NULL OR apply_status != 'in_progress')
                 LIMIT 1
             """, (target_url, target_url, like, like)).fetchone()
         else:
@@ -132,7 +137,7 @@ def acquire_job(target_url: str | None = None, min_score: int = 7,
                        fit_score, location, full_description, cover_letter_path
                 FROM jobs
                 WHERE tailored_resume_path IS NOT NULL
-                  AND (apply_status IS NULL OR apply_status = 'failed')
+                  AND (apply_status IS NULL OR apply_status = 'failed' OR apply_status = 'skipped')
                   AND (apply_attempts IS NULL OR apply_attempts < ?)
                   AND fit_score >= ?
                   {site_clause}
@@ -157,53 +162,48 @@ def acquire_job(target_url: str | None = None, min_score: int = 7,
             logger.info("Skipping manual ATS: %s", row["url"][:80])
             return None
 
-        now = datetime.now(timezone.utc).isoformat()
-        conn.execute("""
-            UPDATE jobs SET apply_status = 'in_progress',
-                           agent_id = ?,
-                           last_attempted_at = ?
-            WHERE url = ?
-        """, (f"worker-{worker_id}", now, row["url"]))
+        attempt_id = create_attempt(conn, row["url"], run_id, worker_id=worker_id)
         conn.commit()
 
-        return dict(row)
+        job = dict(row)
+        job["attempt_id"] = attempt_id
+        return job
     except Exception:
         conn.rollback()
         raise
 
 
-def mark_result(url: str, status: str, error: str | None = None,
+def mark_result(attempt_id: int, url: str, status: str, error: str | None = None,
                 permanent: bool = False, duration_ms: int | None = None,
                 task_id: str | None = None) -> None:
-    """Update a job's apply status in the database."""
+    """Record an attempt's outcome and mirror it onto the job."""
     conn = get_connection()
-    now = datetime.now(timezone.utc).isoformat()
     if status == "applied":
-        conn.execute("""
-            UPDATE jobs SET apply_status = 'applied', applied_at = ?,
-                           apply_error = NULL, agent_id = NULL,
-                           apply_duration_ms = ?, apply_task_id = ?
-            WHERE url = ?
-        """, (now, duration_ms, task_id, url))
+        new_attempts = None  # leave jobs.apply_attempts as-is on success
+    elif permanent:
+        new_attempts = 99
     else:
-        attempts = 99 if permanent else "COALESCE(apply_attempts, 0) + 1"
-        conn.execute(f"""
-            UPDATE jobs SET apply_status = ?, apply_error = ?,
-                           apply_attempts = {attempts}, agent_id = NULL,
-                           apply_duration_ms = ?, apply_task_id = ?
-            WHERE url = ?
-        """, (status, error or "unknown", duration_ms, task_id, url))
-    conn.commit()
+        current = conn.execute(
+            "SELECT apply_attempts FROM jobs WHERE url = ?", (url,)
+        ).fetchone()
+        new_attempts = (current["apply_attempts"] or 0) + 1 if current else 1
 
-
-def release_lock(url: str) -> None:
-    """Release the in_progress lock without changing status."""
-    conn = get_connection()
-    conn.execute(
-        "UPDATE jobs SET apply_status = NULL, agent_id = NULL WHERE url = ? AND apply_status = 'in_progress'",
-        (url,),
+    finish_attempt(
+        conn, attempt_id, status,
+        error=None if status == "applied" else (error or "unknown"),
+        duration_ms=duration_ms, task_id=task_id, apply_attempts=new_attempts,
     )
-    conn.commit()
+
+
+def release_lock(attempt_id: int, url: str) -> None:
+    """Release the in_progress lock without recording a terminal outcome.
+
+    Used when a job was claimed but never really attempted (e.g. skipped
+    via Ctrl+C before Chrome/Claude did anything). The job becomes eligible
+    for re-acquisition again.
+    """
+    conn = get_connection()
+    finish_attempt(conn, attempt_id, "skipped")
 
 
 # ---------------------------------------------------------------------------
@@ -217,8 +217,11 @@ def gen_prompt(target_url: str, min_score: int = 7,
     Returns:
         Path to the generated prompt file, or None if no job found.
     """
-    job = acquire_job(target_url=target_url, min_score=min_score, worker_id=worker_id)
+    conn = get_connection()
+    run_id = start_run(conn, "apply", {"gen_prompt": True, "target_url": target_url, "model": model})
+    job = acquire_job(target_url=target_url, min_score=min_score, worker_id=worker_id, run_id=run_id)
     if not job:
+        end_run(conn, run_id, status="completed", stats={"found": False})
         return None
 
     # Read resume text
@@ -231,7 +234,8 @@ def gen_prompt(target_url: str, min_score: int = 7,
     prompt = prompt_mod.build_prompt(job=job, tailored_resume=resume_text)
 
     # Release the lock so the job stays available
-    release_lock(job["url"])
+    release_lock(job["attempt_id"], job["url"])
+    end_run(conn, run_id, status="completed", stats={"found": True, "url": job["url"]})
 
     # Write prompt file
     config.ensure_dirs()
@@ -250,26 +254,25 @@ def gen_prompt(target_url: str, min_score: int = 7,
 def mark_job(url: str, status: str, reason: str | None = None) -> None:
     """Manually mark a job's apply status in the database.
 
+    Records this as a completed attempt (tied to its own single-attempt run)
+    so the manual override shows up in the same history as automated ones.
+
     Args:
         url: Job URL to mark.
         status: Either 'applied' or 'failed'.
         reason: Failure reason (only for status='failed').
     """
     conn = get_connection()
-    now = datetime.now(timezone.utc).isoformat()
-    if status == "applied":
-        conn.execute("""
-            UPDATE jobs SET apply_status = 'applied', applied_at = ?,
-                           apply_error = NULL, agent_id = NULL
-            WHERE url = ?
-        """, (now, url))
-    else:
-        conn.execute("""
-            UPDATE jobs SET apply_status = 'failed', apply_error = ?,
-                           apply_attempts = 99, agent_id = NULL
-            WHERE url = ?
-        """, (reason or "manual", url))
+    run_id = start_run(conn, "apply", {"manual": True, "action": status})
+    attempt_id = create_attempt(conn, url, run_id, worker_id=None)
     conn.commit()
+
+    if status == "applied":
+        finish_attempt(conn, attempt_id, "applied")
+    else:
+        finish_attempt(conn, attempt_id, "failed", error=reason or "manual", apply_attempts=99)
+
+    end_run(conn, run_id, status="completed", stats={"url": url, "status": status})
 
 
 def reset_failed() -> int:
@@ -293,6 +296,34 @@ def reset_failed() -> int:
 # ---------------------------------------------------------------------------
 # Per-job execution
 # ---------------------------------------------------------------------------
+
+def _check_playwright_mcp(msg: dict) -> str | None:
+    """Inspect a system/init stream-json event for playwright MCP health.
+
+    Browser control depends entirely on this server. If it didn't come up,
+    continuing would just burn a full attempt fumbling with no tools --
+    better to abort immediately with a clear, retryable error.
+
+    Returns:
+        An error string if playwright failed to connect, else None.
+    """
+    servers = msg.get("mcp_servers") or []
+    server_errors = msg.get("mcp_server_errors") or {}
+
+    if isinstance(server_errors, dict) and server_errors.get("playwright"):
+        return str(server_errors["playwright"])
+    if isinstance(server_errors, list):
+        for e in server_errors:
+            if isinstance(e, dict) and e.get("name") == "playwright":
+                return str(e.get("error") or e)
+
+    entry = next((s for s in servers if isinstance(s, dict) and s.get("name") == "playwright"), None)
+    if entry is None:
+        return "playwright MCP server not reported in init event"
+    status = entry.get("status")
+    if status not in ("connected", "ready", "ok"):
+        return f"playwright MCP server status: {status}"
+    return None
 
 def run_job(job: dict, port: int, worker_id: int = 0,
             model: str = "sonnet", dry_run: bool = False) -> tuple[str, int]:
@@ -367,13 +398,16 @@ def run_job(job: dict, port: int, worker_id: int = 0,
     start = time.time()
     stats: dict = {}
     proc = None
+    stderr_thread = None
+    attempt_id = job["attempt_id"]
+    conn = get_connection()
 
     try:
         proc = subprocess.Popen(
             cmd,
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
+            stderr=subprocess.PIPE,
             text=True,
             encoding="utf-8",
             errors="replace",
@@ -386,7 +420,34 @@ def run_job(job: dict, port: int, worker_id: int = 0,
         proc.stdin.write(agent_prompt)
         proc.stdin.close()
 
+        # stderr has its own OS pipe buffer, separate from stdout's. If we
+        # only read stdout, a chatty child (MCP server startup noise, node
+        # warnings) can fill that buffer and block on write -- which stalls
+        # the child entirely, including its stdout. Drain it concurrently
+        # so the two pipes can never deadlock each other.
+        stderr_log_path = config.LOG_DIR / f"worker-{worker_id}-stderr.log"
+
+        def _drain_stderr(p=proc, path=stderr_log_path):
+            try:
+                with open(path, "a", encoding="utf-8") as ef:
+                    for eline in p.stderr:
+                        ef.write(eline)
+            except Exception:
+                logger.debug("Worker %d stderr drain ended", worker_id, exc_info=True)
+
+        stderr_thread = threading.Thread(target=_drain_stderr, daemon=True)
+        stderr_thread.start()
+
+        seq = 0
+
+        def _next_seq():
+            nonlocal seq
+            seq += 1
+            return seq
+
         text_parts: list[str] = []
+        abort_reason: str | None = None
+
         with open(worker_log, "a", encoding="utf-8") as lf:
             lf.write(log_header)
 
@@ -396,50 +457,96 @@ def run_job(job: dict, port: int, worker_id: int = 0,
                     continue
                 try:
                     msg = json.loads(line)
-                    msg_type = msg.get("type")
-                    if msg_type == "assistant":
-                        for block in msg.get("message", {}).get("content", []):
-                            bt = block.get("type")
-                            if bt == "text":
-                                text_parts.append(block["text"])
-                                lf.write(block["text"] + "\n")
-                            elif bt == "tool_use":
-                                name = (
-                                    block.get("name", "")
-                                    .replace("mcp__playwright__", "")
-                                    .replace("mcp__gmail__", "gmail:")
-                                )
-                                inp = block.get("input", {})
-                                if "url" in inp:
-                                    desc = f"{name} {inp['url'][:60]}"
-                                elif "ref" in inp:
-                                    desc = f"{name} {inp.get('element', inp.get('text', ''))}"[:50]
-                                elif "fields" in inp:
-                                    desc = f"{name} ({len(inp['fields'])} fields)"
-                                elif "paths" in inp:
-                                    desc = f"{name} upload"
-                                else:
-                                    desc = name
-
-                                lf.write(f"  >> {desc}\n")
-                                ws = get_state(worker_id)
-                                cur_actions = ws.actions if ws else 0
-                                update_state(worker_id,
-                                             actions=cur_actions + 1,
-                                             last_action=desc[:35])
-                    elif msg_type == "result":
-                        stats = {
-                            "input_tokens": msg.get("usage", {}).get("input_tokens", 0),
-                            "output_tokens": msg.get("usage", {}).get("output_tokens", 0),
-                            "cache_read": msg.get("usage", {}).get("cache_read_input_tokens", 0),
-                            "cache_create": msg.get("usage", {}).get("cache_creation_input_tokens", 0),
-                            "cost_usd": msg.get("total_cost_usd", 0),
-                            "turns": msg.get("num_turns", 0),
-                        }
-                        text_parts.append(msg.get("result", ""))
                 except json.JSONDecodeError:
                     text_parts.append(line)
                     lf.write(line + "\n")
+                    continue
+
+                msg_type = msg.get("type")
+                parent_tool_use_id = msg.get("parent_tool_use_id")
+
+                if msg_type == "system" and msg.get("subtype") == "init":
+                    session_id = msg.get("session_id")
+                    if session_id:
+                        set_attempt_session(conn, attempt_id, session_id)
+                    mcp_error = _check_playwright_mcp(msg)
+                    log_event(conn, attempt_id, _next_seq(), "system_init", raw=msg)
+                    conn.commit()
+                    if mcp_error:
+                        abort_reason = f"mcp_playwright_unavailable:{mcp_error}"
+                        lf.write(f"  !! ABORT: {abort_reason}\n")
+                        break
+
+                elif msg_type == "assistant":
+                    for block in msg.get("message", {}).get("content", []):
+                        bt = block.get("type")
+                        if bt == "text":
+                            text_parts.append(block["text"])
+                            lf.write(block["text"] + "\n")
+                            log_event(conn, attempt_id, _next_seq(), "text",
+                                     text=block["text"],
+                                     parent_tool_use_id=parent_tool_use_id, raw=block)
+                        elif bt == "tool_use":
+                            name = (
+                                block.get("name", "")
+                                .replace("mcp__playwright__", "")
+                                .replace("mcp__gmail__", "gmail:")
+                            )
+                            inp = block.get("input", {})
+                            if "url" in inp:
+                                desc = f"{name} {inp['url'][:60]}"
+                            elif "ref" in inp:
+                                desc = f"{name} {inp.get('element', inp.get('text', ''))}"[:50]
+                            elif "fields" in inp:
+                                desc = f"{name} ({len(inp['fields'])} fields)"
+                            elif "paths" in inp:
+                                desc = f"{name} upload"
+                            else:
+                                desc = name
+
+                            lf.write(f"  >> {desc}\n")
+                            ws = get_state(worker_id)
+                            cur_actions = ws.actions if ws else 0
+                            update_state(worker_id,
+                                         actions=cur_actions + 1,
+                                         last_action=desc[:35])
+                            log_event(conn, attempt_id, _next_seq(), "tool_use",
+                                     tool_name=block.get("name", ""),
+                                     tool_use_id=block.get("id"),
+                                     parent_tool_use_id=parent_tool_use_id,
+                                     input_data=inp, raw=block)
+                    conn.commit()
+
+                elif msg_type == "user":
+                    for block in msg.get("message", {}).get("content", []):
+                        if block.get("type") == "tool_result":
+                            attach_tool_result(conn, attempt_id, block.get("tool_use_id"),
+                                               block.get("content"), raw=block)
+                    conn.commit()
+
+                elif msg_type == "result":
+                    stats = {
+                        "input_tokens": msg.get("usage", {}).get("input_tokens", 0),
+                        "output_tokens": msg.get("usage", {}).get("output_tokens", 0),
+                        "cache_read": msg.get("usage", {}).get("cache_read_input_tokens", 0),
+                        "cache_create": msg.get("usage", {}).get("cache_creation_input_tokens", 0),
+                        "cost_usd": msg.get("total_cost_usd", 0),
+                        "turns": msg.get("num_turns", 0),
+                    }
+                    text_parts.append(msg.get("result", ""))
+                    set_attempt_cost(conn, attempt_id, stats["cost_usd"])
+                    log_event(conn, attempt_id, _next_seq(), "result", raw=msg)
+                    conn.commit()
+
+        if abort_reason:
+            if proc.poll() is None:
+                _kill_process_tree(proc.pid)
+            proc.wait(timeout=10)
+            proc = None
+            duration_ms = int((time.time() - start) * 1000)
+            add_event(f"[W{worker_id}] ABORTED: {abort_reason[:40]}")
+            update_state(worker_id, status="failed", last_action="mcp server unavailable")
+            return f"failed:{abort_reason}", duration_ms
 
         proc.wait(timeout=300)
         returncode = proc.returncode
@@ -493,16 +600,36 @@ def run_job(job: dict, port: int, worker_id: int = 0,
                     return f"failed:{reason}", duration_ms
             return "failed:unknown", duration_ms
 
+        # No RESULT: marker was ever emitted. RESULT: stays authoritative
+        # whenever present (it carries far more meaning than a process exit
+        # code ever could -- expired/captcha/login_issue/failed all exit 0).
+        # The exit code only fills the gap for the cases where the agent
+        # never got to report one.
+        if returncode == 143:
+            add_event(f"[W{worker_id}] SIGTERM, turn unfinished ({elapsed}s)")
+            update_state(worker_id, status="needs_review",
+                         last_action=f"SIGTERM mid-turn ({elapsed}s)")
+            return "needs_review:sigterm_unfinished_turn", duration_ms
+
+        if returncode != 0:
+            add_event(f"[W{worker_id}] CRASHED exit={returncode} ({elapsed}s)")
+            update_state(worker_id, status="failed",
+                         last_action=f"crashed exit={returncode}")
+            return f"failed:crashed_exit_{returncode}", duration_ms
+
         add_event(f"[W{worker_id}] NO RESULT ({elapsed}s)")
         update_state(worker_id, status="failed", last_action=f"no result ({elapsed}s)")
         return "failed:no_result_line", duration_ms
 
     except subprocess.TimeoutExpired:
+        # Same ambiguity as a SIGTERM mid-turn: the agent may have already
+        # interacted with the real application form before being killed
+        # below, so this needs a human look rather than a blind retry.
         duration_ms = int((time.time() - start) * 1000)
         elapsed = int(time.time() - start)
-        add_event(f"[W{worker_id}] TIMEOUT ({elapsed}s)")
-        update_state(worker_id, status="failed", last_action=f"TIMEOUT ({elapsed}s)")
-        return "failed:timeout", duration_ms
+        add_event(f"[W{worker_id}] TIMEOUT, turn unfinished ({elapsed}s)")
+        update_state(worker_id, status="needs_review", last_action=f"TIMEOUT mid-turn ({elapsed}s)")
+        return "needs_review:timeout_unfinished_turn", duration_ms
     except Exception as e:
         duration_ms = int((time.time() - start) * 1000)
         add_event(f"[W{worker_id}] ERROR: {str(e)[:40]}")
@@ -513,6 +640,8 @@ def run_job(job: dict, port: int, worker_id: int = 0,
             _claude_procs.pop(worker_id, None)
         if proc is not None and proc.poll() is None:
             _kill_process_tree(proc.pid)
+        if stderr_thread is not None:
+            stderr_thread.join(timeout=5)
 
 
 # ---------------------------------------------------------------------------
@@ -548,7 +677,8 @@ def _is_permanent_failure(result: str) -> bool:
 def worker_loop(worker_id: int = 0, limit: int = 1,
                 target_url: str | None = None,
                 min_score: int = 7, headless: bool = False,
-                model: str = "sonnet", dry_run: bool = False) -> tuple[int, int]:
+                model: str = "sonnet", dry_run: bool = False,
+                run_id: int | None = None) -> tuple[int, int]:
     """Run jobs sequentially until limit is reached or queue is empty.
 
     Args:
@@ -559,6 +689,7 @@ def worker_loop(worker_id: int = 0, limit: int = 1,
         headless: Run Chrome headless.
         model: Claude model name.
         dry_run: Don't click Submit.
+        run_id: The apply run this worker's attempts belong to.
 
     Returns:
         Tuple of (applied_count, failed_count).
@@ -578,7 +709,7 @@ def worker_loop(worker_id: int = 0, limit: int = 1,
                      last_action="waiting for job", actions=0)
 
         job = acquire_job(target_url=target_url, min_score=min_score,
-                          worker_id=worker_id)
+                          worker_id=worker_id, run_id=run_id)
         if not job:
             if not continuous:
                 add_event(f"[W{worker_id}] Queue empty")
@@ -605,17 +736,27 @@ def worker_loop(worker_id: int = 0, limit: int = 1,
                                             model=model, dry_run=dry_run)
 
             if result == "skipped":
-                release_lock(job["url"])
+                release_lock(job["attempt_id"], job["url"])
                 add_event(f"[W{worker_id}] Skipped: {job['title'][:30]}")
                 continue
             elif result == "applied":
-                mark_result(job["url"], "applied", duration_ms=duration_ms)
+                mark_result(job["attempt_id"], job["url"], "applied", duration_ms=duration_ms)
                 applied += 1
                 update_state(worker_id, jobs_applied=applied,
                              jobs_done=applied + failed)
+            elif result.startswith("needs_review"):
+                # Turn was cut off (SIGTERM/timeout) with no RESULT: marker --
+                # we can't tell if the agent already touched the real form,
+                # so this needs a human look rather than a blind retry.
+                reason = result.split(":", 1)[-1] if ":" in result else result
+                mark_result(job["attempt_id"], job["url"], "needs_review", reason,
+                            permanent=False, duration_ms=duration_ms)
+                failed += 1
+                update_state(worker_id, jobs_failed=failed,
+                             jobs_done=applied + failed)
             else:
                 reason = result.split(":", 1)[-1] if ":" in result else result
-                mark_result(job["url"], "failed", reason,
+                mark_result(job["attempt_id"], job["url"], "failed", reason,
                             permanent=_is_permanent_failure(result),
                             duration_ms=duration_ms)
                 failed += 1
@@ -623,7 +764,7 @@ def worker_loop(worker_id: int = 0, limit: int = 1,
                              jobs_done=applied + failed)
 
         except KeyboardInterrupt:
-            release_lock(job["url"])
+            release_lock(job["attempt_id"], job["url"])
             if _stop_event.is_set():
                 break
             add_event(f"[W{worker_id}] Job skipped (Ctrl+C)")
@@ -631,7 +772,7 @@ def worker_loop(worker_id: int = 0, limit: int = 1,
         except Exception as e:
             logger.exception("Worker %d launcher error", worker_id)
             add_event(f"[W{worker_id}] Launcher error: {str(e)[:40]}")
-            release_lock(job["url"])
+            release_lock(job["attempt_id"], job["url"])
             failed += 1
             update_state(worker_id, jobs_failed=failed)
         finally:
@@ -674,6 +815,24 @@ def main(limit: int = 1, target_url: str | None = None,
     config.ensure_dirs()
     console = Console()
 
+    conn = get_connection()
+
+    # A worker that died mid-attempt in a previous run leaves its attempt
+    # (and the job's apply_status mirror) stuck 'in_progress' forever unless
+    # something notices. Do that here, once, before claiming any new work.
+    recovered = recover_orphaned_attempts(conn)
+    if recovered:
+        console.print(
+            f"[yellow]Recovered {len(recovered)} orphaned attempt(s) "
+            f"from a previous run -> needs_review[/yellow]"
+        )
+
+    run_id = start_run(conn, "apply", {
+        "limit": limit, "target_url": target_url, "min_score": min_score,
+        "headless": headless, "model": model, "dry_run": dry_run,
+        "continuous": continuous, "poll_interval": poll_interval, "workers": workers,
+    })
+
     if continuous:
         effective_limit = 0
         mode_label = "continuous"
@@ -714,6 +873,7 @@ def main(limit: int = 1, target_url: str | None = None,
 
     signal.signal(signal.SIGINT, _sigint_handler)
 
+    run_status = "interrupted"
     try:
         with Live(render_full(), console=console, refresh_per_second=2) as live:
             # Daemon thread for display refresh only (no business logic)
@@ -737,6 +897,7 @@ def main(limit: int = 1, target_url: str | None = None,
                     headless=headless,
                     model=model,
                     dry_run=dry_run,
+                    run_id=run_id,
                 )
             else:
                 # Multi-worker — distribute limit across workers
@@ -760,6 +921,7 @@ def main(limit: int = 1, target_url: str | None = None,
                             headless=headless,
                             model=model,
                             dry_run=dry_run,
+                            run_id=run_id,
                         ): i
                         for i in range(workers)
                     }
@@ -787,8 +949,10 @@ def main(limit: int = 1, target_url: str | None = None,
         )
         console.print(f"Logs: {config.LOG_DIR}")
 
+        run_status = "completed"
     except KeyboardInterrupt:
-        pass
+        run_status = "interrupted"
     finally:
         _stop_event.set()
         kill_all_chrome()
+        end_run(conn, run_id, status=run_status, stats=get_totals())

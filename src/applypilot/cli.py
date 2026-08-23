@@ -323,6 +323,21 @@ def status() -> None:
 
 
 @app.command()
+def jobs(
+    min_fit: int = typer.Option(0, "--min-fit", help="Minimum fit score."),
+    limit: int = typer.Option(20, "--limit", "-l", help="Max jobs to show."),
+    site: Optional[str] = typer.Option(None, "--site", help="Filter to one source site."),
+) -> None:
+    """List individual jobs with fit score and company context."""
+    _bootstrap()
+
+    from applypilot.terminal_view import list_jobs, render_jobs
+
+    matched = list_jobs(min_fit=min_fit, limit=limit, site=site)
+    render_jobs(matched, console)
+
+
+@app.command()
 def dashboard() -> None:
     """Generate and open the HTML dashboard in your browser."""
     _bootstrap()

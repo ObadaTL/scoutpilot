@@ -10,7 +10,6 @@ Generates a self-contained HTML dashboard with:
 
 from __future__ import annotations
 
-import os
 import webbrowser
 from html import escape
 from pathlib import Path
@@ -76,7 +75,7 @@ def generate_dashboard(output_path: str | None = None) -> str:
     jobs = conn.execute("""
         SELECT url, title, salary, description, location, site, strategy,
                full_description, application_url, detail_error,
-               fit_score, score_reasoning
+               fit_score, score_reasoning, company_summary
         FROM jobs
         WHERE fit_score >= 5
         ORDER BY fit_score DESC, site, title
@@ -160,9 +159,13 @@ def generate_dashboard(output_path: str | None = None) -> str:
         keywords = reasoning_lines[0][:120] if reasoning_lines else ""
         reasoning = reasoning_lines[1][:200] if len(reasoning_lines) > 1 else ""
 
-        desc_preview = escape(j["full_description"] or "")[:300]
-        full_desc_html = escape(j["full_description"] or "").replace("\n", "<br>")
-        desc_len = len(j["full_description"] or "")
+        full_desc_text = j["full_description"] or ""
+        desc_preview = escape(full_desc_text[:300])
+        desc_ellipsis = "..." if len(full_desc_text) > 300 else ""
+        full_desc_html = escape(full_desc_text).replace("\n", "<br>")
+        desc_len = len(full_desc_text)
+
+        company_summary = escape(j["company_summary"] or "")
 
         meta_parts = []
         meta_parts.append(
@@ -184,10 +187,11 @@ def generate_dashboard(output_path: str | None = None) -> str:
             <span class="score-pill" style="background:{'#10b981' if score >= 7 else '#f59e0b'}">{score}</span>
             <a href="{url}" class="job-title" target="_blank">{title}</a>
           </div>
+          {f'<div class="company-summary">{company_summary}</div>' if company_summary else ''}
           <div class="meta-row">{meta_html}</div>
           {f'<div class="keywords-row">{escape(keywords)}</div>' if keywords else ''}
           {f'<div class="reasoning-row">{escape(reasoning)}</div>' if reasoning else ''}
-          <p class="desc-preview">{desc_preview}...</p>
+          <p class="desc-preview">{desc_preview}{desc_ellipsis}</p>
           {"<details class='full-desc-details'><summary class='expand-btn'>Full Description (" + f'{desc_len:,}' + " chars)</summary><div class='full-desc'>" + full_desc_html + "</div></details>" if j["full_description"] else ""}
           <div class="card-footer">{apply_html}</div>
         </div>"""
@@ -267,6 +271,8 @@ def generate_dashboard(output_path: str | None = None) -> str:
   .job-title {{ color: #e2e8f0; text-decoration: none; font-weight: 600; font-size: 0.95rem; }}
   .job-title:hover {{ color: #60a5fa; }}
 
+  .company-summary {{ font-size: 0.78rem; color: #a8b3c4; line-height: 1.4; margin-bottom: 0.5rem; }}
+
   .meta-row {{ display: flex; flex-wrap: wrap; gap: 0.4rem; margin-bottom: 0.4rem; }}
   .meta-tag {{ font-size: 0.72rem; padding: 0.15rem 0.5rem; border-radius: 4px; background: #334155; color: #94a3b8; }}
   .meta-tag.salary {{ background: #064e3b; color: #6ee7b7; }}
@@ -313,10 +319,10 @@ def generate_dashboard(output_path: str | None = None) -> str:
 
 <div class="filters">
   <span class="filter-label">Score:</span>
-  <button class="filter-btn active" onclick="filterScore(0)">All 5+</button>
-  <button class="filter-btn" onclick="filterScore(7)">7+ Strong</button>
-  <button class="filter-btn" onclick="filterScore(8)">8+ Excellent</button>
-  <button class="filter-btn" onclick="filterScore(9)">9+ Perfect</button>
+  <button class="filter-btn active" onclick="filterScore(0, this)">All 5+</button>
+  <button class="filter-btn" onclick="filterScore(7, this)">7+ Strong</button>
+  <button class="filter-btn" onclick="filterScore(8, this)">8+ Excellent</button>
+  <button class="filter-btn" onclick="filterScore(9, this)">9+ Perfect</button>
   <span class="filter-label" style="margin-left:1rem">Search:</span>
   <input type="text" class="search-input" placeholder="Filter by title, site..." oninput="filterText(this.value)">
 </div>
@@ -340,10 +346,10 @@ def generate_dashboard(output_path: str | None = None) -> str:
 let minScore = 0;
 let searchText = '';
 
-function filterScore(min) {{
+function filterScore(min, btn) {{
   minScore = min;
   document.querySelectorAll('.filter-btn').forEach(b => b.classList.remove('active'));
-  event.target.classList.add('active');
+  btn.classList.add('active');
   applyFilters();
 }}
 
@@ -403,4 +409,4 @@ def open_dashboard(output_path: str | None = None) -> None:
     """
     path = generate_dashboard(output_path)
     console.print("[dim]Opening in browser...[/dim]")
-    webbrowser.open(f"file:///{path}")
+    webbrowser.open(Path(path).as_uri())

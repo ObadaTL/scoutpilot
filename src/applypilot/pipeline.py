@@ -22,7 +22,7 @@ from rich.panel import Panel
 from rich.table import Table
 
 from applypilot.config import load_env, ensure_dirs
-from applypilot.database import init_db, get_connection, get_stats
+from applypilot.database import init_db, get_connection, get_stats, start_run, end_run
 
 log = logging.getLogger(__name__)
 console = Console()
@@ -61,6 +61,8 @@ _UPSTREAM: dict[str, str | None] = {
 
 def _run_discover(workers: int = 1) -> dict:
     """Stage: Job discovery — JobSpy, Workday, and smart-extract scrapers."""
+    conn = get_connection()
+    run_id = start_run(conn, "discover", {"workers": workers})
     stats: dict = {"jobspy": None, "workday": None, "smartextract": None}
 
     # JobSpy
@@ -96,39 +98,53 @@ def _run_discover(workers: int = 1) -> dict:
         console.print(f"  [red]Smart extract error:[/red] {e}")
         stats["smartextract"] = f"error: {e}"
 
+    errored = any(isinstance(v, str) and v.startswith("error") for v in stats.values())
+    end_run(conn, run_id, status="partial" if errored else "completed", stats=stats)
     return stats
 
 
 def _run_enrich(workers: int = 1) -> dict:
     """Stage: Detail enrichment — scrape full descriptions and apply URLs."""
+    conn = get_connection()
+    run_id = start_run(conn, "enrich", {"workers": workers})
     try:
         from applypilot.enrichment.detail import run_enrichment
-        run_enrichment(workers=workers)
+        result = run_enrichment(workers=workers)
+        end_run(conn, run_id, status="completed", stats=result)
         return {"status": "ok"}
     except Exception as e:
         log.error("Enrichment failed: %s", e)
+        end_run(conn, run_id, status="failed", error=str(e))
         return {"status": f"error: {e}"}
 
 
 def _run_score() -> dict:
     """Stage: LLM scoring — assign fit scores 1-10."""
+    conn = get_connection()
+    run_id = start_run(conn, "score", {})
     try:
         from applypilot.scoring.scorer import run_scoring
-        run_scoring()
+        result = run_scoring()
+        end_run(conn, run_id, status="completed", stats=result)
         return {"status": "ok"}
     except Exception as e:
         log.error("Scoring failed: %s", e)
+        end_run(conn, run_id, status="failed", error=str(e))
         return {"status": f"error: {e}"}
 
 
 def _run_tailor(min_score: int = 7, validation_mode: str = "normal") -> dict:
     """Stage: Resume tailoring — generate tailored resumes for high-fit jobs."""
+    conn = get_connection()
+    run_id = start_run(conn, "tailor", {"min_score": min_score, "validation_mode": validation_mode})
     try:
         from applypilot.scoring.tailor import run_tailoring
-        run_tailoring(min_score=min_score, validation_mode=validation_mode)
+        result = run_tailoring(min_score=min_score, validation_mode=validation_mode)
+        end_run(conn, run_id, status="completed", stats=result)
         return {"status": "ok"}
     except Exception as e:
         log.error("Tailoring failed: %s", e)
+        end_run(conn, run_id, status="failed", error=str(e))
         return {"status": f"error: {e}"}
 
 

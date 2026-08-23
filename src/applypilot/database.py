@@ -5,6 +5,7 @@ pipeline stage are created up front so any stage can run independently
 without migration ordering issues.
 """
 
+import json
 import sqlite3
 import threading
 from datetime import datetime, timezone
@@ -109,6 +110,8 @@ def init_db(db_path: Path | str | None = None) -> sqlite3.Connection:
             fit_score             INTEGER,
             score_reasoning       TEXT,
             scored_at             TEXT,
+            company_summary       TEXT,
+            company_hook          TEXT,
 
             -- Tailoring stage (resume tailor)
             tailored_resume_path  TEXT,
@@ -119,6 +122,8 @@ def init_db(db_path: Path | str | None = None) -> sqlite3.Connection:
             cover_letter_path     TEXT,
             cover_letter_at       TEXT,
             cover_attempts        INTEGER DEFAULT 0,
+            cover_letter_passed   INTEGER,
+            cover_letter_errors   TEXT,
 
             -- Application stage
             applied_at            TEXT,
@@ -136,6 +141,74 @@ def init_db(db_path: Path | str | None = None) -> sqlite3.Connection:
 
     # Run migrations for any columns added after initial schema
     ensure_columns(conn)
+
+    # Runs: one row per invocation of a pipeline stage (discover, enrich,
+    # score, tailor, apply). Attempts: one row per try at applying to a job,
+    # tied to the run that made the attempt. jobs.apply_status stays a mirror
+    # of the latest attempt so existing queries keep working.
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS runs (
+            id            INTEGER PRIMARY KEY AUTOINCREMENT,
+            stage         TEXT NOT NULL,
+            started_at    TEXT NOT NULL,
+            ended_at      TEXT,
+            status        TEXT NOT NULL DEFAULT 'running',
+            config_json   TEXT,
+            stats_json    TEXT,
+            error         TEXT
+        )
+    """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS attempts (
+            id                       INTEGER PRIMARY KEY AUTOINCREMENT,
+            job_url                  TEXT NOT NULL REFERENCES jobs(url),
+            run_id                   INTEGER NOT NULL REFERENCES runs(id),
+            worker_id                INTEGER,
+            status                   TEXT NOT NULL DEFAULT 'in_progress',
+            error                    TEXT,
+            started_at               TEXT NOT NULL,
+            ended_at                 TEXT,
+            duration_ms              INTEGER,
+            task_id                  TEXT,
+            verification_confidence  TEXT,
+            session_id               TEXT,
+            cost_usd                 REAL
+        )
+    """)
+    # Forward migration for the two columns added after attempts shipped
+    # (mirrors the jobs table's ensure_columns pattern, scoped to this table).
+    existing_attempt_cols = {row[1] for row in conn.execute("PRAGMA table_info(attempts)").fetchall()}
+    for col, dtype in {"session_id": "TEXT", "cost_usd": "REAL"}.items():
+        if col not in existing_attempt_cols:
+            conn.execute(f"ALTER TABLE attempts ADD COLUMN {col} {dtype}")
+
+    # Per-attempt event timeline: one row per Claude Code stream-json event
+    # (tool_use paired with its tool_result, assistant text, the system/init
+    # handshake, and the final result). This is what an "expand this attempt"
+    # view in a dashboard reads -- attempts.status/error is just the summary.
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS attempt_events (
+            id                   INTEGER PRIMARY KEY AUTOINCREMENT,
+            attempt_id           INTEGER NOT NULL REFERENCES attempts(id),
+            seq                  INTEGER NOT NULL,
+            ts                   TEXT NOT NULL,
+            event_type           TEXT NOT NULL,
+            tool_name            TEXT,
+            tool_use_id          TEXT,
+            parent_tool_use_id   TEXT,
+            input_json           TEXT,
+            result_json          TEXT,
+            text                 TEXT,
+            raw_json             TEXT NOT NULL
+        )
+    """)
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_runs_stage ON runs(stage)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_attempts_job_url ON attempts(job_url)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_attempts_run_id ON attempts(run_id)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_attempts_status ON attempts(status)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_attempt_events_attempt_seq ON attempt_events(attempt_id, seq)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_attempt_events_tool_use_id ON attempt_events(attempt_id, tool_use_id)")
+    conn.commit()
 
     return conn
 
@@ -162,6 +235,8 @@ _ALL_COLUMNS: dict[str, str] = {
     "fit_score": "INTEGER",
     "score_reasoning": "TEXT",
     "scored_at": "TEXT",
+    "company_summary": "TEXT",
+    "company_hook": "TEXT",
     # Tailoring
     "tailored_resume_path": "TEXT",
     "tailored_at": "TEXT",
@@ -170,6 +245,8 @@ _ALL_COLUMNS: dict[str, str] = {
     "cover_letter_path": "TEXT",
     "cover_letter_at": "TEXT",
     "cover_attempts": "INTEGER DEFAULT 0",
+    "cover_letter_passed": "INTEGER",
+    "cover_letter_errors": "TEXT",
     # Application
     "applied_at": "TEXT",
     "apply_status": "TEXT",
@@ -422,3 +499,277 @@ def get_jobs_by_stage(conn: sqlite3.Connection | None = None,
         columns = rows[0].keys()
         return [dict(zip(columns, row)) for row in rows]
     return []
+
+
+# ---------------------------------------------------------------------------
+# Runs: one row per invocation of a pipeline stage
+# ---------------------------------------------------------------------------
+
+def start_run(conn: sqlite3.Connection, stage: str, config: dict | None = None) -> int:
+    """Record the start of one pipeline stage invocation.
+
+    Args:
+        conn: Database connection.
+        stage: One of "discover", "enrich", "score", "tailor", "apply".
+        config: Snapshot of the config/kwargs this invocation ran with.
+
+    Returns:
+        The new run's id.
+    """
+    now = datetime.now(timezone.utc).isoformat()
+    cur = conn.execute(
+        "INSERT INTO runs (stage, started_at, status, config_json) VALUES (?, ?, 'running', ?)",
+        (stage, now, json.dumps(config, default=str) if config is not None else None),
+    )
+    conn.commit()
+    return cur.lastrowid
+
+
+def end_run(conn: sqlite3.Connection, run_id: int, status: str = "completed",
+           stats: dict | None = None, error: str | None = None) -> None:
+    """Record the end of a pipeline stage invocation.
+
+    Args:
+        conn: Database connection.
+        run_id: Id returned by start_run().
+        status: "completed", "partial", "failed", or "interrupted".
+        stats: Result stats dict for this run (json-encoded).
+        error: Error message if the run failed.
+    """
+    now = datetime.now(timezone.utc).isoformat()
+    conn.execute(
+        "UPDATE runs SET ended_at = ?, status = ?, stats_json = ?, error = ? WHERE id = ?",
+        (now, status, json.dumps(stats, default=str) if stats is not None else None, error, run_id),
+    )
+    conn.commit()
+
+
+# ---------------------------------------------------------------------------
+# Attempts: one row per try at applying to a job, tied to a run
+# ---------------------------------------------------------------------------
+
+def create_attempt(conn: sqlite3.Connection, job_url: str, run_id: int,
+                   worker_id: int | None = None) -> int:
+    """Start a new apply attempt for a job, tied to a run.
+
+    Also mirrors the in-progress state onto jobs.apply_status so downstream
+    queries that only know about the jobs table keep working. Caller is
+    responsible for the surrounding transaction/commit (acquire_job runs
+    this inside a BEGIN IMMEDIATE to keep it atomic with job selection).
+
+    Args:
+        conn: Database connection.
+        job_url: The job being attempted (jobs.url).
+        run_id: The apply run this attempt belongs to.
+        worker_id: Numeric worker claiming this attempt.
+
+    Returns:
+        The new attempt's id.
+    """
+    now = datetime.now(timezone.utc).isoformat()
+    cur = conn.execute(
+        "INSERT INTO attempts (job_url, run_id, worker_id, status, started_at) "
+        "VALUES (?, ?, ?, 'in_progress', ?)",
+        (job_url, run_id, worker_id, now),
+    )
+    conn.execute("""
+        UPDATE jobs SET apply_status = 'in_progress',
+                       agent_id = ?,
+                       last_attempted_at = ?
+        WHERE url = ?
+    """, (f"worker-{worker_id}" if worker_id is not None else None, now, job_url))
+    return cur.lastrowid
+
+
+def finish_attempt(conn: sqlite3.Connection, attempt_id: int, status: str,
+                   error: str | None = None, duration_ms: int | None = None,
+                   task_id: str | None = None,
+                   verification_confidence: str | None = None,
+                   apply_attempts: int | None = None) -> None:
+    """Record the outcome of an apply attempt and mirror it onto jobs.
+
+    Args:
+        conn: Database connection.
+        attempt_id: Id returned by create_attempt().
+        status: "applied", "failed", "needs_review", "skipped", "manual", etc.
+        error: Failure reason, if any.
+        duration_ms: Wall-clock duration of the attempt.
+        task_id: Claude Code task id, if any.
+        verification_confidence: Verification confidence label, if any.
+        apply_attempts: New value for jobs.apply_attempts (caller computes
+            this so permanent-failure semantics stay in one place).
+    """
+    row = conn.execute("SELECT job_url FROM attempts WHERE id = ?", (attempt_id,)).fetchone()
+    if row is None:
+        return
+    job_url = row["job_url"]
+    now = datetime.now(timezone.utc).isoformat()
+
+    conn.execute("""
+        UPDATE attempts SET status = ?, error = ?, ended_at = ?, duration_ms = ?,
+                            task_id = ?, verification_confidence = ?
+        WHERE id = ?
+    """, (status, error, now, duration_ms, task_id, verification_confidence, attempt_id))
+
+    applied_at = now if status == "applied" else None
+    conn.execute("""
+        UPDATE jobs SET apply_status = ?,
+                       apply_error = ?,
+                       agent_id = NULL,
+                       apply_duration_ms = ?,
+                       apply_task_id = ?,
+                       verification_confidence = ?,
+                       applied_at = COALESCE(?, applied_at),
+                       apply_attempts = COALESCE(?, apply_attempts)
+        WHERE url = ?
+    """, (status, error, duration_ms, task_id, verification_confidence,
+         applied_at, apply_attempts, job_url))
+    conn.commit()
+
+
+def recover_orphaned_attempts(conn: sqlite3.Connection | None = None) -> list[str]:
+    """Mark attempts left 'in_progress' by a crashed worker as needs_review.
+
+    Call this once at launcher startup, before any new attempts are
+    acquired. An attempt stuck in_progress means the worker that owned it
+    died without reporting a result (process crash, killed, machine reset)
+    -- there's no way to know what state the application was left in, so it
+    needs a human to check rather than being silently retried or lost.
+
+    Args:
+        conn: Database connection. Uses get_connection() if None.
+
+    Returns:
+        List of job URLs that were recovered.
+    """
+    if conn is None:
+        conn = get_connection()
+
+    now = datetime.now(timezone.utc).isoformat()
+    orphans = conn.execute(
+        "SELECT id, job_url, run_id FROM attempts WHERE status = 'in_progress'"
+    ).fetchall()
+
+    for row in orphans:
+        conn.execute("""
+            UPDATE attempts SET status = 'needs_review', ended_at = ?,
+                                error = COALESCE(error, 'orphaned: worker never reported back')
+            WHERE id = ?
+        """, (now, row["id"]))
+        conn.execute(
+            "UPDATE jobs SET apply_status = 'needs_review', agent_id = NULL WHERE url = ?",
+            (row["job_url"],),
+        )
+
+    orphan_run_ids = {row["run_id"] for row in orphans if row["run_id"] is not None}
+    for run_id in orphan_run_ids:
+        run = conn.execute("SELECT ended_at FROM runs WHERE id = ?", (run_id,)).fetchone()
+        if run and run["ended_at"] is None:
+            conn.execute(
+                "UPDATE runs SET ended_at = ?, status = 'interrupted' WHERE id = ?",
+                (now, run_id),
+            )
+
+    conn.commit()
+    return [row["job_url"] for row in orphans]
+
+
+# ---------------------------------------------------------------------------
+# Attempt event timeline: per-tool-call detail for an attempt, for the
+# "expand this attempt" view. attempts.status/error is just the summary --
+# this is where the actual command-by-command history lives.
+# ---------------------------------------------------------------------------
+
+def set_attempt_session(conn: sqlite3.Connection, attempt_id: int, session_id: str) -> None:
+    """Record the Claude Code session id for an attempt (from the init event)."""
+    conn.execute("UPDATE attempts SET session_id = ? WHERE id = ?", (session_id, attempt_id))
+    conn.commit()
+
+
+def set_attempt_cost(conn: sqlite3.Connection, attempt_id: int, cost_usd: float) -> None:
+    """Record the total cost for an attempt (from the final result event)."""
+    conn.execute("UPDATE attempts SET cost_usd = ? WHERE id = ?", (cost_usd, attempt_id))
+    conn.commit()
+
+
+def log_event(conn: sqlite3.Connection, attempt_id: int, seq: int, event_type: str, *,
+              tool_name: str | None = None, tool_use_id: str | None = None,
+              parent_tool_use_id: str | None = None, input_data=None,
+              text: str | None = None, raw=None) -> int:
+    """Persist one Claude Code stream-json event onto an attempt's timeline.
+
+    Caller controls commits (the launcher batches one commit per stream-json
+    line so a crash mid-attempt still leaves everything up to that point
+    queryable, matching the orphan-recovery story).
+
+    Args:
+        conn: Database connection.
+        attempt_id: The attempt this event belongs to.
+        seq: Monotonically increasing sequence number within the attempt.
+        event_type: "system_init", "text", "tool_use", "tool_result", or "result".
+        tool_name: MCP/tool name, for tool_use events.
+        tool_use_id: The tool_use block's id (used to pair with attach_tool_result).
+        parent_tool_use_id: Non-null means this event came from inside a
+            subagent (Task tool) invocation nested under that parent call --
+            a dashboard should nest these under the parent tool_use.
+        input_data: Full tool input, for tool_use events. Stored verbatim
+            (e.g. the literal Bash command string), not paraphrased.
+        text: Assistant text content, for text events.
+        raw: The full raw event/block as received, for fidelity.
+
+    Returns:
+        The new event row's id.
+    """
+    now = datetime.now(timezone.utc).isoformat()
+    cur = conn.execute("""
+        INSERT INTO attempt_events (
+            attempt_id, seq, ts, event_type, tool_name, tool_use_id,
+            parent_tool_use_id, input_json, text, raw_json
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    """, (
+        attempt_id, seq, now, event_type, tool_name, tool_use_id, parent_tool_use_id,
+        json.dumps(input_data, default=str) if input_data is not None else None,
+        text,
+        json.dumps(raw, default=str),
+    ))
+    return cur.lastrowid
+
+
+def attach_tool_result(conn: sqlite3.Connection, attempt_id: int, tool_use_id: str | None,
+                       result_data, raw) -> bool:
+    """Pair a tool_result event onto its matching tool_use event row.
+
+    Falls back to inserting a standalone tool_result event (with the next
+    seq in the attempt) if no matching tool_use row is found, so nothing is
+    silently dropped.
+
+    Returns:
+        True if an existing tool_use row was updated in place, False if a
+        standalone tool_result event was inserted instead.
+    """
+    if tool_use_id:
+        row = conn.execute("""
+            SELECT id FROM attempt_events
+            WHERE attempt_id = ? AND tool_use_id = ? AND event_type = 'tool_use'
+            ORDER BY id DESC LIMIT 1
+        """, (attempt_id, tool_use_id)).fetchone()
+        if row:
+            conn.execute(
+                "UPDATE attempt_events SET result_json = ? WHERE id = ?",
+                (json.dumps(result_data, default=str), row["id"]),
+            )
+            return True
+
+    seq_row = conn.execute(
+        "SELECT COALESCE(MAX(seq), 0) + 1 FROM attempt_events WHERE attempt_id = ?",
+        (attempt_id,),
+    ).fetchone()
+    now = datetime.now(timezone.utc).isoformat()
+    conn.execute("""
+        INSERT INTO attempt_events (attempt_id, seq, ts, event_type, tool_use_id, result_json, raw_json)
+        VALUES (?, ?, ?, 'tool_result', ?, ?, ?)
+    """, (
+        attempt_id, seq_row[0], now, tool_use_id,
+        json.dumps(result_data, default=str), json.dumps(raw, default=str),
+    ))
+    return False

@@ -39,10 +39,18 @@ IMPORTANT FACTORS:
 - Factor in the candidate's project experience
 - Seniority mismatch is a HARD factor, not a minor deduction -- strong skill overlap does not outweigh a real seniority gap
 
+HARD RULE ON COMPANY FIELDS: Base COMPANY_SUMMARY and COMPANY_HOOK ONLY on
+what this job description actually says. Do not use anything you think you
+know about this company from training. If the description doesn't say what
+the company does or build, output NULL for both -- a guess is worse than
+nothing.
+
 RESPOND IN EXACTLY THIS FORMAT (no other text):
 SCORE: [1-10]
 KEYWORDS: [comma-separated ATS keywords from the job description that match or could match the candidate]
-REASONING: [2-3 sentences explaining the score, EXPLICITLY addressing seniority fit]"""
+REASONING: [2-3 sentences explaining the score, EXPLICITLY addressing seniority fit]
+COMPANY_SUMMARY: [2 sentences: what the company does, what the team builds. NULL if the description doesn't say.]
+COMPANY_HOOK: [one concrete, specific thing worth mentioning in a cover letter -- a product, a technical problem, a domain. NULL if there's nothing specific enough.]"""
 
 
 def _build_candidate_level(profile: dict) -> str:
@@ -75,6 +83,25 @@ def _build_candidate_level(profile: dict) -> str:
     return "\n".join(lines)
 
 
+_NULL_RE = re.compile(r"^[\"'*_\s]*null[\"'*_\s]*$", re.IGNORECASE)
+
+
+def _clean_optional_field(raw: str | None) -> str | None:
+    """Strip a captured field and map a literal 'NULL' response to None.
+
+    The scoring prompt is explicitly told to output the literal word NULL
+    for COMPANY_SUMMARY/COMPANY_HOOK when the job description doesn't
+    support a real answer -- this turns that sentinel into an actual
+    Python/DB NULL instead of storing the string "NULL".
+    """
+    if raw is None:
+        return None
+    cleaned = raw.strip().strip("*_")
+    if not cleaned or _NULL_RE.match(cleaned):
+        return None
+    return cleaned
+
+
 def _parse_score_response(response: str) -> dict:
     """Parse the LLM's score response into structured data.
 
@@ -82,7 +109,8 @@ def _parse_score_response(response: str) -> dict:
         response: Raw LLM response text.
 
     Returns:
-        {"score": int, "keywords": str, "reasoning": str}
+        {"score": int, "keywords": str, "reasoning": str,
+         "company_summary": str | None, "company_hook": str | None}
     """
     score = 0
     keywords = ""
@@ -100,13 +128,31 @@ def _parse_score_response(response: str) -> dict:
     if kw_match:
         keywords = kw_match.group(1).strip().strip("*_")
 
-    reason_match = re.search(r"\b(?:REASONING|Reasoning)\b[:\*\s]*([\s\S]+)", response, re.IGNORECASE)
+    # Non-greedy, bounded to the next known field header (or end of string) --
+    # REASONING used to grab everything to the end of the response, which
+    # would swallow COMPANY_SUMMARY/COMPANY_HOOK whole once those were added.
+    reason_match = re.search(
+        r"\b(?:REASONING|Reasoning)\b[:\*\s]*([\s\S]+?)(?=\n\s*(?:COMPANY_SUMMARY|COMPANY_HOOK)\s*:|\Z)",
+        response, re.IGNORECASE,
+    )
     if reason_match:
         reasoning = reason_match.group(1).strip()
     else:
         reasoning = response.strip()
 
-    return {"score": score, "keywords": keywords, "reasoning": reasoning}
+    summary_match = re.search(
+        r"\bCOMPANY_SUMMARY\b[:\*\s]*([\s\S]+?)(?=\n\s*COMPANY_HOOK\s*:|\Z)",
+        response, re.IGNORECASE,
+    )
+    company_summary = _clean_optional_field(summary_match.group(1) if summary_match else None)
+
+    hook_match = re.search(r"\bCOMPANY_HOOK\b[:\*\s]*([^\n]+)", response, re.IGNORECASE)
+    company_hook = _clean_optional_field(hook_match.group(1) if hook_match else None)
+
+    return {
+        "score": score, "keywords": keywords, "reasoning": reasoning,
+        "company_summary": company_summary, "company_hook": company_hook,
+    }
 
 
 def score_job(resume_text: str, job: dict, profile: dict | None = None) -> dict:
@@ -120,7 +166,8 @@ def score_job(resume_text: str, job: dict, profile: dict | None = None) -> dict:
             only so score_job stays callable in isolation/tests.
 
     Returns:
-        {"score": int, "keywords": str, "reasoning": str}
+        {"score": int, "keywords": str, "reasoning": str,
+         "company_summary": str | None, "company_hook": str | None}
     """
     job_text = (
         f"TITLE: {job['title']}\n"
@@ -142,7 +189,10 @@ def score_job(resume_text: str, job: dict, profile: dict | None = None) -> dict:
         return _parse_score_response(response)
     except Exception as e:
         log.error("LLM error scoring job '%s': %s", job.get("title", "?"), e)
-        return {"score": 0, "keywords": "", "reasoning": f"LLM error: {e}"}
+        return {
+            "score": 0, "keywords": "", "reasoning": f"LLM error: {e}",
+            "company_summary": None, "company_hook": None,
+        }
 
 
 def run_scoring(limit: int = 0, rescore: bool = False) -> dict:
@@ -196,9 +246,11 @@ def run_scoring(limit: int = 0, rescore: bool = False) -> dict:
         results.append(result)
 
         conn.execute(
-            "UPDATE jobs SET fit_score = ?, score_reasoning = ?, scored_at = ? WHERE url = ?",
+            "UPDATE jobs SET fit_score = ?, score_reasoning = ?, scored_at = ?, "
+            "company_summary = ?, company_hook = ? WHERE url = ?",
             (result["score"], f"{result['keywords']}\n{result['reasoning']}",
-             datetime.now(timezone.utc).isoformat(), job["url"]),
+             datetime.now(timezone.utc).isoformat(),
+             result.get("company_summary"), result.get("company_hook"), job["url"]),
         )
         conn.commit()
 

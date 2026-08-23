@@ -115,6 +115,7 @@ def render_dashboard() -> Table:
     table = Table(title="ApplyPilot Dashboard", expand=True, show_lines=False)
     table.add_column("W", style="bold", width=3, justify="center")
     table.add_column("Job", min_width=30, max_width=50, no_wrap=True)
+    table.add_column("Score", width=5, justify="right")
     table.add_column("Status", width=12, justify="center")
     table.add_column("Time", width=6, justify="right")
     table.add_column("Acts", width=5, justify="right")
@@ -139,10 +140,12 @@ def render_dashboard() -> Table:
         status_text = Text(s.status.upper(), style=style)
 
         job_text = f"{s.job_title[:28]} @ {s.company[:16]}" if s.job_title else ""
+        score_text = str(s.score) if s.job_title and s.score else ""
 
         table.add_row(
             str(s.worker_id),
             job_text,
+            score_text,
             status_text,
             elapsed,
             str(s.actions) if s.actions else "",
@@ -158,7 +161,7 @@ def render_dashboard() -> Table:
     # Totals row
     table.add_section()
     table.add_row(
-        "", "", "", "", "", "TOTAL",
+        "", "", "", "", "", "", "TOTAL",
         str(total_applied), str(total_failed), f"${total_cost:.3f}",
         style="bold",
     )

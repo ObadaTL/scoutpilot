@@ -349,6 +349,135 @@ def validate_tailored_resume(text: str, profile: dict, original_text: str = "") 
     }
 
 
+# ── Tool Leak Guard ─────────────────────────────────────────────────────
+#
+# Deterministic, post-generation check for cover letters: a tool mentioned in
+# the job description but absent from the candidate's real skills must not
+# appear in the letter. The model is told this in the prompt ("candidate's
+# real tools are ONLY: ...") but nothing enforced it in code -- this does.
+
+# Common acronyms that would otherwise match the ALL-CAPS shape heuristic
+# below but are never themselves a "tool": geography/regulatory, generic
+# business/HR titles, education/credentials, and generic tech buzzwords too
+# broad to be a specific, fabricatable claim.
+_ACRONYM_STOPWORDS: frozenset[str] = frozenset({
+    "uk", "us", "usa", "eu", "gdpr", "ccpa",
+    "hr", "pm", "qa", "ux", "ui", "vp", "ceo", "cto", "cfo", "coo",
+    "pto", "nda", "llc", "inc", "ltd", "eoe", "ats", "faq", "asap", "tbd",
+    "cv", "phd", "bsc", "msc", "mba", "gpa",
+    "ai", "ml", "api", "sdk", "sla", "kpi", "roi", "b2b", "b2c", "saas",
+    "ci", "cd",
+})
+
+# Well-known plain Title-Case tool/product names -- invisible to the shape
+# heuristic (no digits, symbols, or internal caps) but exactly the names that
+# actually get name-dropped from a job description into a letter. Breadth
+# over completeness: extend this as new fabrications are observed, it is not
+# meant to be exhaustive.
+_KNOWN_TOOL_NAMES: frozenset[str] = frozenset({
+    # container / orchestration / infra-as-code
+    "kubernetes", "docker", "terraform", "ansible", "chef", "puppet", "vagrant",
+    "helm", "istio", "nomad", "packer",
+    # CI/CD
+    "jenkins", "circleci", "travis", "teamcity", "bamboo", "argo",
+    # data / streaming / big data
+    "kafka", "spark", "hadoop", "airflow", "databricks", "snowflake",
+    "flink", "beam", "presto", "hive", "nifi", "dbt",
+    # datastores
+    "redis", "postgres", "postgresql", "mysql", "mongodb", "cassandra",
+    "dynamodb", "elasticsearch", "memcached", "mariadb", "cockroachdb",
+    "neo4j", "influxdb",
+    # web frameworks
+    "flask", "fastapi", "rails", "laravel", "symfony", "express",
+    "nestjs", "gatsby", "nextjs",
+    # observability
+    "grafana", "prometheus", "datadog", "splunk", "newrelic", "sentry", "kibana",
+    # messaging
+    "rabbitmq", "celery", "pulsar",
+    # misc widely-known tools/SaaS
+    "jira", "confluence", "figma", "tableau", "looker", "salesforce",
+    "webpack", "babel", "jquery", "bootstrap", "tailwind",
+})
+
+_TOOL_SHAPE_RE = re.compile(r"[A-Za-z][A-Za-z0-9+#.]*")
+
+
+class ToolLeakViolation(Exception):
+    """Raised by ToolLeakGuard when a job-description tool the candidate
+    doesn't have leaked into the generated letter."""
+
+    def __init__(self, tools: list[str]):
+        self.tools = tools
+        super().__init__(f"Tool(s) leaked from job description, not in candidate skills: {tools}")
+
+
+def _company_tokens(job: dict) -> set[str]:
+    """Lowercase word tokens from the job's company name.
+
+    This codebase already treats job['site'] as the company name for prompt
+    purposes (see the "COMPANY: {job['site']}" job-text block) -- the prompt
+    tells the model to name the company, so those tokens must never be
+    treated as a leaked tool (e.g. an acronym employer like IBM or SAP).
+    """
+    site = str(job.get("site") or "")
+    return {w.lower() for w in re.findall(r"[A-Za-z0-9]+", site)}
+
+
+class ToolLeakGuard:
+    """Deterministic check: a tool/tech token in the job description but
+    absent from the candidate's real skills must not appear in the letter."""
+
+    def __init__(self, profile: dict):
+        self._allowed = _build_skills_set(profile)
+
+    def _extract_job_tools(self, job_description: str) -> set[str]:
+        candidates: set[str] = set()
+        for raw in _TOOL_SHAPE_RE.findall(job_description):
+            token = raw.strip(".")
+            if not token:
+                continue
+            lower = token.lower()
+            is_acronym = token.isupper() and 2 <= len(token) <= 6
+            has_digit = any(c.isdigit() for c in token) and any(c.isalpha() for c in token)
+            has_symbol = "+" in token or "#" in token or ("." in token and not token.endswith("."))
+            is_camel = (
+                len(token) > 2 and token[0].isupper()
+                and any(c.isupper() for c in token[1:]) and any(c.islower() for c in token)
+            )
+            if is_acronym or has_digit or has_symbol or is_camel or lower in FABRICATION_WATCHLIST:
+                candidates.add(lower)
+
+        description_lower = job_description.lower()
+        for name in _KNOWN_TOOL_NAMES:
+            if re.search(r"\b" + re.escape(name) + r"\b", description_lower):
+                candidates.add(name)
+
+        return candidates
+
+    def check(self, job: dict, letter: str) -> None:
+        """Raise ToolLeakViolation if a job-description tool the candidate
+        doesn't have appears as a whole word in the letter.
+
+        Args:
+            job: Job dict (uses full_description and site).
+            letter: The generated cover letter text.
+        """
+        job_tools = self._extract_job_tools(job.get("full_description") or "")
+        company = _company_tokens(job)
+
+        remainder = {
+            t for t in job_tools
+            if t not in _ACRONYM_STOPWORDS
+            and t not in company
+            and not any(t in s or s in t for s in self._allowed)
+        }
+
+        letter_lower = letter.lower()
+        leaked = sorted(t for t in remainder if re.search(r"\b" + re.escape(t) + r"\b", letter_lower))
+        if leaked:
+            raise ToolLeakViolation(leaked)
+
+
 # ── Cover Letter Validation ──────────────────────────────────────────────
 
 def validate_cover_letter(text: str, mode: str = "normal") -> dict:

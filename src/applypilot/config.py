@@ -98,7 +98,22 @@ def load_profile() -> dict:
         raise FileNotFoundError(
             f"Profile not found at {PROFILE_PATH}. Run `applypilot init` first."
         )
-    return json.loads(PROFILE_PATH.read_text(encoding="utf-8"))
+    profile = json.loads(PROFILE_PATH.read_text(encoding="utf-8"))
+
+    # A profile with no name at all breaks downstream consumers in confusing
+    # ways (e.g. prompt.py's _build_profile_summary does personal["full_name"]
+    # with no fallback) -- fail here, at the shared load point, with a clear
+    # message instead of a KeyError several modules away.
+    personal = profile.get("personal", {})
+    sign_off_name = (personal.get("preferred_name") or personal.get("full_name", "")).strip()
+    if not sign_off_name:
+        raise ValueError(
+            f"Profile at {PROFILE_PATH} has no 'personal.full_name' or "
+            "'personal.preferred_name' -- there's no name to sign a cover "
+            "letter or build a resume header with. Fill one in and try again."
+        )
+
+    return profile
 
 
 # ---------------------------------------------------------------------------
