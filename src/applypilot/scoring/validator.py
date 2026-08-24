@@ -177,13 +177,27 @@ def strip_numbered_sentences(text: str) -> str:
     fabricated statistic is worse than no statistic, even an ungainly one,
     and this guarantees a shippable result without another (possibly
     equally unreliable) LLM call.
+
+    Processes paragraphs (blank-line-separated, or single-newline-separated
+    when the text has no blank lines at all) independently and rejoins with
+    the same separator -- joining every sentence in the whole text with a
+    single space, as this used to, flattens any multi-paragraph structure
+    the moment any paragraph has a sentence to drop.
     """
     if not text or not _ANY_DIGIT_RE.search(text):
         return text
-    sentences = re.split(r"(?<=[.!?])\s+", text)
-    kept = [s for s in sentences if not _ANY_DIGIT_RE.search(s)]
-    cleaned = " ".join(kept).strip()
-    return cleaned if cleaned else _ANY_DIGIT_RE.sub("", text).strip()
+
+    def _strip_para(para: str) -> str:
+        if not _ANY_DIGIT_RE.search(para):
+            return para
+        sentences = re.split(r"(?<=[.!?])\s+", para)
+        kept = [s for s in sentences if not _ANY_DIGIT_RE.search(s)]
+        cleaned = " ".join(kept).strip()
+        return cleaned if cleaned else _ANY_DIGIT_RE.sub("", para).strip()
+
+    sep = "\n\n" if "\n\n" in text else "\n"
+    result = sep.join(_strip_para(p) for p in text.split(sep))
+    return result if result.strip() else _ANY_DIGIT_RE.sub("", text).strip()
 
 
 # ── JSON Field Validation ─────────────────────────────────────────────────

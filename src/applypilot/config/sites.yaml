@@ -40,6 +40,7 @@ base_urls:
   "Job Bank Canada": "https://www.jobbank.gc.ca"
   "CareerJet Canada": "https://www.careerjet.ca"
   "BuiltIn Remote": "https://builtin.com"
+  "BuiltIn Belfast": "https://builtin.com"
   "Hacker News Jobs": "https://news.ycombinator.com/"
   "RemoteOK": null
   "WelcomeToTheJungle": null
@@ -180,3 +181,35 @@ sites:
   - name: "Otta"
     url: "https://otta.com/jobs/all?title=software+engineer&remote=true"
     type: search
+
+  # ── Northern Ireland — added for a focused NI/Belfast job search ─────
+  # Both sites are NI-scoped by nature of their whole domain, so every job
+  # discovered from them is already NI/Belfast (or a remote role an NI
+  # employer posted) -- no extra location filtering needed at discovery
+  # time. Belfast-vs-rest-of-NI-vs-remote priority is applied later, in the
+  # tailor/apply selection queries (see database.load_location_focus /
+  # loc_priority), not here.
+  - name: "NIJobs"
+    # Hyphenated path search, confirmed live: /jobs/software-engineer/in-belfast
+    # returns Belfast results; the same path without "/in-belfast" covers
+    # all of NI (the site's default scope). {query_slug} = lowercased,
+    # hyphenated query (e.g. "Graduate Software Engineer" -> "graduate-software-engineer").
+    url: "https://www.nijobs.com/jobs/{query_slug}"
+    type: search
+
+  - name: "NIJobFinder"
+    # Best-effort: this domain blocked automated fetches from this
+    # environment, so its query-search URL pattern couldn't be confirmed --
+    # points at the homepage itself (user-confirmed to be listing-rich)
+    # rather than a guessed /jobs path. Scraped once, unfiltered by
+    # keyword -- the scoring stage still ranks/filters everything by fit.
+    # Replace with a confirmed search URL if a better one turns up.
+    url: "https://www.nijobfinder.co.uk/"
+    type: static
+
+  - name: "BuiltIn Belfast"
+    # User-provided URL for BuiltIn's Belfast city subsite (same platform
+    # as the existing "BuiltIn Remote" static entry above, which already
+    # extracts cleanly from builtin.com's job pages).
+    url: "https://builtinbelfast.uk/jobs"
+    type: static

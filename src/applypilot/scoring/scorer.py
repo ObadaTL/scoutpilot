@@ -116,7 +116,18 @@ def _parse_score_response(response: str) -> dict:
     keywords = ""
     reasoning = ""
 
-    score_match = re.search(r"\b(?:SCORE|Score)\b[:\*\s]*(\d+)", response, re.IGNORECASE)
+    # Field-label prefix: colon/asterisks then ONLY horizontal whitespace --
+    # never \s, which also matches newlines. Confirmed live 2026-08-24: with
+    # the old `[:\*\s]*` prefix, a genuinely empty KEYWORDS field (model
+    # wrote "KEYWORDS:" then went straight to a newline, no content) let
+    # that greedy prefix swallow the newline and start capturing from
+    # "REASONING: <actual reasoning text>" instead -- keywords ended up
+    # holding the reasoning's own first line (mislabeled), and the dashboard
+    # then rendered that as "ATS keyword" chips. Same failure mode was
+    # latent in every other field here; fixed uniformly.
+    _LABEL_SEP = r"[:\*]*[ \t]*"
+
+    score_match = re.search(rf"\b(?:SCORE|Score)\b{_LABEL_SEP}(\d+)", response, re.IGNORECASE)
     if score_match:
         try:
             score = int(score_match.group(1))
@@ -124,7 +135,7 @@ def _parse_score_response(response: str) -> dict:
         except (ValueError, TypeError):
             score = 0
 
-    kw_match = re.search(r"\b(?:KEYWORDS|Keywords)\b[:\*\s]*([^\n]+)", response, re.IGNORECASE)
+    kw_match = re.search(rf"\b(?:KEYWORDS|Keywords)\b{_LABEL_SEP}([^\n]+)", response, re.IGNORECASE)
     if kw_match:
         keywords = kw_match.group(1).strip().strip("*_")
 
@@ -132,7 +143,7 @@ def _parse_score_response(response: str) -> dict:
     # REASONING used to grab everything to the end of the response, which
     # would swallow COMPANY_SUMMARY/COMPANY_HOOK whole once those were added.
     reason_match = re.search(
-        r"\b(?:REASONING|Reasoning)\b[:\*\s]*([\s\S]+?)(?=\n\s*(?:COMPANY_SUMMARY|COMPANY_HOOK)\s*:|\Z)",
+        rf"\b(?:REASONING|Reasoning)\b{_LABEL_SEP}([\s\S]+?)(?=\n\s*(?:COMPANY_SUMMARY|COMPANY_HOOK)\s*:|\Z)",
         response, re.IGNORECASE,
     )
     if reason_match:
@@ -141,12 +152,12 @@ def _parse_score_response(response: str) -> dict:
         reasoning = response.strip()
 
     summary_match = re.search(
-        r"\bCOMPANY_SUMMARY\b[:\*\s]*([\s\S]+?)(?=\n\s*COMPANY_HOOK\s*:|\Z)",
+        rf"\bCOMPANY_SUMMARY\b{_LABEL_SEP}([\s\S]+?)(?=\n\s*COMPANY_HOOK\s*:|\Z)",
         response, re.IGNORECASE,
     )
     company_summary = _clean_optional_field(summary_match.group(1) if summary_match else None)
 
-    hook_match = re.search(r"\bCOMPANY_HOOK\b[:\*\s]*([^\n]+)", response, re.IGNORECASE)
+    hook_match = re.search(rf"\bCOMPANY_HOOK\b{_LABEL_SEP}([^\n]+)", response, re.IGNORECASE)
     company_hook = _clean_optional_field(hook_match.group(1) if hook_match else None)
 
     return {

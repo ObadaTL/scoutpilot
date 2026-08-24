@@ -12,11 +12,105 @@ import threading
 from datetime import datetime, timezone
 from pathlib import Path
 
-from applypilot.config import DB_PATH, DEFAULTS
+from applypilot.config import DB_PATH, DEFAULTS, load_location_focus
 
 # Thread-local connection storage — each thread gets its own connection
 # (required for SQLite thread safety with parallel workers)
 _local = threading.local()
+
+
+# A bare "remote" term is ambiguous by itself -- global job boards routinely
+# tag postings restricted to a single foreign country as e.g. "Colombia -
+# Remote", "REMOTE/TELETRAVAIL, ON, CAN", "Remote Jersey City (NJ)". None of
+# those are workable for a UK/NI candidate. A denylist of every country/state
+# that might show up there doesn't scale (confirmed live 2026-08-24: even
+# after adding all 50 US states plus half a dozen countries, fresh leaks
+# kept surfacing -- Colombia, Thailand, Sweden, Spain, Singapore, "ON, CAN").
+# So this instead only trusts a generic remote term when the location EITHER
+# carries an explicit UK/NI signal, OR is genuinely bare once the remote
+# wording itself is stripped out -- a positive check, not an ever-growing
+# blacklist.
+_UK_SIGNAL_TERMS = ("united kingdom", "uk", "gb", "great britain",
+                    "england", "scotland", "wales", "northern ireland", "belfast")
+_GENERIC_REMOTE_TERMS = ("remote", "anywhere", "work from home", "wfh", "distributed")
+_REMOTE_WORDING_RE = re.compile(
+    r"\b(remote|anywhere|work[\s-]?from[\s-]?home|wfh|distributed|fully|100%|"
+    r"first|telework|teletravail)\b"
+)
+_PUNCT_RE = re.compile(r"[()\[\],/-]")
+
+
+def _is_relevant_remote(loc_lower: str) -> bool:
+    """True if a (lowercased) location's "remote" claim is UK/NI-relevant or
+    unqualified, rather than restricted to some other specific country/region."""
+    if any(t in loc_lower for t in _UK_SIGNAL_TERMS):
+        return True
+    stripped = _PUNCT_RE.sub(" ", loc_lower)
+    stripped = _REMOTE_WORDING_RE.sub(" ", stripped)
+    return not stripped.strip()
+
+
+def _location_priority_tier(location: str | None, tiers: list[list[str]]) -> int:
+    """0-indexed priority tier for a job's location (lower = higher priority).
+
+    Checked in order; the first tier with a matching term wins. A tier term
+    that's just a generic remote-work word (see _GENERIC_REMOTE_TERMS) only
+    counts as a match when _is_relevant_remote() confirms it isn't actually
+    restricted to some other country -- see that function's docstring. A
+    location matching none of the tiers (or a NULL location, when tiers are
+    active) gets `len(tiers)` -- one past the last real tier, so it always
+    sorts last and can be filtered out with `< len(tiers)`.
+    """
+    if not tiers:
+        return 0
+    if not location:
+        return len(tiers)
+    loc = location.lower()
+    for i, terms in enumerate(tiers):
+        for t in terms:
+            tl = t.lower()
+            if tl not in loc:
+                continue
+            if tl in _GENERIC_REMOTE_TERMS and not _is_relevant_remote(loc):
+                continue
+            return i
+    return len(tiers)
+
+
+def classify_location(location: str | None) -> str:
+    """Human-readable place label for a job's location, for the dashboard's
+    place filter. Reuses the same location_focus config and tier logic as
+    loc_priority() so the two always agree; each tier's label is just its
+    first configured term (e.g. tier ["Northern Ireland", "Antrim", ...]
+    displays as "Northern Ireland"). Falls back to a plain Remote / Other
+    split when no location_focus is configured, so the filter still works
+    for a setup without one.
+    """
+    focus = load_location_focus()
+    tiers = (focus or {}).get("priority", [])
+    if tiers:
+        tier = _location_priority_tier(location, tiers)
+        return tiers[tier][0] if tier < len(tiers) else "Other"
+    if not location:
+        return "Unknown"
+    return "Remote" if any(k in location.lower() for k in _GENERIC_REMOTE_TERMS) else "Other"
+
+
+def _register_loc_priority(conn: sqlite3.Connection) -> None:
+    """Register the `loc_priority(location)` SQL function used to rank/filter
+    jobs by the optional location_focus config (config.load_location_focus).
+
+    With focus disabled/absent, tiers is empty and _location_priority_tier
+    always returns 0 -- so `ORDER BY loc_priority(location)` is a harmless
+    no-op and callers simply don't add the `< len(tiers)` filter clause.
+    """
+    focus = load_location_focus()
+    tiers = (focus or {}).get("priority", [])
+
+    def _priority(location):
+        return _location_priority_tier(location, tiers)
+
+    conn.create_function("loc_priority", 1, _priority)
 
 
 def get_connection(db_path: Path | str | None = None) -> sqlite3.Connection:
@@ -48,6 +142,7 @@ def get_connection(db_path: Path | str | None = None) -> sqlite3.Connection:
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA busy_timeout=10000")
     conn.row_factory = sqlite3.Row
+    _register_loc_priority(conn)
     _local.connections[path] = conn
     return conn
 
@@ -267,6 +362,13 @@ _ALL_COLUMNS: dict[str, str] = {
     # duplicate never gets its own separate tailor/apply cycle.
     "duplicate_of": "TEXT",
     "listing_checked_at": "TEXT",
+    # Manual dashboard hide: a permanent "never apply to this" decision,
+    # independent of apply_status. Every stage-selection query that acquires
+    # work (score/tailor/apply) filters hidden = 0 so a hidden job is never
+    # picked up again -- it stays in the DB, viewable via the dashboard's
+    # Hidden filter, but the pipeline treats it as inert.
+    "hidden": "INTEGER DEFAULT 0",
+    "hidden_at": "TEXT",
 }
 
 
@@ -459,6 +561,40 @@ def apply_duplicate_marks(conn: sqlite3.Connection | None = None,
     return marked
 
 
+# ── Manual hide/unhide ───────────────────────────────────────────────────
+# A dashboard-driven "never apply to this" decision, separate from
+# apply_status: the job stays in the DB (viewable via the dashboard's
+# Hidden filter) but every pipeline acquisition query above skips it.
+
+def hide_job(conn: sqlite3.Connection, url: str) -> bool:
+    """Mark a job hidden so it stops showing by default and stops being
+    picked up for scoring/tailoring/apply.
+
+    Returns:
+        True if a matching job row was found and hidden.
+    """
+    now = datetime.now(timezone.utc).isoformat()
+    cursor = conn.execute(
+        "UPDATE jobs SET hidden = 1, hidden_at = ? WHERE url = ?", (now, url)
+    )
+    conn.commit()
+    return cursor.rowcount > 0
+
+
+def unhide_job(conn: sqlite3.Connection, url: str) -> bool:
+    """Reverse hide_job() -- the job becomes visible and eligible for the
+    pipeline again.
+
+    Returns:
+        True if a matching job row was found and unhidden.
+    """
+    cursor = conn.execute(
+        "UPDATE jobs SET hidden = 0, hidden_at = NULL WHERE url = ?", (url,)
+    )
+    conn.commit()
+    return cursor.rowcount > 0
+
+
 def get_stats(conn: sqlite3.Connection | None = None) -> dict:
     """Return job counts by pipeline stage.
 
@@ -563,6 +699,10 @@ def get_stats(conn: sqlite3.Connection | None = None) -> dict:
         "AND application_url IS NOT NULL"
     ).fetchone()[0]
 
+    stats["hidden"] = conn.execute(
+        "SELECT COUNT(*) FROM jobs WHERE hidden = 1"
+    ).fetchone()[0]
+
     return stats
 
 
@@ -627,19 +767,23 @@ def get_jobs_by_stage(conn: sqlite3.Connection | None = None,
         # duplicate_of IS NULL on pending_score/pending_tailor: a detected
         # duplicate of an already-handled posting shouldn't burn a second
         # round of scoring/tailoring LLM calls on the same real job.
-        "pending_score": "full_description IS NOT NULL AND fit_score IS NULL AND duplicate_of IS NULL",
+        # COALESCE(hidden, 0) = 0 on every acquisition query: a job the user
+        # hid from the dashboard is a "never apply to this" decision, so it
+        # must never be picked up for scoring/tailoring/apply again.
+        "pending_score": "full_description IS NOT NULL AND fit_score IS NULL AND duplicate_of IS NULL AND COALESCE(hidden, 0) = 0",
         "scored": "fit_score IS NOT NULL",
         "pending_tailor": (
             "fit_score >= ? AND full_description IS NOT NULL "
             "AND tailored_resume_path IS NULL AND duplicate_of IS NULL "
-            "AND COALESCE(apply_status, '') != 'listing_closed' AND COALESCE(tailor_attempts, 0) < "
+            "AND COALESCE(apply_status, '') != 'listing_closed' AND COALESCE(hidden, 0) = 0 "
+            "AND COALESCE(tailor_attempts, 0) < "
             f"{DEFAULTS['max_tailor_attempts']}"
         ),
         "tailored": "tailored_resume_path IS NOT NULL",
         "pending_apply": (
             "tailored_resume_path IS NOT NULL AND applied_at IS NULL "
             "AND application_url IS NOT NULL AND duplicate_of IS NULL "
-            "AND COALESCE(apply_status, '') != 'listing_closed'"
+            "AND COALESCE(apply_status, '') != 'listing_closed' AND COALESCE(hidden, 0) = 0"
         ),
         "applied": "applied_at IS NOT NULL",
     }
@@ -656,7 +800,22 @@ def get_jobs_by_stage(conn: sqlite3.Connection | None = None,
         where += " AND fit_score >= ?"
         params.append(min_score)
 
-    query = f"SELECT * FROM jobs WHERE {where} ORDER BY fit_score DESC NULLS LAST, discovered_at DESC"
+    # Optional location_focus (config.load_location_focus): when enabled,
+    # the three "give me work to do next" stages are restricted to jobs
+    # matching one of the configured location tiers (e.g. Belfast, then
+    # rest of NI, then remote) instead of the full backlog -- a temporary,
+    # reversible narrowing that touches no existing rows. loc_priority() is
+    # a no-op (always 0) when focus is disabled, so ORDER BY including it
+    # never changes behavior in that case.
+    order_by = "fit_score DESC NULLS LAST, discovered_at DESC"
+    if stage in ("pending_score", "pending_tailor", "pending_apply"):
+        focus = load_location_focus()
+        tier_count = len((focus or {}).get("priority", []))
+        if tier_count:
+            where += f" AND loc_priority(location) < {tier_count}"
+            order_by = "loc_priority(location) ASC, " + order_by
+
+    query = f"SELECT * FROM jobs WHERE {where} ORDER BY {order_by}"
     if limit > 0:
         query += " LIMIT ?"
         params.append(limit)

@@ -20,6 +20,10 @@ last written, no matter how many times you click refresh or reload.
 from __future__ import annotations
 
 import logging
+import platform
+import subprocess
+import threading
+import time
 import webbrowser
 from html import escape
 from pathlib import Path
@@ -27,7 +31,7 @@ from pathlib import Path
 from rich.console import Console
 
 from applypilot.config import APP_DIR, COVER_LETTER_DIR, DB_PATH, TAILORED_DIR
-from applypilot.database import get_connection
+from applypilot.database import classify_location, get_connection
 
 console = Console()
 log = logging.getLogger(__name__)
@@ -35,6 +39,104 @@ log = logging.getLogger(__name__)
 # Directories serve_dashboard() is willing to stream files from via /files --
 # CV/cover-letter assets only, not an arbitrary local-file read.
 ASSET_SERVE_ROOTS: tuple[Path, ...] = (TAILORED_DIR, COVER_LETTER_DIR)
+
+
+# ---------------------------------------------------------------------------
+# On-demand single-job tailor + cover letter (dashboard "Tailor" button)
+#
+# Runs in a background thread per job so the POST that kicks it off returns
+# immediately -- an LLM tailor+cover-letter round trip can take a minute or
+# two, far past any reasonable HTTP timeout. The page polls /api/tailor-status
+# for progress instead of holding the connection open.
+# ---------------------------------------------------------------------------
+
+_tailor_jobs: dict[str, dict] = {}
+_tailor_jobs_lock = threading.Lock()
+
+
+def _set_tailor_status(url: str, **fields) -> None:
+    with _tailor_jobs_lock:
+        state = _tailor_jobs.setdefault(url, {})
+        state.update(fields)
+
+
+def get_tailor_status(url: str) -> dict:
+    """Current on-demand tailor-job status for a URL, or {"status": "idle"}
+    if none has ever been started for it in this server process."""
+    with _tailor_jobs_lock:
+        state = _tailor_jobs.get(url)
+        return dict(state) if state else {"status": "idle"}
+
+
+def _run_tailor_and_cover(url: str) -> None:
+    """Background-thread target: tailor the resume, then (if that produced
+    one) generate the cover letter, for exactly one job. Updates
+    _tailor_jobs throughout so the page's polling loop can show progress.
+    """
+    from applypilot.llm import is_local_provider
+    from applypilot.scoring.cover_letter import cover_letter_one
+    from applypilot.scoring.tailor import tailor_one
+
+    # A single on-demand click is a very different cost/time tradeoff than a
+    # batch run: the batch functions default to 1 retry on a local provider
+    # to keep hundreds of jobs from each burning multiple LLM passes, but
+    # here it's one job and the user is actively waiting on the result --
+    # worth spending a couple more attempts (each ~30-60s locally) for a
+    # meaningfully better chance of passing validation on the first click.
+    max_retries = 2 if is_local_provider() else 3
+
+    def _error_summary(errors: list) -> str:
+        if not errors:
+            return ""
+        return " -- " + "; ".join(str(e)[:160] for e in errors[:2])
+
+    try:
+        _set_tailor_status(url, status="running", stage="tailoring", error=None)
+        tailor_result = tailor_one(url, max_retries=max_retries)
+
+        success_statuses = {"approved", "approved_with_judge_warning", "approved_unquantified_fallback"}
+        if tailor_result["status"] not in success_statuses:
+            _set_tailor_status(
+                url, status="error", stage="tailoring",
+                error=f"Tailoring failed ({tailor_result['status']})"
+                     f"{_error_summary(tailor_result.get('errors'))}",
+            )
+            return
+
+        _set_tailor_status(url, status="running", stage="cover_letter", error=None)
+        cover_result = cover_letter_one(url, max_retries=max_retries)
+
+        if cover_result["status"] != "generated":
+            _set_tailor_status(
+                url, status="error", stage="cover_letter",
+                error=f"CV tailored, but cover letter failed ({cover_result['status']})"
+                     f"{_error_summary(cover_result.get('errors'))}",
+            )
+            return
+
+        _set_tailor_status(url, status="done", stage=None, error=None)
+    except Exception as exc:  # noqa: BLE001 -- report to the page, don't crash the thread silently
+        log.exception("On-demand tailor+cover failed for %s", url)
+        _set_tailor_status(url, status="error", stage=None, error=str(exc))
+
+
+def _reveal_in_file_manager(path: Path) -> None:
+    """Open the OS file manager with `path` pre-selected.
+
+    Lets the user grab a tailored CV or cover letter straight off disk to
+    attach it to a manual application on a portal the AI couldn't submit
+    through. No shell=True and no string interpolation into a shell command
+    -- each arg is passed straight to the OS process, so this is safe even
+    though `path` ultimately comes from a browser request (still validated
+    against ASSET_SERVE_ROOTS by the caller before this runs).
+    """
+    system = platform.system()
+    if system == "Windows":
+        subprocess.run(["explorer", f"/select,{path}"])
+    elif system == "Darwin":
+        subprocess.run(["open", "-R", str(path)])
+    else:
+        subprocess.run(["xdg-open", str(path.parent)])
 
 
 def generate_dashboard(output_path: str | None = None, serve_base_url: str | None = None) -> str:
@@ -73,6 +175,7 @@ def generate_dashboard(output_path: str | None = None, serve_base_url: str | Non
     ).fetchone()[0]
     in_progress = conn.execute("SELECT COUNT(*) FROM jobs WHERE apply_status = 'in_progress'").fetchone()[0]
     failed_apply = conn.execute("SELECT COUNT(*) FROM jobs WHERE apply_status IN ('failed', 'needs_review')").fetchone()[0]
+    hidden_count = conn.execute("SELECT COUNT(*) FROM jobs WHERE hidden = 1").fetchone()[0]
 
     # --- Score Distribution ---
     score_dist: dict[int, int] = {}
@@ -105,11 +208,31 @@ def generate_dashboard(output_path: str | None = None, serve_base_url: str | Non
                tailored_resume_path, tailored_at, tailor_attempts,
                cover_letter_path, cover_letter_at, cover_attempts,
                applied_at, apply_status, apply_error, apply_attempts,
-               last_attempted_at, verification_confidence
+               last_attempted_at, verification_confidence, hidden
         FROM jobs
         WHERE fit_score IS NOT NULL OR tailored_resume_path IS NOT NULL
         ORDER BY fit_score DESC, site, title
     """).fetchall()
+
+    # Place filter: classify every job's location up front (Belfast/NI/Remote
+    # tiers when location_focus is configured, else a plain Remote/Other
+    # split) and tally counts for the filter buttons below.
+    from collections import Counter
+    from applypilot.config import load_location_focus
+
+    place_labels = {j["url"]: classify_location(j["location"]) for j in jobs}
+    place_counts = Counter(place_labels.values())
+    focus_cfg = load_location_focus()
+    tier_labels = [t[0] for t in (focus_cfg or {}).get("priority", [])]
+    ordered_place_labels = [l for l in tier_labels if l in place_counts] + sorted(
+        (l for l in place_counts if l not in tier_labels),
+        key=lambda l: -place_counts[l],
+    )
+    place_filter_buttons = "".join(
+        f'<button class="filter-btn" onclick="filterPlace(\'{escape(label)}\', this)">'
+        f'{escape(label)} ({place_counts[label]})</button>'
+        for label in ordered_place_labels
+    )
 
     # Color map per site
     colors = {
@@ -217,6 +340,10 @@ def generate_dashboard(output_path: str | None = None, serve_base_url: str | Non
             status_pill = '<span class="status-pill status-none">PENDING TAILOR</span>'
             data_status = "unapplied"
 
+        is_hidden = bool(j["hidden"])
+        if is_hidden:
+            status_pill += ' <span class="status-pill status-hidden">🙈 HIDDEN</span>'
+
         # Asset Links (CV & Cover Letter) -- each asset gets an "open in new
         # tab" link plus a "Preview" button that loads it into the in-page
         # modal (see #preview-modal / openPreview() JS) so the assets are
@@ -238,11 +365,22 @@ def generate_dashboard(output_path: str | None = None, serve_base_url: str | Non
             else:
                 uri = escape(target.as_uri())
             preview_title = escape(f"{label} ({kind}) — {j['title'] or ''}")
+            # Open Folder needs the local server to actually run a process on
+            # this machine -- only wire it up when one is behind the page (a
+            # static file:// snapshot has nothing listening to ask).
+            folder_btn = ""
+            if serve_base_url:
+                folder_btn = (
+                    f'<button type="button" class="asset-btn folder-btn" '
+                    f'data-path="{escape(str(target))}" onclick="openFolder(this)">'
+                    f'\U0001f4c2 Open Folder</button>'
+                )
             return (
                 f'<a href="{uri}" class="asset-btn {css_class}" target="_blank">{icon} {label} ({kind})</a>'
                 f'<button type="button" class="asset-btn preview-btn" '
                 f"onclick=\"openPreview('{uri}', '{preview_title}')\">"
                 f"\U0001f441️ Preview</button>"
+                f"{folder_btn}"
             )
 
         tailored_cv = j["tailored_resume_path"]
@@ -255,19 +393,71 @@ def generate_dashboard(output_path: str | None = None, serve_base_url: str | Non
 
         assets_html = f'<div class="assets-row">{" ".join(asset_links)}</div>' if asset_links else ""
 
-        # Parse keywords and full reasoning from score_reasoning
-        reasoning_raw = j["score_reasoning"] or ""
-        reasoning_lines = [ln.strip() for ln in reasoning_raw.split("\n") if ln.strip()]
-        keywords_chips = []
-        full_reasoning = ""
-        if reasoning_lines:
-            first_line = reasoning_lines[0]
-            if "," in first_line or len(reasoning_lines) > 1:
-                kws = [k.strip() for k in first_line.split(",") if k.strip()]
-                keywords_chips = [f'<span class="kw-chip">{escape(kw)}</span>' for kw in kws[:12]]
-                full_reasoning = "\n\n".join(reasoning_lines[1:])
+        # Manual status controls -- lets the user apply themselves (e.g. via
+        # the asset's Open Folder button above, on a portal the AI couldn't
+        # get through) and then tell the dashboard about it directly,
+        # without touching the CLI. Same live-server requirement as Open
+        # Folder above: these mutate the DB through a POST the page sends.
+        manage_html = ""
+        if serve_base_url:
+            manage_buttons = []
+            tailor_label = "🪄 Re-tailor CV + Cover Letter" if tailored_cv else "🪄 Tailor CV + Cover Letter"
+            manage_buttons.append(
+                f'<button type="button" class="manage-btn manage-tailor" '
+                f'onclick="tailorJob(this)">{tailor_label}</button>'
+            )
+            if data_status != "applied":
+                manage_buttons.append(
+                    '<button type="button" class="manage-btn manage-applied" '
+                    'onclick="markApplied(this)">✅ Mark Applied</button>'
+                )
+                manage_buttons.append(
+                    '<button type="button" class="manage-btn manage-failed" '
+                    'onclick="markFailed(this)">✖ Mark Failed</button>'
+                )
+            # Always offered, even on a job with no apply_status yet (ready/
+            # tailored/unapplied) -- reset_job() is a harmless no-op with
+            # nothing to clear there, and always hiding it made the control
+            # inconsistently absent from card to card for no reason a user
+            # could tell from looking at the card.
+            manage_buttons.append(
+                '<button type="button" class="manage-btn manage-reset" '
+                'onclick="resetJobStatus(this)">↺ Reset to Pending</button>'
+            )
+            if is_hidden:
+                manage_buttons.append(
+                    '<button type="button" class="manage-btn manage-unhide" '
+                    'onclick="unhideJob(this)">👁 Unhide</button>'
+                )
             else:
-                full_reasoning = "\n\n".join(reasoning_lines)
+                manage_buttons.append(
+                    '<button type="button" class="manage-btn manage-hide" '
+                    'onclick="hideJob(this)">🙈 Hide</button>'
+                )
+            if manage_buttons:
+                manage_html = f'<div class="manage-row">{" ".join(manage_buttons)}</div>'
+
+        # Parse keywords and full reasoning from score_reasoning. scorer.py
+        # always writes this as f"{keywords}\n{reasoning}" -- exactly one
+        # newline separating the two -- so split on the FIRST newline only.
+        # The old approach (drop all blank lines, then guess whether line[0]
+        # was keywords from a comma/line-count heuristic) broke whenever the
+        # LLM returned an empty KEYWORDS field: the now-blank first "line"
+        # got silently dropped by the blank-line filter, which shifted the
+        # reasoning's own first sentence into the keywords slot -- showing
+        # reasoning text as "ATS keyword" chips.
+        reasoning_raw = j["score_reasoning"] or ""
+        if "\n" in reasoning_raw:
+            keywords_part, reasoning_part = reasoning_raw.split("\n", 1)
+        else:
+            keywords_part, reasoning_part = "", reasoning_raw
+        keywords_part = keywords_part.strip()
+        full_reasoning = reasoning_part.strip()
+        keywords_chips = (
+            [f'<span class="kw-chip">{escape(kw.strip())}</span>'
+             for kw in keywords_part.split(",") if kw.strip()][:12]
+            if keywords_part else []
+        )
 
         full_reasoning_html = escape(full_reasoning).replace("\n", "<br>")
 
@@ -299,7 +489,7 @@ def generate_dashboard(output_path: str | None = None, serve_base_url: str | Non
         actions_html = f'<div class="card-actions">{" ".join(action_buttons)}</div>'
 
         job_sections += f"""
-        <div class="job-card" data-score="{score}" data-site="{escape(j['site'] or '')}" data-status="{data_status}" data-has-cv="{1 if tailored_cv else 0}" data-has-cl="{1 if cover_letter else 0}">
+        <div class="job-card" data-url="{url}" data-score="{score}" data-site="{escape(j['site'] or '')}" data-status="{data_status}" data-hidden="{1 if is_hidden else 0}" data-place="{escape(place_labels[j['url']])}" data-has-cv="{1 if tailored_cv else 0}" data-has-cl="{1 if cover_letter else 0}">
           <div class="card-header">
             <div class="card-title-group">
               <span class="score-pill" style="background:{'#10b981' if score >= 7 else ('#f59e0b' if score >= 5 else '#ef4444')}">{score}</span>
@@ -326,6 +516,7 @@ def generate_dashboard(output_path: str | None = None, serve_base_url: str | Non
           </div>''' if keywords_chips else ''}
 
           {assets_html}
+          {manage_html}
 
           <p class="desc-preview">{desc_preview}{desc_ellipsis}</p>
           {"<details class='full-desc-details'><summary class='expand-btn'>View Full Job Description (" + f'{desc_len:,}' + " chars)</summary><div class='full-desc'>" + full_desc_html + "</div></details>" if j["full_description"] else ""}
@@ -372,6 +563,7 @@ def generate_dashboard(output_path: str | None = None, serve_base_url: str | Non
   .stat-cl .stat-num {{ color: #f472b6; }}
   .stat-applied .stat-num {{ color: #10b981; }}
   .stat-unavailable .stat-num {{ color: #64748b; }}
+  .stat-hidden .stat-num {{ color: #a8a29e; }}
 
   /* Filter Controls */
   .filter-panel {{ background: #151d30; border: 1px solid #243049; border-radius: 12px; padding: 1.25rem; margin-bottom: 2rem; display: flex; flex-direction: column; gap: 1rem; }}
@@ -439,6 +631,7 @@ def generate_dashboard(output_path: str | None = None, serve_base_url: str | Non
   .status-none {{ background: #1e293b; color: #64748b; border: 1px solid #334155; }}
   .status-closed {{ background: #1e293b; color: #64748b; border: 1px solid #475569; }}
   .status-manual {{ background: #451a03; color: #fdba74; border: 1px solid #c2410c; }}
+  .status-hidden {{ background: #1c1917; color: #a8a29e; border: 1px solid #57534e; }}
 
   .meta-row {{ display: flex; flex-wrap: wrap; gap: 0.4rem; margin-bottom: 0.85rem; }}
   .meta-tag {{ font-size: 0.74rem; padding: 0.2rem 0.55rem; border-radius: 6px; background: #1e293b; color: #94a3b8; font-weight: 500; }}
@@ -470,6 +663,34 @@ def generate_dashboard(output_path: str | None = None, serve_base_url: str | Non
   .cl-btn:hover {{ background: #700c35; color: #ffffff; border-color: #f472b6; }}
   .preview-btn {{ background: #0c4a6e; color: #7dd3fc; border: 1px solid #0284c7; cursor: pointer; font-family: inherit; }}
   .preview-btn:hover {{ background: #075985; color: #ffffff; border-color: #38bdf8; }}
+  .folder-btn {{ background: #292524; color: #fcd34d; border: 1px solid #78716c; cursor: pointer; font-family: inherit; }}
+  .folder-btn:hover {{ background: #44403c; color: #ffffff; border-color: #d6d3d1; }}
+
+  /* Manual status controls */
+  .manage-row {{ display: flex; flex-wrap: wrap; gap: 0.5rem; margin-bottom: 0.95rem; }}
+  .manage-btn {{ font-size: 0.78rem; font-weight: 600; padding: 0.4rem 0.85rem; border-radius: 6px; cursor: pointer; font-family: inherit; transition: 0.15s; }}
+  .manage-applied {{ background: #064e3b; color: #6ee7b7; border: 1px solid #059669; }}
+  .manage-applied:hover {{ background: #065f46; color: #ffffff; }}
+  .manage-failed {{ background: #450a0a; color: #fca5a5; border: 1px solid #b91c1c; }}
+  .manage-failed:hover {{ background: #7f1d1d; color: #ffffff; }}
+  .manage-reset {{ background: #1e293b; color: #94a3b8; border: 1px solid #334155; }}
+  .manage-reset:hover {{ background: #334155; color: #ffffff; }}
+  .manage-hide {{ background: #1c1917; color: #d6d3d1; border: 1px solid #57534e; }}
+  .manage-hide:hover {{ background: #292524; color: #ffffff; }}
+  .manage-unhide {{ background: #172554; color: #93c5fd; border: 1px solid #1d4ed8; }}
+  .manage-unhide:hover {{ background: #1e3a8a; color: #ffffff; }}
+  .manage-tailor {{ background: #3b0764; color: #e9d5ff; border: 1px solid #7c3aed; }}
+  .manage-tailor:hover {{ background: #4c1d95; color: #ffffff; }}
+  .manage-tailor:disabled {{ opacity: 0.6; cursor: default; }}
+
+  /* Card highlight after a Tailor job finishes and the page auto-reloads --
+     the job-card the user was just watching gets a brief pulsing border so
+     they can find it again among however many other cards are on screen. */
+  @keyframes focus-pulse {{
+    0%, 100% {{ box-shadow: 0 0 0 3px #a855f799; }}
+    50% {{ box-shadow: 0 0 0 3px #a855f722; }}
+  }}
+  .job-card.just-tailored {{ animation: focus-pulse 1.1s ease-in-out 3; border-color: #a855f7; }}
 
   /* Asset Preview Modal */
   .preview-overlay {{
@@ -545,6 +766,7 @@ def generate_dashboard(output_path: str | None = None, serve_base_url: str | Non
   <div class="stat-card stat-cl"><div class="stat-num">{with_cl}</div><div class="stat-label">Cover Letters Ready</div></div>
   <div class="stat-card stat-applied"><div class="stat-num">{applied}</div><div class="stat-label">Submitted Applications</div></div>
   <div class="stat-card stat-unavailable"><div class="stat-num">{unavailable}</div><div class="stat-label">Unavailable (closed/manual)</div></div>
+  <div class="stat-card stat-hidden"><div class="stat-num">{hidden_count}</div><div class="stat-label">Hidden by you</div></div>
 </div>
 
 <div class="filter-panel">
@@ -567,6 +789,13 @@ def generate_dashboard(output_path: str | None = None, serve_base_url: str | Non
     <button class="filter-btn" onclick="filterStatus('cl', this)">Has Cover Letter</button>
     <button class="filter-btn" onclick="filterStatus('failed', this)">Needs Review / Failed</button>
     <button class="filter-btn" onclick="filterStatus('unavailable', this)">Unavailable (Closed/Manual)</button>
+    <button class="filter-btn" onclick="filterStatus('hidden', this)">🙈 Hidden by you</button>
+  </div>
+
+  <div class="filter-row">
+    <span class="filter-label">Place:</span>
+    <button class="filter-btn active" onclick="filterPlace('all', this)">All Places</button>
+    {place_filter_buttons}
   </div>
 
   <div class="filter-row">
@@ -576,8 +805,8 @@ def generate_dashboard(output_path: str | None = None, serve_base_url: str | Non
 
   <div class="filter-row">
     <label class="hide-toggle">
-      <input type="checkbox" id="hide-toggle-input" onchange="toggleHideAppliedUnavailable(this.checked)">
-      Hide Applied &amp; Unavailable jobs
+      <input type="checkbox" id="hide-toggle-input" checked onchange="toggleHideAppliedUnavailable(this.checked)">
+      Hide Applied, Unavailable &amp; Hidden jobs by default (a Status filter above still shows them)
     </label>
   </div>
 </div>
@@ -626,10 +855,122 @@ function closePreview() {{
 document.addEventListener('keydown', (e) => {{
   if (e.key === 'Escape') closePreview();
 }});
+
+function apiPost(url, body) {{
+  return fetch(url, {{
+    method: 'POST',
+    headers: {{'Content-Type': 'application/json'}},
+    body: JSON.stringify(body || {{}}),
+  }}).then(r => r.json().catch(() => ({{}})).then(data => {{
+    if (!r.ok || data.ok === false) throw new Error(data.error || ('HTTP ' + r.status));
+    return data;
+  }}));
+}}
+
+function cardUrl(btn) {{
+  return btn.closest('.job-card').dataset.url;
+}}
+
+function markApplied(btn) {{
+  if (!confirm('Mark this job as applied?')) return;
+  apiPost('/api/status', {{url: cardUrl(btn), action: 'applied'}})
+    .then(() => location.reload())
+    .catch(err => alert('Failed to update status: ' + err.message));
+}}
+
+function markFailed(btn) {{
+  const reason = prompt('Reason (optional):', '');
+  if (reason === null) return;
+  apiPost('/api/status', {{url: cardUrl(btn), action: 'failed', reason}})
+    .then(() => location.reload())
+    .catch(err => alert('Failed to update status: ' + err.message));
+}}
+
+function resetJobStatus(btn) {{
+  if (!confirm('Reset this job back to pending (clears applied/failed status)?')) return;
+  apiPost('/api/status', {{url: cardUrl(btn), action: 'reset'}})
+    .then(() => location.reload())
+    .catch(err => alert('Failed to reset status: ' + err.message));
+}}
+
+function openFolder(btn) {{
+  apiPost('/api/open-folder', {{path: btn.dataset.path}})
+    .catch(err => alert('Failed to open folder: ' + err.message));
+}}
+
+function hideJob(btn) {{
+  apiPost('/api/status', {{url: cardUrl(btn), action: 'hide'}})
+    .then(() => location.reload())
+    .catch(err => alert('Failed to hide job: ' + err.message));
+}}
+
+function unhideJob(btn) {{
+  apiPost('/api/status', {{url: cardUrl(btn), action: 'unhide'}})
+    .then(() => location.reload())
+    .catch(err => alert('Failed to unhide job: ' + err.message));
+}}
+
+const FOCUS_STORAGE_KEY = 'applypilot_focus_url';
+
+function tailorJob(btn) {{
+  const url = cardUrl(btn);
+  btn.disabled = true;
+  btn.textContent = '⏳ Starting...';
+  apiPost('/api/tailor-one', {{url}})
+    .then(() => pollTailorStatus(url, btn))
+    .catch(err => {{
+      alert('Failed to start tailoring: ' + err.message);
+      btn.disabled = false;
+      btn.textContent = '🪄 Tailor CV + Cover Letter';
+    }});
+}}
+
+function pollTailorStatus(url, btn) {{
+  fetch('/api/tailor-status?url=' + encodeURIComponent(url))
+    .then(r => r.json())
+    .then(data => {{
+      if (data.status === 'running') {{
+        const stageLabel = data.stage === 'cover_letter' ? 'Writing cover letter...' : 'Tailoring CV...';
+        btn.textContent = '⏳ ' + stageLabel;
+        setTimeout(() => pollTailorStatus(url, btn), 3000);
+      }} else if (data.status === 'done') {{
+        localStorage.setItem(FOCUS_STORAGE_KEY, url);
+        location.reload();
+      }} else if (data.status === 'error') {{
+        alert('Tailoring failed: ' + (data.error || 'unknown error'));
+        btn.disabled = false;
+        btn.textContent = '🪄 Tailor CV + Cover Letter';
+      }} else {{
+        // idle/unknown -- keep waiting briefly in case the POST hasn't
+        // registered the job yet
+        setTimeout(() => pollTailorStatus(url, btn), 1500);
+      }}
+    }})
+    .catch(() => setTimeout(() => pollTailorStatus(url, btn), 3000));
+}}
+
+function focusStoredCard() {{
+  let url;
+  try {{
+    url = localStorage.getItem(FOCUS_STORAGE_KEY);
+    localStorage.removeItem(FOCUS_STORAGE_KEY);
+  }} catch (e) {{
+    return;
+  }}
+  if (!url) return;
+  const card = document.querySelector(`.job-card[data-url="${{CSS.escape(url)}}"]`);
+  if (!card) return;
+  card.classList.remove('hidden');
+  card.scrollIntoView({{behavior: 'smooth', block: 'center'}});
+  card.classList.add('just-tailored');
+  setTimeout(() => card.classList.remove('just-tailored'), 3600);
+}}
+
 let activeScoreFilter = 'all';
 let activeStatusFilter = 'all';
+let activePlaceFilter = 'all';
 let searchText = '';
-let hideAppliedUnavailable = false;
+let hideAppliedUnavailable = true;
 
 function toggleHideAppliedUnavailable(checked) {{
   hideAppliedUnavailable = checked;
@@ -650,6 +991,13 @@ function filterStatus(val, btn) {{
   applyFilters();
 }}
 
+function filterPlace(val, btn) {{
+  activePlaceFilter = val;
+  btn.parentElement.querySelectorAll('.filter-btn').forEach(b => b.classList.remove('active'));
+  btn.classList.add('active');
+  applyFilters();
+}}
+
 function filterText(text) {{
   searchText = text.toLowerCase();
   applyFilters();
@@ -663,6 +1011,8 @@ function applyFilters() {{
     total++;
     const score = parseInt(card.dataset.score) || 0;
     const status = card.dataset.status;
+    const isHidden = card.dataset.hidden === '1';
+    const place = card.dataset.place;
     const hasCV = card.dataset.hasCv === '1';
     const hasCL = card.dataset.hasCl === '1';
     const text = card.textContent.toLowerCase();
@@ -683,15 +1033,22 @@ function applyFilters() {{
     else if (activeStatusFilter === 'cl') statusMatch = hasCL;
     else if (activeStatusFilter === 'failed') statusMatch = status === 'failed';
     else if (activeStatusFilter === 'unavailable') statusMatch = status === 'closed' || status === 'manual';
+    else if (activeStatusFilter === 'hidden') statusMatch = isHidden;
 
-    // Hide Applied & Unavailable toggle (combines with the filters above)
-    const hideMatch = !hideAppliedUnavailable
-      || (status !== 'applied' && status !== 'closed' && status !== 'manual');
+    // Place Filter
+    const placeMatch = activePlaceFilter === 'all' || place === activePlaceFilter;
+
+    // Hide Applied/Unavailable/Hidden toggle (default on) combines with the
+    // filters above, but a specific Status filter always wins -- picking
+    // "Applied" or "Hidden by you" is an explicit request to see exactly
+    // those, so the blanket hide shouldn't fight it.
+    const hideMatch = activeStatusFilter !== 'all' || !hideAppliedUnavailable
+      || (status !== 'applied' && status !== 'closed' && status !== 'manual' && !isHidden);
 
     // Search Text Match
     const textMatch = !searchText || text.includes(searchText);
 
-    if (scoreMatch && statusMatch && hideMatch && textMatch) {{
+    if (scoreMatch && statusMatch && placeMatch && hideMatch && textMatch) {{
       card.classList.remove('hidden');
       shown++;
     }} else {{
@@ -714,6 +1071,7 @@ function applyFilters() {{
 }}
 
 applyFilters();
+focusStoredCard();
 </script>
 
 </body>
@@ -763,6 +1121,7 @@ def serve_dashboard(output_path: str | None = None, port: int = 8765) -> None:
             (most likely cause: a previous `applypilot dashboard` is still
             running in another terminal).
     """
+    import json
     import urllib.parse
     from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
@@ -779,9 +1138,116 @@ def serve_dashboard(output_path: str | None = None, port: int = 8765) -> None:
                 self._serve_dashboard()
             elif parsed.path == "/files":
                 self._serve_asset(urllib.parse.parse_qs(parsed.query))
+            elif parsed.path == "/api/tailor-status":
+                self._handle_tailor_status(urllib.parse.parse_qs(parsed.query))
             else:
                 self.send_response(404)
                 self.end_headers()
+
+        def do_POST(self) -> None:
+            parsed = urllib.parse.urlsplit(self.path)
+            length = int(self.headers.get("Content-Length") or 0)
+            raw_body = self.rfile.read(length) if length else b""
+            try:
+                payload = json.loads(raw_body.decode("utf-8")) if raw_body else {}
+            except (json.JSONDecodeError, UnicodeDecodeError):
+                self._respond_json(400, {"ok": False, "error": "invalid JSON body"})
+                return
+
+            if parsed.path == "/api/status":
+                self._handle_status(payload)
+            elif parsed.path == "/api/open-folder":
+                self._handle_open_folder(payload)
+            elif parsed.path == "/api/tailor-one":
+                self._handle_tailor_one(payload)
+            else:
+                self.send_response(404)
+                self.end_headers()
+
+        def _handle_tailor_one(self, payload: dict) -> None:
+            # Kicks off tailor_one() + cover_letter_one() for exactly one
+            # job in a background thread and returns immediately -- an LLM
+            # round trip is far too slow to hold this HTTP request open for.
+            # The page polls /api/tailor-status for progress instead.
+            url = str(payload.get("url") or "").strip()
+            if not url:
+                self._respond_json(400, {"ok": False, "error": "url is required"})
+                return
+
+            existing = get_tailor_status(url)
+            if existing.get("status") == "running":
+                self._respond_json(200, {"ok": True, "status": "already_running"})
+                return
+
+            thread = threading.Thread(target=_run_tailor_and_cover, args=(url,), daemon=True)
+            thread.start()
+            self._respond_json(200, {"ok": True, "status": "started"})
+
+        def _handle_tailor_status(self, query: dict[str, list[str]]) -> None:
+            url = (query.get("url") or [""])[0]
+            if not url:
+                self._respond_json(400, {"status": "error", "error": "url is required"})
+                return
+            self._respond_json(200, get_tailor_status(url))
+
+        def _handle_status(self, payload: dict) -> None:
+            # Lets the dashboard mark a job applied/failed, reset it back to
+            # pending, or hide/unhide it -- without the user touching the
+            # CLI. Covers both the "I applied by hand, tell the dashboard"
+            # workflow and the "never show me this posting again" one.
+            from applypilot.apply.launcher import mark_job, reset_job
+            from applypilot.database import hide_job, unhide_job
+
+            url = str(payload.get("url") or "").strip()
+            action = str(payload.get("action") or "").strip()
+            reason = payload.get("reason")
+            valid_actions = ("applied", "failed", "reset", "hide", "unhide")
+            if not url or action not in valid_actions:
+                self._respond_json(400, {"ok": False, "error": "url and a valid action are required"})
+                return
+            try:
+                if action == "reset":
+                    reset_job(url)
+                elif action == "hide":
+                    hide_job(get_connection(), url)
+                elif action == "unhide":
+                    unhide_job(get_connection(), url)
+                else:
+                    mark_job(url, action, reason=(reason or None) if action == "failed" else None)
+                self._respond_json(200, {"ok": True})
+            except Exception as exc:  # noqa: BLE001 -- report the failure to the page, don't crash the server
+                log.exception("Manual status update failed")
+                self._respond_json(500, {"ok": False, "error": str(exc)})
+
+        def _handle_open_folder(self, payload: dict) -> None:
+            # Same allow-listed-roots check as _serve_asset: only ever reveal
+            # a file that already lives under the CV/cover-letter output
+            # dirs, never an arbitrary path a request happens to name.
+            raw = str(payload.get("path") or "").strip()
+            if not raw:
+                self._respond_json(400, {"ok": False, "error": "path is required"})
+                return
+            try:
+                target = Path(raw).resolve()
+            except (OSError, ValueError):
+                self._respond_json(400, {"ok": False, "error": "invalid path"})
+                return
+            allowed = any(
+                target == root.resolve() or root.resolve() in target.parents
+                for root in ASSET_SERVE_ROOTS
+            )
+            if not allowed or not target.is_file():
+                self._respond_json(403, {"ok": False, "error": "path not allowed"})
+                return
+            try:
+                _reveal_in_file_manager(target)
+                self._respond_json(200, {"ok": True})
+            except Exception as exc:  # noqa: BLE001 -- report the failure to the page, don't crash the server
+                log.exception("Failed to open file manager")
+                self._respond_json(500, {"ok": False, "error": str(exc)})
+
+        def _respond_json(self, status: int, obj: dict) -> None:
+            self._respond(status, json.dumps(obj).encode("utf-8"), "application/json; charset=utf-8")
 
         def _serve_dashboard(self) -> None:
             try:
@@ -825,6 +1291,16 @@ def serve_dashboard(output_path: str | None = None, port: int = 8765) -> None:
             self.send_response(status)
             self.send_header("Content-Type", content_type)
             self.send_header("Content-Length", str(len(body)))
+            # Every response through here -- the dashboard HTML itself and
+            # every /files asset -- must always be re-fetched, never served
+            # from the browser's cache. Without this, a re-tailored CV/cover
+            # letter writes to the SAME deterministic /files?path=... URL as
+            # before (same job -> same filename), so the browser can (and,
+            # confirmed live 2026-08-25, does) keep showing the old cached
+            # file after a regenerate-and-reload even though the file on
+            # disk changed.
+            self.send_header("Cache-Control", "no-store, no-cache, must-revalidate")
+            self.send_header("Pragma", "no-cache")
             self.end_headers()
             self.wfile.write(body)
 

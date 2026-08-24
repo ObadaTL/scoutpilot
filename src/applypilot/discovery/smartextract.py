@@ -8,8 +8,8 @@ Two-phase approach:
 
 JSON-LD and API strategies execute directly from stored data -- no LLM needed.
 
-Sites are loaded from config/sites.yaml, with {query_encoded} and {location_encoded}
-placeholders replaced from the user's search configuration.
+Sites are loaded from config/sites.yaml, with {query_encoded}, {query_slug}, and
+{location_encoded} placeholders replaced from the user's search configuration.
 """
 
 import json
@@ -993,6 +993,13 @@ def build_scrape_targets(
                 expanded_url = expanded_url.replace("{query_encoded}", quote_plus(query))
                 expanded_url = expanded_url.replace("{query}", quote_plus(query))
                 expanded_url = expanded_url.replace("{location_encoded}", quote_plus(default_location))
+                # Hyphenated-path query slug (e.g. "Graduate Software
+                # Engineer" -> "graduate-software-engineer") -- some boards
+                # (nijobs.com) encode the search term as a URL path segment
+                # rather than a query string, so quote_plus's "+"-for-space
+                # doesn't fit.
+                query_slug = re.sub(r"[^a-z0-9]+", "-", query.lower()).strip("-")
+                expanded_url = expanded_url.replace("{query_slug}", query_slug)
                 targets.append({
                     "name": site_name,
                     "url": expanded_url,

@@ -175,6 +175,37 @@ def is_manual_ats(url: str | None) -> bool:
     return any(domain in url_lower for domain in domains)
 
 
+def load_location_focus() -> dict | None:
+    """Load the optional `location_focus` section from searches.yaml.
+
+    A temporary, reversible way to work through one specific regional job
+    search without touching any existing DB rows or discovery config: when
+    present and enabled, the tailor/apply job-selection queries (see
+    database.get_jobs_by_stage, apply.launcher.acquire_job) filter to only
+    jobs whose location matches one of the listed priority tiers, ordering
+    results by tier (tier 0 first) then fit_score. Absent or
+    `enabled: false` -> those queries behave exactly as before this feature
+    existed.
+
+    Expected shape in searches.yaml:
+        location_focus:
+          enabled: true
+          priority:
+            - ["Belfast"]
+            - ["Northern Ireland", "Antrim", "Down", ...]
+            - ["Remote"]
+
+    Returns:
+        The focus dict ({"enabled": True, "priority": [...]})  if enabled
+        with at least one tier, else None.
+    """
+    cfg = load_search_config()
+    focus = cfg.get("location_focus")
+    if not focus or not focus.get("enabled") or not focus.get("priority"):
+        return None
+    return focus
+
+
 def load_blocked_sites() -> tuple[set[str], list[str]]:
     """Load blocked sites and URL patterns from sites.yaml.
 

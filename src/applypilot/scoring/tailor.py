@@ -16,6 +16,7 @@ against FactBank.allowed_numbers() after generation, deterministically -- this i
 enforcement, not just a prompt instruction the model could ignore.
 """
 
+import hashlib
 import json
 import logging
 import re
@@ -1257,6 +1258,169 @@ def _strip_all_digits_from_fields(data: dict) -> dict:
     return result
 
 
+# ── Per-job worker (shared by the batch runner and the single-job entry
+# point used by the dashboard's Tailor button) ───────────────────────────
+
+_SUCCESS_STATUSES = {"approved", "approved_with_judge_warning", "approved_unquantified_fallback"}
+
+
+def _tailor_one_job(conn, job: dict, resume_text: str, profile: dict,
+                    fact_bank: FactBank, validation_mode: str,
+                    max_retries: int) -> dict:
+    """Tailor a resume for one job: liveness check, LLM call, file writes,
+    PDF conversion, and an immediate DB commit for this job alone.
+
+    Committing per job (rather than the caller batching one commit at the
+    very end across every job) means a crash/interrupt partway through a
+    multi-job run keeps whatever was already completed, instead of losing
+    the whole batch's progress along with it.
+
+    Returns:
+        Result dict: {"url", "path", "pdf_path", "title", "site", "status",
+        "attempts"}.
+    """
+    from applypilot.enrichment.detail import check_listing_still_open
+
+    still_open = check_listing_still_open(job["url"], job.get("site", ""))
+    conn.execute(
+        "UPDATE jobs SET listing_checked_at=? WHERE url=?",
+        (datetime.now(timezone.utc).isoformat(), job["url"]),
+    )
+    if still_open is False:
+        conn.execute(
+            "UPDATE jobs SET apply_status='listing_closed' WHERE url=?",
+            (job["url"],),
+        )
+        conn.commit()
+        log.info("[LISTING_CLOSED] %s -- skipped, no longer accepting applications", job["title"][:40])
+        return {
+            "url": job["url"], "title": job["title"], "site": job["site"],
+            "status": "listing_closed", "attempts": 0, "path": None, "pdf_path": None,
+        }
+
+    try:
+        tailored, report = tailor_resume(resume_text, job, profile,
+                                         validation_mode=validation_mode,
+                                         fact_bank=fact_bank,
+                                         max_retries=max_retries)
+
+        # Build safe, collision-resistant filename prefix. Two distinct
+        # postings frequently share the exact same site+title (e.g. two
+        # different "Graduate Software Engineer" listings both on
+        # LinkedIn) -- without the URL hash they'd write to the same
+        # path and silently clobber each other's resume/report files
+        # mid-batch while each job's own DB row still points at that one
+        # shared (now-wrong-for-one-of-them) file. cover_letter.py
+        # already does this; mirror it here.
+        safe_title = re.sub(r"[^\w\s-]", "", job["title"])[:50].strip().replace(" ", "_")
+        safe_site = re.sub(r"[^\w\s-]", "", job["site"])[:20].strip().replace(" ", "_")
+        url_hash = hashlib.sha1(job["url"].encode("utf-8")).hexdigest()[:8]
+        prefix = f"{safe_site}_{safe_title}_{url_hash}"
+
+        # Save tailored resume text
+        txt_path = TAILORED_DIR / f"{prefix}.txt"
+        txt_path.write_text(tailored, encoding="utf-8")
+
+        # Save job description for traceability
+        job_path = TAILORED_DIR / f"{prefix}_JOB.txt"
+        job_desc = (
+            f"Title: {job['title']}\n"
+            f"Company: {job['site']}\n"
+            f"Location: {job.get('location', 'N/A')}\n"
+            f"Score: {job.get('fit_score', 'N/A')}\n"
+            f"URL: {job['url']}\n\n"
+            f"{job.get('full_description', '')}"
+        )
+        job_path.write_text(job_desc, encoding="utf-8")
+
+        # Save validation report
+        report_path = TAILORED_DIR / f"{prefix}_REPORT.json"
+        report_path.write_text(json.dumps(report, indent=2), encoding="utf-8")
+
+        # Generate PDF for approved resumes (best-effort)
+        # "approved_with_judge_warning" and "approved_unquantified_fallback"
+        # are also successes — a real, safe resume was generated in both cases.
+        pdf_path = None
+        if report["status"] in _SUCCESS_STATUSES:
+            try:
+                from applypilot.scoring.pdf import convert_to_pdf
+                pdf_path = str(convert_to_pdf(txt_path))
+            except Exception:
+                log.debug("PDF generation failed for %s", txt_path, exc_info=True)
+
+        result = {
+            "url": job["url"],
+            "path": str(txt_path),
+            "pdf_path": pdf_path,
+            "title": job["title"],
+            "site": job["site"],
+            "status": report["status"],
+            "attempts": report["attempts"],
+            "errors": (report.get("validator") or {}).get("errors", []),
+        }
+    except Exception as e:
+        result = {
+            "url": job["url"], "title": job["title"], "site": job["site"],
+            "status": "error", "attempts": 0, "path": None, "pdf_path": None,
+            "errors": [str(e)],
+        }
+        log.error("[ERROR] %s -- %s", job["title"][:40], e)
+
+    now = datetime.now(timezone.utc).isoformat()
+    if result["status"] in _SUCCESS_STATUSES:
+        conn.execute(
+            "UPDATE jobs SET tailored_resume_path=?, tailored_at=?, "
+            "tailor_attempts=COALESCE(tailor_attempts,0)+1 WHERE url=?",
+            (result["path"], now, result["url"]),
+        )
+    elif result["status"] != "listing_closed":
+        conn.execute(
+            "UPDATE jobs SET tailor_attempts=COALESCE(tailor_attempts,0)+1 WHERE url=?",
+            (result["url"],),
+        )
+    conn.commit()
+
+    return result
+
+
+def tailor_one(url: str, validation_mode: str | None = None,
+               max_retries: int | None = None) -> dict:
+    """Tailor a resume for exactly one job, by URL, regardless of its
+    current pending_tailor eligibility (e.g. re-tailoring a job that
+    already has a tailored resume). Used by the dashboard's Tailor button.
+
+    Args:
+        url: The job's url (jobs.url).
+        validation_mode, max_retries: Same as run_tailoring; same
+            provider-aware auto-selection when not given.
+
+    Returns:
+        Result dict (see _tailor_one_job), or {"status": "not_found", ...}
+        if no job with that url exists.
+    """
+    if max_retries is None:
+        max_retries = 1 if is_local_provider() else 3
+    if validation_mode is None:
+        validation_mode = "lenient" if is_local_provider() else "normal"
+
+    conn = get_connection()
+    row = conn.execute("SELECT * FROM jobs WHERE url = ?", (url,)).fetchone()
+    if row is None:
+        return {"url": url, "title": "?", "site": "?", "status": "not_found",
+                "attempts": 0, "path": None, "pdf_path": None}
+    job = dict(row)
+
+    profile = load_profile()
+    resume_text = RESUME_PATH.read_text(encoding="utf-8")
+    fact_bank = FactBank.load()
+    TAILORED_DIR.mkdir(parents=True, exist_ok=True)
+
+    log.info("Tailoring 1 job on demand: %s (validation=%s, max_retries=%d)",
+             job["title"][:40], validation_mode, max_retries)
+    return _tailor_one_job(conn, job, resume_text, profile, fact_bank,
+                           validation_mode, max_retries)
+
+
 # ── Batch Entry Point ────────────────────────────────────────────────────
 
 def run_tailoring(min_score: int = 7, limit: int = 20,
@@ -1316,91 +1480,8 @@ def run_tailoring(min_score: int = 7, limit: int = 20,
 
     for job in jobs:
         completed += 1
-
-        # Cheap liveness check before the expensive tailor LLM call --
-        # skip postings already confirmed closed rather than burning a
-        # full tailor+judge cycle on something no apply attempt can use.
-        from applypilot.enrichment.detail import check_listing_still_open
-        still_open = check_listing_still_open(job["url"], job.get("site", ""))
-        conn.execute(
-            "UPDATE jobs SET listing_checked_at=? WHERE url=?",
-            (datetime.now(timezone.utc).isoformat(), job["url"]),
-        )
-        if still_open is False:
-            conn.execute(
-                "UPDATE jobs SET apply_status='listing_closed' WHERE url=?",
-                (job["url"],),
-            )
-            conn.commit()
-            result = {
-                "url": job["url"], "title": job["title"], "site": job["site"],
-                "status": "listing_closed", "attempts": 0, "path": None, "pdf_path": None,
-            }
-            results.append(result)
-            stats["listing_closed"] = stats.get("listing_closed", 0) + 1
-            log.info("%d/%d [LISTING_CLOSED] %s -- skipped, no longer accepting applications",
-                     completed, len(jobs), job["title"][:40])
-            continue
-
-        try:
-            tailored, report = tailor_resume(resume_text, job, profile,
-                                             validation_mode=validation_mode,
-                                             fact_bank=fact_bank,
-                                             max_retries=max_retries)
-
-            # Build safe filename prefix
-            safe_title = re.sub(r"[^\w\s-]", "", job["title"])[:50].strip().replace(" ", "_")
-            safe_site = re.sub(r"[^\w\s-]", "", job["site"])[:20].strip().replace(" ", "_")
-            prefix = f"{safe_site}_{safe_title}"
-
-            # Save tailored resume text
-            txt_path = TAILORED_DIR / f"{prefix}.txt"
-            txt_path.write_text(tailored, encoding="utf-8")
-
-            # Save job description for traceability
-            job_path = TAILORED_DIR / f"{prefix}_JOB.txt"
-            job_desc = (
-                f"Title: {job['title']}\n"
-                f"Company: {job['site']}\n"
-                f"Location: {job.get('location', 'N/A')}\n"
-                f"Score: {job.get('fit_score', 'N/A')}\n"
-                f"URL: {job['url']}\n\n"
-                f"{job.get('full_description', '')}"
-            )
-            job_path.write_text(job_desc, encoding="utf-8")
-
-            # Save validation report
-            report_path = TAILORED_DIR / f"{prefix}_REPORT.json"
-            report_path.write_text(json.dumps(report, indent=2), encoding="utf-8")
-
-            # Generate PDF for approved resumes (best-effort)
-            # "approved_with_judge_warning" and "approved_unquantified_fallback"
-            # are also successes — a real, safe resume was generated in both cases.
-            pdf_path = None
-            if report["status"] in ("approved", "approved_with_judge_warning",
-                                    "approved_unquantified_fallback"):
-                try:
-                    from applypilot.scoring.pdf import convert_to_pdf
-                    pdf_path = str(convert_to_pdf(txt_path))
-                except Exception:
-                    log.debug("PDF generation failed for %s", txt_path, exc_info=True)
-
-            result = {
-                "url": job["url"],
-                "path": str(txt_path),
-                "pdf_path": pdf_path,
-                "title": job["title"],
-                "site": job["site"],
-                "status": report["status"],
-                "attempts": report["attempts"],
-            }
-        except Exception as e:
-            result = {
-                "url": job["url"], "title": job["title"], "site": job["site"],
-                "status": "error", "attempts": 0, "path": None, "pdf_path": None,
-            }
-            log.error("%d/%d [ERROR] %s -- %s", completed, len(jobs), job["title"][:40], e)
-
+        result = _tailor_one_job(conn, job, resume_text, profile, fact_bank,
+                                 validation_mode, max_retries)
         results.append(result)
         stats[result.get("status", "error")] = stats.get(result.get("status", "error"), 0) + 1
 
@@ -1414,23 +1495,6 @@ def run_tailoring(min_score: int = 7, limit: int = 20,
             rate * 60,
             result["title"][:40],
         )
-
-    # Persist to DB: increment attempt counter for ALL, save path only for approved
-    now = datetime.now(timezone.utc).isoformat()
-    _success_statuses = {"approved", "approved_with_judge_warning", "approved_unquantified_fallback"}
-    for r in results:
-        if r["status"] in _success_statuses:
-            conn.execute(
-                "UPDATE jobs SET tailored_resume_path=?, tailored_at=?, "
-                "tailor_attempts=COALESCE(tailor_attempts,0)+1 WHERE url=?",
-                (r["path"], now, r["url"]),
-            )
-        elif r["status"] != "listing_closed":
-            conn.execute(
-                "UPDATE jobs SET tailor_attempts=COALESCE(tailor_attempts,0)+1 WHERE url=?",
-                (r["url"],),
-            )
-    conn.commit()
 
     elapsed = time.time() - t0
     log.info(

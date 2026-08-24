@@ -110,16 +110,43 @@ def acquire_job(target_url: str | None = None, min_score: int = 7,
         conn.execute("BEGIN IMMEDIATE")
 
         if target_url:
-            like = f"%{target_url.split('?')[0].rstrip('/')}%"
+            # Exact match first, always. Confirmed live 2026-08-24: the old
+            # single query OR'd in a fuzzy LIKE fallback built from
+            # target_url.split('?')[0] -- stripping the query string. For
+            # Indeed URLs the query string (?jk=...) *is* the entire
+            # identifier, so that pattern degraded to "%https://uk.indeed.com
+            # /viewjob%", matched every tailored Indeed job in the DB, and
+            # with no ORDER BY, SQLite handed back whichever one it felt
+            # like -- --url targeting a specific "Academic Tutor" posting
+            # instead submitted a real application to an unrelated
+            # "Engineering Support Graduate Assessment Day" posting. Exact
+            # match is tried alone first so this can't happen when the
+            # caller passes the real jobs.url/application_url value (the
+            # normal case for a DB-sourced URL); the fuzzy fallback below
+            # only runs when that fails, and never discards the query
+            # string, so a query-string-only identifier can't be erased.
             row = conn.execute("""
                 SELECT url, title, site, application_url, tailored_resume_path,
                        fit_score, location, full_description, cover_letter_path
                 FROM jobs
-                WHERE (url = ? OR application_url = ? OR application_url LIKE ? OR url LIKE ?)
+                WHERE (url = ? OR application_url = ?)
                   AND tailored_resume_path IS NOT NULL
                   AND (apply_status IS NULL OR apply_status != 'in_progress')
                 LIMIT 1
-            """, (target_url, target_url, like, like)).fetchone()
+            """, (target_url, target_url)).fetchone()
+
+            if not row:
+                like = f"%{target_url.rstrip('/')}%"
+                row = conn.execute("""
+                    SELECT url, title, site, application_url, tailored_resume_path,
+                           fit_score, location, full_description, cover_letter_path
+                    FROM jobs
+                    WHERE (application_url LIKE ? OR url LIKE ?)
+                      AND tailored_resume_path IS NOT NULL
+                      AND (apply_status IS NULL OR apply_status != 'in_progress')
+                    ORDER BY url
+                    LIMIT 1
+                """, (like, like)).fetchone()
         else:
             blocked_sites, blocked_patterns = _load_blocked()
             # Build parameterized filters to avoid SQL injection
@@ -133,6 +160,18 @@ def acquire_job(target_url: str | None = None, min_score: int = 7,
             if blocked_patterns:
                 url_clauses = " ".join(f"AND url NOT LIKE ?" for _ in blocked_patterns)
                 params.extend(blocked_patterns)
+
+            # Optional location_focus (config.load_location_focus): same
+            # temporary/reversible narrowing as database.get_jobs_by_stage
+            # -- restrict the auto-apply queue to matching location tiers
+            # and process them in tier order (e.g. Belfast before rest-of-NI
+            # before remote) when enabled. No-op when focus is disabled.
+            from applypilot.config import load_location_focus
+            focus = load_location_focus()
+            tier_count = len((focus or {}).get("priority", []))
+            focus_clause = f"AND loc_priority(location) < {tier_count}" if tier_count else ""
+            order_by = "loc_priority(location) ASC, fit_score DESC, url" if tier_count else "fit_score DESC, url"
+
             row = conn.execute(f"""
                 SELECT url, title, site, application_url, tailored_resume_path,
                        fit_score, location, full_description, cover_letter_path
@@ -142,9 +181,11 @@ def acquire_job(target_url: str | None = None, min_score: int = 7,
                   AND (apply_attempts IS NULL OR apply_attempts < ?)
                   AND fit_score >= ?
                   AND duplicate_of IS NULL
+                  AND COALESCE(hidden, 0) = 0
                   {site_clause}
                   {url_clauses}
-                ORDER BY fit_score DESC, url
+                  {focus_clause}
+                ORDER BY {order_by}
                 LIMIT 1
             """, [config.DEFAULTS["max_apply_attempts"]] + params).fetchone()
 
@@ -293,6 +334,27 @@ def reset_failed() -> int:
     """)
     conn.commit()
     return cursor.rowcount
+
+
+def reset_job(url: str) -> bool:
+    """Clear one job's apply status back to pending, e.g. after a wrong manual
+    mark or to let a stuck/failed job be picked up again (by auto-apply or a
+    fresh manual attempt).
+
+    Args:
+        url: Job URL to reset.
+
+    Returns:
+        True if a matching job row was found and reset.
+    """
+    conn = get_connection()
+    cursor = conn.execute("""
+        UPDATE jobs SET apply_status = NULL, apply_error = NULL,
+                       applied_at = NULL, apply_attempts = 0, agent_id = NULL
+        WHERE url = ?
+    """, (url,))
+    conn.commit()
+    return cursor.rowcount > 0
 
 
 # ---------------------------------------------------------------------------
