@@ -39,6 +39,19 @@ _NUMBER_TOKEN_RE = re.compile(r"\d+")
 # into keywords for job-description matching.
 _USE_WHEN_STOPWORDS = {"only", "roles", "role", "and", "or"}
 
+# Generic words stripped before comparing a rejected plain bullet against a
+# verified fact's `short` variant in _match_similar_fact -- common enough
+# that requiring them wouldn't distinguish one fact from another.
+_BULLET_MATCH_STOPWORDS = {
+    "a", "an", "the", "and", "or", "of", "in", "on", "at", "to", "for",
+    "with", "from", "by", "into", "across", "using", "via",
+}
+_WORD_RE = re.compile(r"[a-z0-9]+")
+
+
+def _significant_words(text: str) -> set[str]:
+    return {w for w in _WORD_RE.findall(text.lower()) if w not in _BULLET_MATCH_STOPWORDS and len(w) > 1}
+
 
 class FactBankError(Exception):
     """Base class for fact-bank problems."""
@@ -257,6 +270,61 @@ class FactBank:
             return self._facts.get("edu.meng")
         return None
 
+    def match_similar(self, text: str) -> tuple[str, str] | None:
+        """Best-effort recovery for a plain-string bullet that has a digit
+        but is actually just a reworded version of an existing verified
+        fact the model forgot to reference by id.
+
+        Confirmed live 2026-08-24: the model independently wrote "Built 2
+        parallel ML pipelines on surface-EMG signals in Python/scikit-learn"
+        as plain text -- word-for-word `emg.dual_pipeline`'s own `short`
+        variant -- instead of emitting {"fact": "emg.dual_pipeline", "form":
+        "short"}. resolve_bullet used to just drop bullets like this, which
+        thins the resume (fewer bullets -> more empty space on the rendered
+        PDF) for a reason that has nothing to do with the claim being
+        unverified -- it demonstrably already IS one of the two ways to say
+        THIS SPECIFIC AND VERIFIED thing.
+
+        Matching is on whole words with underscore/word-boundary tokenizing
+        (not raw substring, and not a general text-similarity score like
+        difflib's SequenceMatcher -- tested live and found unreliable here:
+        a true reworded match against a short/terse fact variant scored
+        LOWER than an unrelated fact purely because of length mismatch).
+        A fact only matches if EVERY significant word in its own `short`
+        variant, and every number in its own `numbers` list, is literally
+        present in the bullet -- this can't accidentally fire on a bullet
+        that merely shares a couple of common words with a fact, since it
+        requires the fact's full (short) claim to already be present.
+        Returns (fact_id, text) -- text is the fact's own `short` text
+        (never anything derived from the bullet), so this is exactly as
+        safe as the id-reference path: nothing the LLM wrote is ever used,
+        only pre-verified text. The fact_id lets a caller recognize two
+        differently-worded bullets that both resolved to the same
+        underlying fact (see _resolve_fact_bullets's dedup).
+        """
+        bullet_words = _significant_words(text)
+        bullet_numbers = {int(n) for n in _NUMBER_TOKEN_RE.findall(text)}
+        if not bullet_words:
+            return None
+
+        best: tuple[float, str, str] | None = None
+        for fact in self.verified():
+            short = fact.variants.get("short")
+            if not short:
+                continue
+            fact_words = _significant_words(short)
+            if not fact_words or not fact_words <= bullet_words:
+                continue
+            if fact.numbers and not set(fact.numbers) <= bullet_numbers:
+                continue
+            # Prefer the fact whose short text covers more of the bullet --
+            # keeps an overly generic/short fact from winning over a more
+            # specific one when both technically qualify.
+            coverage = len(fact_words) / len(bullet_words)
+            if best is None or coverage > best[0]:
+                best = (coverage, fact.id, " ".join(short.split()))
+        return (best[1], best[2]) if best else None
+
     def verified(self) -> list[Fact]:
         """All tier == 'verified' facts. The ONLY facts ever exposed to the LLM."""
         return [f for f in self._facts.values() if f.tier == "verified"]
@@ -295,14 +363,25 @@ class FactBank:
         return relevant
 
     def resolve_bullet(self, bullet) -> str:
-        """Turn one LLM-output bullet into literal text.
+        """Turn one LLM-output bullet into literal text. See resolve_bullet_ex
+        for the full contract; this just drops the fact-id half of it for
+        callers that only need the text."""
+        return self.resolve_bullet_ex(bullet)[0]
+
+    def resolve_bullet_ex(self, bullet) -> tuple[str, str | None]:
+        """Turn one LLM-output bullet into (literal text, fact id or None).
 
         A fact-referencing bullet (``{"fact": id, "form": "short"|"long"}``)
         is replaced VERBATIM with that fact's pre-written variant -- the
         LLM's own phrasing for it, if any, is discarded entirely, so it
         cannot rewrite numeric content no matter what it outputs alongside
         the id. A plain-string bullet passes through only if it contains no
-        digits at all.
+        digits at all. The fact id (None for a plain bullet with no digits)
+        lets a caller recognize two differently-worded bullets that both
+        resolved to the same fact -- see _resolve_fact_bullets's dedup,
+        which needs this because two bullets pointing at the same fact can
+        land on very different-length text (a fact's `short` vs `long`
+        variant) that a text-similarity check alone won't reliably catch.
 
         Raises:
             ValueError: unknown/unverified fact id, missing variant text,
@@ -317,7 +396,7 @@ class FactBank:
                 # If the dict contains a text bullet without a valid fact id
                 text = bullet.get("text") or bullet.get("bullet") or bullet.get("desc")
                 if text and isinstance(text, str):
-                    return self.resolve_bullet(text)
+                    return self.resolve_bullet_ex(text)
                 raise ValueError(f"Invalid fact id format in bullet: {bullet!r}")
 
             fact = self._facts.get(fact_id)
@@ -327,11 +406,11 @@ class FactBank:
             text = fact.variants.get(form) or fact.variants.get("short") or fact.variants.get("long")
             if not text:
                 raise ValueError(f"Fact {fact_id!r} has no usable variant text")
-            return " ".join(text.split())  # collapse YAML block-scalar line wrapping
+            return " ".join(text.split()), fact.id  # collapse YAML block-scalar line wrapping
 
         if isinstance(bullet, (list, tuple)):
             # If bullet is a list of items, join them into a single string
-            return " ".join(str(b) for b in bullet if b)
+            return " ".join(str(b) for b in bullet if b), None
 
         if isinstance(bullet, str):
             # Check for inline fact references like (fact: kraydel.audit_event_system) or [fact: ...]
@@ -343,12 +422,15 @@ class FactBank:
                     form = "long" if "long" in bullet.lower() else "short"
                     text = fact.variants.get(form) or fact.variants.get("short") or fact.variants.get("long")
                     if text:
-                        return " ".join(text.split())
+                        return " ".join(text.split()), fact.id
                 elif fact is None:
                     raise ValueError(f"Unknown fact id in bullet: {fact_id!r}")
             if _NUMBER_TOKEN_RE.search(bullet):
+                recovered = self.match_similar(bullet)
+                if recovered is not None:
+                    return recovered[1], recovered[0]
                 raise ValueError(f"Bullet without a fact id contains a digit: {bullet!r}")
-            return bullet
+            return bullet, None
         raise ValueError(f"Unrecognized bullet format: {bullet!r}")
 
 

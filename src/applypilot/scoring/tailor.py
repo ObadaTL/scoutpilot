@@ -26,7 +26,7 @@ from pathlib import Path
 from applypilot.config import RESUME_PATH, TAILORED_DIR, get_locale_style, load_profile
 from applypilot.database import get_connection, get_jobs_by_stage
 from applypilot.facts import FactBank, NumericGuard, NumericGuardViolation
-from applypilot.llm import get_client
+from applypilot.llm import get_client, is_local_provider
 from applypilot.scoring.pdf import split_sections
 from applypilot.scoring.validator import (
     BANNED_WORDS,
@@ -624,9 +624,19 @@ def _resolve_fact_bullets(data: dict, fact_bank: FactBank) -> tuple[dict, list[s
     A fact-id bullet is replaced verbatim with that fact's pre-written
     variant (see FactBank.resolve_bullet) -- the LLM's own wording for it
     is discarded, so it cannot rewrite numeric content. A bad bullet
-    (unknown fact id, or a plain bullet with a digit) is dropped and
-    reported as an error rather than let through; assemble_resume_text
-    only ever sees plain strings, same as before this change.
+    (unknown fact id, or a plain bullet with a digit with no fact match) is
+    dropped and reported as an error rather than let through;
+    assemble_resume_text only ever sees plain strings, same as before this
+    change.
+
+    Two differently-worded bullets can independently resolve to the SAME
+    fact -- both a literal {"fact": id} reference and FactBank.match_similar
+    recovering a reworded plain bullet (see resolve_bullet) always return
+    that fact's own verbatim text, so two attempts at describing the one
+    real achievement collapse to identical resolved text. Deduped here
+    (same near-duplicate check _merge_canonical_section uses) rather than
+    left for a human to notice two copies of "1st place, QUB Dragon's Den
+    2024" back to back.
 
     Returns:
         (resolved_data, errors) -- resolved_data is a shallow copy of data
@@ -641,15 +651,52 @@ def _resolve_fact_bullets(data: dict, fact_bank: FactBank) -> tuple[dict, list[s
             if not isinstance(entry, dict):
                 continue
             new_entry = dict(entry)
-            new_bullets = []
+            new_bullets: list[str] = []
+            seen_fact_ids: set[str] = set()
             raw_bullets = entry.get("bullets", [])
             if isinstance(raw_bullets, str):
                 raw_bullets = [raw_bullets]
             for bullet in raw_bullets:
                 try:
-                    new_bullets.append(fact_bank.resolve_bullet(bullet))
+                    resolved, fact_id = fact_bank.resolve_bullet_ex(bullet)
                 except ValueError as e:
                     errors.append(str(e))
+                    continue
+                if fact_id is None:
+                    # A zero-digit plain bullet never goes through
+                    # resolve_bullet_ex's match_similar recovery (that only
+                    # triggers on a digit) -- but it can still just BE a
+                    # fact's own short text, or close enough to it, without
+                    # ever declaring the id. Discover that identity here too
+                    # so the fact-id dedup below covers this bullet in
+                    # either arrival order (fact-id bullet first or this
+                    # one first) -- confirmed live 2026-08-24: the LONG
+                    # variant of a fact and a plain bullet matching its
+                    # SHORT variant share too few words for the
+                    # word-coverage check alone to catch (0.24, below
+                    # threshold) even though they're unambiguously the same
+                    # underlying fact.
+                    implicit = fact_bank.match_similar(resolved)
+                    if implicit is not None:
+                        fact_id = implicit[0]
+
+                # Two bullets pointing at the same fact are ALWAYS a
+                # duplicate even if the resolved text differs a lot --
+                # exact-match on the id is reliable where a text-similarity
+                # score isn't (a fact's short vs long variant can be too
+                # different in length for that to catch).
+                if fact_id is not None and fact_id in seen_fact_ids:
+                    continue
+                # Still check word-coverage against everything kept so far
+                # (regardless of fact id) -- catches two independently
+                # LLM-authored plain bullets restating the same thing with
+                # no fact involved at all.
+                is_dup = any(_bullets_similar(resolved, kept) for kept in new_bullets)
+                if is_dup:
+                    continue
+                if fact_id is not None:
+                    seen_fact_ids.add(fact_id)
+                new_bullets.append(resolved)
             new_entry["bullets"] = new_bullets
             resolved_entries.append(new_entry)
         return resolved_entries
@@ -658,6 +705,134 @@ def _resolve_fact_bullets(data: dict, fact_bank: FactBank) -> tuple[dict, list[s
     resolved["experience"] = _resolve_section(data.get("experience"))
     resolved["projects"] = _resolve_section(data.get("projects"))
     return resolved, errors
+
+
+def _bullet_text(bullet) -> str:
+    """Best-effort plain text for a bullet, which may still be a raw
+    {"fact": id, "form": ...} dict at this point (canonicalization runs
+    before _resolve_fact_bullets) -- str(dict) is good enough for a
+    similarity comparison, it doesn't need to be the final rendered text."""
+    return bullet if isinstance(bullet, str) else str(bullet)
+
+
+_BULLET_STOPWORDS = {
+    "a", "an", "the", "and", "or", "of", "in", "on", "at", "to", "for",
+    "with", "from", "by", "into", "across", "using", "via",
+}
+_WORD_RE = re.compile(r"[a-z0-9]+")
+
+# Conservative on purpose: merging two entries that split off the same real
+# job/project is worth deduping near-identical bullets for, but a false
+# merge silently deletes a real, distinct achievement -- worse than leaving
+# a redundant bullet in.
+#
+# Word-overlap coverage, not a character-sequence ratio (difflib's
+# SequenceMatcher): confirmed live 2026-08-24 that SequenceMatcher is
+# unreliable across bullets of very different length describing the same
+# claim -- a fact's `short` vs `long` variant of the SAME achievement
+# scored only 0.24 (read as two different bullets) while an unrelated pair
+# from the same entry scored 0.56 purely by chance overlap in phrasing.
+# Coverage (what fraction of each bullet's significant words also appear
+# in the other, take the smaller side) doesn't have that length bias.
+# Calibrated against this candidate's real bullets: unrelated bullets
+# topped out at 0.12 coverage; true duplicates (differently-worded, same
+# claim) started at 0.40.
+_BULLET_DUP_MIN_COVERAGE = 0.30
+
+
+def _significant_words(text: str) -> set[str]:
+    return {w for w in _WORD_RE.findall(text.lower()) if w not in _BULLET_STOPWORDS and len(w) > 1}
+
+
+def _bullets_similar(a: str, b: str) -> bool:
+    wa, wb = _significant_words(a), _significant_words(b)
+    if not wa or not wb:
+        return False
+    inter = wa & wb
+    return min(len(inter) / len(wa), len(inter) / len(wb)) >= _BULLET_DUP_MIN_COVERAGE
+
+
+def _merge_canonical_section(entries: list, records: list[dict]) -> list:
+    """Match each LLM-authored entry against the profile's canonical records
+    by keyword, force the matched record's header/subtitle onto it, and
+    merge together every entry that matches the SAME record (fixing a
+    single real job/project the model split into two JSON entries) into one,
+    deduping bullets that are the same underlying claim reworded.
+
+    Entries matching no canonical record pass through untouched -- the
+    registry only needs to cover the entries you actually want protected;
+    anything else keeps today's fully LLM-authored behavior.
+    """
+    merged_bullets: dict[int, list] = {}
+    match_order: list[int] = []
+    leftover: list = []
+
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+        haystack = " ".join(
+            str(entry.get(k, "")) for k in ("header", "subtitle")
+        ).lower() + " " + " ".join(str(b) for b in entry.get("bullets", [])).lower()
+
+        record_idx = next(
+            (i for i, rec in enumerate(records)
+             if any(m.lower() in haystack for m in rec.get("match", []))),
+            None,
+        )
+        if record_idx is None:
+            leftover.append(entry)
+            continue
+
+        if record_idx not in merged_bullets:
+            merged_bullets[record_idx] = []
+            match_order.append(record_idx)
+        for bullet in entry.get("bullets", []):
+            text = _bullet_text(bullet)
+            is_dup = any(
+                _bullets_similar(text, _bullet_text(kept))
+                for kept in merged_bullets[record_idx]
+            )
+            if not is_dup:
+                merged_bullets[record_idx].append(bullet)
+
+    merged = [
+        {"header": records[idx]["header"], "subtitle": records[idx]["subtitle"], "bullets": merged_bullets[idx]}
+        for idx in match_order
+    ]
+    return merged + leftover
+
+
+def _apply_canonical_entries(data: dict, profile: dict) -> dict:
+    """Overwrite the LLM-authored header/subtitle of any experience/project
+    entry that describes a known real job or project with the profile's own
+    verbatim text (profile.resume_facts.canonical_entries), and collapse
+    duplicates that match the same record into a single entry.
+
+    The header ("Title | Company") and subtitle ("Tech | Dates") lines are
+    free text the LLM generates fresh every attempt -- unlike numeric
+    bullets (NumericGuard) or the personal contact header (always
+    code-injected), nothing previously checked these afterward. Confirmed
+    live: a small local model both drifts real dates ("Jul 2022 - May 2023"
+    becoming something else) and occasionally splits one real entry into
+    two JSON entries that both reference the same company/project, and
+    NumericGuard's scan deliberately skips headers/subtitles (they
+    legitimately carry real dates it can't otherwise authorize -- see
+    _build_guard_scan_text), so neither failure mode was ever caught. This
+    is optional and additive: entries with no matching canonical record are
+    left exactly as the LLM produced them.
+    """
+    canonical = profile.get("resume_facts", {}).get("canonical_entries") or {}
+    if not canonical:
+        return data
+
+    result = dict(data)
+    for section in ("experience", "projects"):
+        records = canonical.get(section)
+        entries = data.get(section)
+        if not records or not isinstance(entries, list):
+            continue
+        result[section] = _merge_canonical_section(entries, records)
+    return result
 
 
 def _build_guard_scan_text(resolved_data: dict) -> str:
@@ -909,6 +1084,23 @@ def tailor_resume(
                 return tailored, report
             continue
 
+        # Force known real jobs/projects back onto their verbatim header +
+        # subtitle (title/company/dates), and merge any duplicate the model
+        # split off, BEFORE anything else touches `data` -- see
+        # _apply_canonical_entries. Matching happens against the model's
+        # full, unfiltered bullet list on purpose: doing this after
+        # _resolve_fact_bullets/_fallback_unquantified would match against
+        # whatever bullets survived THEIR filtering, and if the only bullet
+        # that happened to mention a company/project name gets dropped
+        # there (e.g. it also carried an unverified digit), the match
+        # keyword is gone and that entry's header/subtitle silently stay
+        # LLM-authored -- confirmed live 2026-08-24 on a real job: the
+        # Kraydel entry's header/subtitle only had "Kraydel" in a bullet
+        # that the numeric-fallback path dropped, so it shipped without a
+        # company name or its real dates. Canonicalizing `data` itself here
+        # means every downstream branch (normal path, both fallback paths)
+        # sees the corrected version from the start.
+        data = _apply_canonical_entries(data, profile)
         last_good_data = data
 
         # Resolve fact-id bullets to their verbatim pre-written text BEFORE
@@ -1030,6 +1222,7 @@ def _ship_unquantified_fallback(
     """
     fallback_data = _fallback_unquantified(data, fact_bank)
     resolved_fallback, _ = _resolve_fact_bullets(fallback_data, fact_bank)
+    resolved_fallback = _apply_canonical_entries(resolved_fallback, profile)
     try:
         guard.check(_build_guard_scan_text(resolved_fallback))
     except NumericGuardViolation:
@@ -1067,17 +1260,37 @@ def _strip_all_digits_from_fields(data: dict) -> dict:
 # ── Batch Entry Point ────────────────────────────────────────────────────
 
 def run_tailoring(min_score: int = 7, limit: int = 20,
-                  validation_mode: str = "normal") -> dict:
+                  validation_mode: str | None = None,
+                  max_retries: int | None = None) -> dict:
     """Generate tailored resumes for high-scoring jobs.
 
     Args:
         min_score:       Minimum fit_score to tailor for.
         limit:           Maximum jobs to process.
-        validation_mode: "strict", "normal", or "lenient".
+        validation_mode: "strict", "normal", or "lenient". If not given,
+                         auto-picks "lenient" for a local provider (skips
+                         the LLM judge) or "normal" for cloud -- same
+                         provider-aware default the CLI resolves for you,
+                         kept here too so a direct call (scripts, tests,
+                         this function's own default) gets it without going
+                         through cli.py.
+        max_retries:     Per-job retry budget passed to tailor_resume(). If
+                         not given, auto-picks 1 for a local Ollama/llama.cpp
+                         provider vs. 3 for a cloud provider (Gemini/OpenAI):
+                         a small local model rarely produces a materially
+                         better rewrite on a 3rd/4th "avoid these issues"
+                         retry, and each retry here can double again for the
+                         LLM judge (see tailor_resume/judge_tailored_resume),
+                         so the full retry budget mostly buys extra minutes
+                         per job on local hardware, not extra quality.
 
     Returns:
         {"approved": int, "failed": int, "errors": int, "elapsed": float}
     """
+    if max_retries is None:
+        max_retries = 1 if is_local_provider() else 3
+    if validation_mode is None:
+        validation_mode = "lenient" if is_local_provider() else "normal"
     profile = load_profile()
     resume_text = RESUME_PATH.read_text(encoding="utf-8")
     # Loaded once per batch (not per job) -- also means a bad facts.yaml
@@ -1092,7 +1305,10 @@ def run_tailoring(min_score: int = 7, limit: int = 20,
         return {"approved": 0, "failed": 0, "errors": 0, "elapsed": 0.0}
 
     TAILORED_DIR.mkdir(parents=True, exist_ok=True)
-    log.info("Tailoring resumes for %d jobs (score >= %d)...", len(jobs), min_score)
+    log.info(
+        "Tailoring resumes for %d jobs (score >= %d, validation=%s, max_retries=%d)...",
+        len(jobs), min_score, validation_mode, max_retries,
+    )
     t0 = time.time()
     completed = 0
     results: list[dict] = []
@@ -1129,7 +1345,8 @@ def run_tailoring(min_score: int = 7, limit: int = 20,
         try:
             tailored, report = tailor_resume(resume_text, job, profile,
                                              validation_mode=validation_mode,
-                                             fact_bank=fact_bank)
+                                             fact_bank=fact_bank,
+                                             max_retries=max_retries)
 
             # Build safe filename prefix
             safe_title = re.sub(r"[^\w\s-]", "", job["title"])[:50].strip().replace(" ", "_")

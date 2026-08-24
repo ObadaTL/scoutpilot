@@ -21,6 +21,19 @@ log = logging.getLogger(__name__)
 # Provider detection
 # ---------------------------------------------------------------------------
 
+def is_local_provider() -> bool:
+    """True when generation will hit a local (non-cloud) LLM_URL endpoint.
+
+    Mirrors _detect_provider's own precedence (LLM_URL wins over any cloud
+    API key when both are set) without constructing a client. Used to
+    auto-tune retry/judge behavior for tailoring: a small local model
+    doesn't reliably improve on repeated "avoid these issues" retries the
+    way a cloud model does, and a same-size local model judging its own
+    output adds latency without much of a trust bump -- see tailor.py.
+    """
+    return bool(os.environ.get("LLM_URL", ""))
+
+
 def _detect_provider() -> tuple[str, str, str]:
     """Return (base_url, model, api_key) based on environment variables.
 
@@ -80,6 +93,18 @@ _RATE_LIMIT_BASE_WAIT = 10
 _GEMINI_COMPAT_BASE = "https://generativelanguage.googleapis.com/v1beta/openai"
 _GEMINI_NATIVE_BASE = "https://generativelanguage.googleapis.com/v1beta"
 
+# Ollama's runtime context window defaults to 4096 tokens for ANY model
+# unless a request explicitly overrides it with `options.num_ctx` -- this is
+# independent of the model's own max supported context (qwen3:14b supports
+# 40960). Confirmed live 2026-08-24: the tailoring prompt alone (system
+# prompt + base resume + a near-6000-char job description) already runs
+# ~4900 tokens, before the ~2048-token output budget is even added -- well
+# past the silent-truncation point, on every call, for any job with a
+# moderately long description. Verified 8192 fits this machine's 16GB card
+# with ~3GB of headroom to spare (peak ~13.2GB during generation).
+# LLM_NUM_CTX lets a smaller/larger card override it.
+_DEFAULT_NUM_CTX = 8192
+
 
 class LLMClient:
     """Thin LLM client supporting OpenAI-compatible and native Gemini endpoints.
@@ -99,6 +124,7 @@ class LLMClient:
         self._is_gemini: bool = base_url.startswith(_GEMINI_COMPAT_BASE)
         # Use native generateContent API directly for Gemini
         self._use_native_gemini: bool = self._is_gemini
+        self._num_ctx = int(os.environ.get("LLM_NUM_CTX", _DEFAULT_NUM_CTX))
 
     # -- Native Gemini API --------------------------------------------------
 
@@ -205,39 +231,75 @@ class LLMClient:
             content = choice.get("reasoning")
         return content
 
-    # -- Ollama native API (structured output only) -------------------------
+    # -- Ollama native API ----------------------------------------------------
 
     def _chat_ollama_native(
         self,
         messages: list[dict],
         temperature: float,
         max_tokens: int,
-        json_schema: dict,
+        json_schema: dict | None = None,
     ) -> str:
-        """Call Ollama's native /api/chat with a JSON-schema `format`.
+        """Call Ollama's native /api/chat, optionally with a JSON-schema `format`.
 
-        Ollama's OpenAI-compat layer (/v1/chat/completions) silently ignores
+        Originally used only for schema-constrained calls, since Ollama's
+        OpenAI-compat layer (/v1/chat/completions) silently ignores
         `response_format` on this build -- no error, but no enforcement
         either (verified empirically: the model's raw chain-of-thought came
         back as "content" instead of schema-shaped JSON). The native API's
         top-level `format: <schema>` field genuinely constrains sampling
         (also verified empirically) and cleanly separates "thinking" from
-        "content", so structured calls route here instead when talking to a
-        local (non-Gemini) provider. Same [{role, content}, ...] message
-        shape as the OpenAI-compat layer -- only the envelope differs.
+        "content".
+
+        Now also the route for EVERY local call, schema or not: this is the
+        only endpoint that accepts `options.num_ctx` -- the OpenAI-compat
+        body has no field for it -- and without it Ollama silently runs at
+        its own 4096-token default regardless of what the model actually
+        supports (see _DEFAULT_NUM_CTX). A scoring or cover-letter call with
+        no json_schema still needs that override just as much as a
+        schema-constrained tailoring call does.
+
+        Same [{role, content}, ...] message shape as the OpenAI-compat
+        layer -- only the envelope differs.
+
+        Also sets the top-level `think: false` field. The text-based
+        `/no_think` prompt prefix (see chat()) does NOT reliably suppress
+        qwen3's reasoning on this Ollama build -- confirmed live 2026-08-24:
+        with `/no_think` prepended and num_predict=250, the model still
+        spent the entire budget on hidden `message.thinking` and emitted 0-18
+        chars of real `message.content` before hitting the length cap.
+        Ollama's native `think` field is what actually works: same prompt,
+        same budget, `think: false` produced 0 thinking tokens and 400-500+
+        chars of real content, using under half the total tokens. Every
+        max_tokens budget in this codebase (tailor, judge, score, cover
+        letter) was sized assuming /no_think was working -- without this,
+        those calls were burning most or all of their budget on invisible
+        reasoning and returning truncated or empty JSON, which reads back
+        as "not valid JSON" retries or malformed output, not as a reasoning
+        problem.
         """
         url = self.base_url[: -len("/v1")] if self.base_url.endswith("/v1") else self.base_url
         payload = {
             "model": self.model,
             "messages": messages,
             "stream": False,
-            "format": json_schema,
-            "options": {"temperature": temperature, "num_predict": max_tokens},
+            "think": False,
+            "options": {"temperature": temperature, "num_predict": max_tokens, "num_ctx": self._num_ctx},
         }
+        if json_schema is not None:
+            payload["format"] = json_schema
         resp = self._client.post(f"{url}/api/chat", json=payload, headers={"Content-Type": "application/json"})
         resp.raise_for_status()
         data = resp.json()
-        return data["message"]["content"]
+        message = data["message"]
+        content = message.get("content") or ""
+        if not content and message.get("thinking"):
+            # think:false should make this unreachable, but if an older
+            # Ollama/model build ignores the field and reasons anyway, fall
+            # back to it rather than return an empty string outright -- same
+            # safety net _handle_compat_response already has.
+            content = message["thinking"]
+        return content
 
     # -- public API ---------------------------------------------------------
 
@@ -250,17 +312,25 @@ class LLMClient:
     ) -> str:
         """Send a chat completion request and return the assistant message text.
 
-        json_schema: optional JSON Schema to constrain the response to (see
-        _chat_compat). Only honored on the OpenAI-compat path -- the native
-        Gemini path ignores it (Gemini's own JSON mode has been reliable
-        enough in practice that this hasn't been needed there).
+        json_schema: optional JSON Schema to constrain the response to.
+        Honored on Ollama's native path (_chat_ollama_native) and the
+        OpenAI-compat path (_chat_compat) -- the native Gemini path ignores
+        it (Gemini's own JSON mode has been reliable enough in practice
+        that this hasn't been needed there).
         """
-        # Qwen3 optimization: prepend /no_think to skip chain-of-thought
-        # reasoning, saving tokens on structured extraction tasks. Every
-        # call site in this codebase sends [system, user, ...] -- looking
-        # only at messages[0] (as this used to) means the role is always
-        # "system" there and this never fires. Find the first "user"
-        # message wherever it actually is instead.
+        # Qwen3: prepend /no_think as a secondary hint for any Qwen served
+        # over the OpenAI-compat path (cloud or a non-Ollama local server),
+        # where there's no equivalent to Ollama's native `think` field to
+        # rely on instead. NOT the primary mechanism for a local Ollama
+        # provider -- confirmed live 2026-08-24 that this text convention
+        # does not reliably suppress qwen3's reasoning on this Ollama build
+        # (the model still spent its whole token budget on hidden
+        # "thinking" and returned little/no real content); the native path
+        # (_chat_ollama_native) sets `think: false` instead, which does
+        # work. Every call site in this codebase sends [system, user, ...]
+        # -- looking only at messages[0] (as this used to) means the role
+        # is always "system" there and this never fires. Find the first
+        # "user" message wherever it actually is instead.
         if "qwen" in self.model.lower() and messages:
             for i, msg in enumerate(messages):
                 if msg.get("role") == "user":
@@ -275,20 +345,27 @@ class LLMClient:
                 if self._use_native_gemini:
                     return self._chat_native_gemini(messages, temperature, max_tokens)
 
-                # A schema-constrained call to a local (non-Gemini) provider
-                # goes through Ollama's native /api/chat, where `format`
-                # actually enforces the schema -- see _chat_ollama_native.
-                if json_schema is not None and not self._is_gemini:
+                # Every call to a local (non-Gemini) provider goes through
+                # Ollama's native /api/chat -- not just schema-constrained
+                # ones. Besides being where `format` actually enforces a
+                # schema (see _chat_ollama_native), it's the only endpoint
+                # that accepts `options.num_ctx`; the OpenAI-compat body has
+                # no field for it, so a plain (no-schema) compat call to
+                # Ollama silently runs at its 4096-token default regardless
+                # of what the model supports. json_schema is passed through
+                # as-is (None is fine -- see _chat_ollama_native).
+                if not self._is_gemini:
                     try:
                         return self._chat_ollama_native(messages, temperature, max_tokens, json_schema)
                     except Exception:
                         log.warning(
-                            "Ollama native /api/chat structured-output call failed "
-                            "(not Ollama, or an old version) -- falling back to "
-                            "unconstrained OpenAI-compat generation.",
+                            "Ollama native /api/chat call failed (not Ollama, or an "
+                            "old version) -- falling back to OpenAI-compat generation "
+                            "(num_ctx override and, if requested, schema enforcement "
+                            "are both lost on this fallback path).",
                             exc_info=True,
                         )
-                        return self._chat_compat(messages, temperature, max_tokens)
+                        return self._chat_compat(messages, temperature, max_tokens, json_schema=json_schema)
 
                 return self._chat_compat(messages, temperature, max_tokens, json_schema=json_schema)
 

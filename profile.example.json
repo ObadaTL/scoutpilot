@@ -50,7 +50,24 @@
     "preserved_companies": ["Company A", "Company B"],
     "preserved_projects": ["Project X", "Project Y"],
     "preserved_school": "Your University",
-    "real_metrics": ["50% improvement", "10x faster"]
+    "real_metrics": ["50% improvement", "10x faster"],
+    "canonical_entries": {
+      "_comment": "Optional. Ground truth for each real job/project's header+subtitle line (title, company, dates) -- the tailoring LLM only rewords bullets, it never touches these once matched, so it can't drift a date or split one entry into two. 'match' is a list of case-insensitive keywords used to find this entry among whatever the LLM returned for that section.",
+      "experience": [
+        {
+          "match": ["Company A"],
+          "header": "Your Title | Company A",
+          "subtitle": "Key tech | Start - End dates"
+        }
+      ],
+      "projects": [
+        {
+          "match": ["Project X"],
+          "header": "Project X - Short Description",
+          "subtitle": "Key tech | Start - End dates"
+        }
+      ]
+    }
   },
   "eeo_voluntary": {
     "gender": "Decline to self-identify",

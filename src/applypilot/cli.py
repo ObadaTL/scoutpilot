@@ -87,19 +87,30 @@ def run(
     workers: int = typer.Option(1, "--workers", "-w", help="Parallel threads for discovery/enrichment stages."),
     stream: bool = typer.Option(False, "--stream", help="Run stages concurrently (streaming mode)."),
     dry_run: bool = typer.Option(False, "--dry-run", help="Preview stages without executing."),
-    validation: str = typer.Option(
-        "normal",
+    validation: Optional[str] = typer.Option(
+        None,
         "--validation",
         help=(
             "Validation strictness for tailor/cover stages. "
             "strict: banned words = errors, judge must pass. "
-            "normal: banned words = warnings only (default, recommended for Gemini free tier). "
-            "lenient: banned words ignored, LLM judge skipped (fastest, fewest API calls)."
+            "normal: banned words = warnings only (recommended for a cloud provider). "
+            "lenient: banned words ignored, LLM judge skipped (fastest, fewest calls). "
+            "Default: auto-picks 'lenient' for a local LLM_URL provider (skips the "
+            "judge -- a same-size local model judging its own output is slow and not "
+            "much more trustworthy than the writer) or 'normal' for a cloud provider."
         ),
     ),
 ) -> None:
     """Run pipeline stages: discover, enrich, score, tailor, cover, pdf."""
     _bootstrap()
+
+    if validation is None:
+        from applypilot.llm import is_local_provider
+        validation = "lenient" if is_local_provider() else "normal"
+        console.print(
+            f"[dim]--validation not set -- auto-selected '{validation}' "
+            f"({'local model, skipping LLM judge' if validation == 'lenient' else 'cloud provider'})[/dim]"
+        )
 
     from applypilot.pipeline import run_pipeline
 

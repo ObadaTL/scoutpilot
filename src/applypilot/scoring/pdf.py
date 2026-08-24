@@ -280,6 +280,43 @@ _PAGE_DIMS_IN: dict[str, tuple[float, float]] = {
 
 _TARGET_MAX_PAGES = 2
 
+# _fit_resume_html only ever stepped DOWN from "spacious" to avoid overflow
+# past _TARGET_MAX_PAGES -- there was no matching step UP for content that
+# falls short of it. Confirmed live 2026-08-24 on a real tailored resume:
+# "spacious" rendered at ~52% of the 2-page budget (~1.05 pages), which
+# ships as a 2-page PDF with a couple of stray lines on an otherwise blank
+# second page -- exactly the "1 page long, other page mostly empty" look.
+# _TARGET_FILL_RATIO is how much of the budget a stretch pass aims to
+# reach (not literally 100% -- a touch of bottom margin reads as
+# intentional, a page filled to the pixel reads as suspiciously tight).
+# _STRETCH_MAX_SCALE caps how far spacing/line-height are allowed to grow
+# so a genuinely thin resume gets MORE breathing room, not obviously
+# padded whitespace that would fail an "industry standard" look.
+_TARGET_FILL_RATIO = 0.92
+_STRETCH_MAX_SCALE = 1.45
+
+
+def _stretch_density(base: dict, scale: float) -> dict:
+    """Proportionally loosen a density preset's line-height and vertical
+    spacing (not its margins -- those anchor the page layout the DOCX
+    baseline defines) so short content spreads to better fill the page.
+    Font size gets a much gentler bump than spacing does (0.35x the
+    spacing scale, capped at 12.5pt) -- oversized body text reads as
+    padding a lot faster than slightly looser line spacing does.
+    """
+    scale = min(scale, _STRETCH_MAX_SCALE)
+    font_scale = 1 + (scale - 1) * 0.35
+    return {
+        **base,
+        "name": f"{base['name']}-stretched",
+        "font": round(min(base["font"] * font_scale, 12.5), 2),
+        "line": round(base["line"] * scale, 3),
+        "section_mt": round(base["section_mt"] * scale, 2),
+        "entry_mb": round(base["entry_mb"] * scale, 2),
+        "li_mb": round(base["li_mb"] * scale, 2),
+        "li_line": round(base["li_line"] * scale, 3),
+    }
+
 
 def build_html(resume: dict, page_size: str = "Letter", density: dict | None = None) -> str:
     """Build professional resume/CV HTML from parsed data.
@@ -658,18 +695,27 @@ body {{
 
 
 def _fit_resume_html(resume: dict, page_size: str) -> str:
-    """Render `resume` at the loosest density that still fits within
-    `_TARGET_MAX_PAGES` pages (2, matching the candidate's real baseline CV).
+    """Render `resume` at the density that best fills `_TARGET_MAX_PAGES`
+    pages (2, matching the candidate's real baseline CV) without overflowing
+    it -- too much content shrinks down through the density presets, too
+    little stretches the baseline ("spacious") preset looser instead of
+    shipping as-is with a mostly-blank trailing page.
 
-    Chromium's print layout has no built-in "shrink to fit N pages" for
-    @page-based pagination, so this does it manually: render each density
-    preset ("spacious" first) at the page's actual content width in a single
-    headless-Chromium session, measure the resulting content height, and
-    stop at the first preset whose content fits within `_TARGET_MAX_PAGES`
-    pages' worth of content height. Falls back to the most compact preset if
-    even that overflows -- a genuinely long resume will legitimately need
-    more room, but this keeps it as close to 2 pages as the presets allow
-    rather than sprawling further unchecked.
+    Chromium's print layout has no built-in "shrink/grow to fit N pages" for
+    @page-based pagination, so this does it manually in a single headless
+    Chromium session: render the baseline density at the page's actual
+    content width, measure the resulting content height, and:
+      - if it overflows the page budget, step down through the tighter
+        presets and stop at the first that fits (falls back to the most
+        compact preset if even that overflows -- a genuinely long resume
+        legitimately needs more room, but this keeps it as close to
+        `_TARGET_MAX_PAGES` as the presets allow rather than sprawling
+        further unchecked);
+      - if it falls short of `_TARGET_FILL_RATIO` of the budget, stretch
+        spacing/line-height by the ratio needed to reach that fill level
+        (capped at `_STRETCH_MAX_SCALE`) and use that instead, so short
+        content reads as a normally-spaced, well-filled CV rather than a
+        cramped one-and-a-bit pages with an empty tail.
     """
     from playwright.sync_api import sync_playwright
 
@@ -678,15 +724,32 @@ def _fit_resume_html(resume: dict, page_size: str) -> str:
     with sync_playwright() as p:
         browser = p.chromium.launch()
         try:
-            for i, density in enumerate(_DENSITY_PRESETS):
+            def _measure(density: dict) -> tuple[str, int, int]:
                 html = build_html(resume, page_size=page_size, density=density)
                 content_w_px = round((page_w_in - 2 * density["margin_h"]) * 96)
-                content_h_px = round((page_h_in - 2 * density["margin_v"]) * 96) * _TARGET_MAX_PAGES
+                budget_px = round((page_h_in - 2 * density["margin_v"]) * 96) * _TARGET_MAX_PAGES
                 page = browser.new_page(viewport={"width": content_w_px, "height": 100})
                 page.set_content(html, wait_until="networkidle")
                 height = page.evaluate("document.body.scrollHeight")
                 page.close()
-                if height <= content_h_px or i == len(_DENSITY_PRESETS) - 1:
+                return html, height, budget_px
+
+            baseline = _DENSITY_PRESETS[0]
+            html, height, budget_px = _measure(baseline)
+
+            if height <= budget_px:
+                if height < budget_px * _TARGET_FILL_RATIO:
+                    scale = (budget_px * _TARGET_FILL_RATIO) / height
+                    stretched_html, stretched_height, _ = _measure(_stretch_density(baseline, scale))
+                    if stretched_height <= budget_px:
+                        return stretched_html
+                    # Overshot the single-pass estimate -- the un-stretched
+                    # baseline is still a safe, correctly-fitting result.
+                return html
+
+            for density in _DENSITY_PRESETS[1:]:
+                html, height, budget_px = _measure(density)
+                if height <= budget_px or density is _DENSITY_PRESETS[-1]:
                     return html
         finally:
             browser.close()

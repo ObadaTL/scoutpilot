@@ -23,7 +23,7 @@ from pathlib import Path
 from applypilot.config import COVER_LETTER_DIR, DEFAULTS, RESUME_PATH, get_locale_style, load_profile
 from applypilot.database import get_connection
 from applypilot.facts import FactBank, NumericGuard, NumericGuardViolation
-from applypilot.llm import get_client
+from applypilot.llm import get_client, is_local_provider
 from applypilot.scoring.validator import (
     ToolLeakGuard,
     ToolLeakViolation,
@@ -202,6 +202,54 @@ def _strip_after_signoff(text: str, sign_off_name: str) -> str:
     return "\n".join(lines[:last_idx + 1]).rstrip()
 
 
+_ANY_DIGIT_RE = re.compile(r"\d")
+_SENTENCE_SPLIT_RE = re.compile(r"(?<=[.!?])\s+")
+
+
+def _recover_numeric_sentences(text: str, fact_bank: FactBank) -> str:
+    """Proactively swap any sentence carrying a digit for the matching
+    verified fact's own verbatim text, before validation ever runs.
+
+    Mirrors tailor.py's per-bullet fact recovery (FactBank.match_similar) --
+    same rationale, applied per-sentence here since a cover letter is prose,
+    not a bullet list a violation can be dropped from cleanly. Without this,
+    a sentence that happens to restate an already-verified fact in the
+    model's own words (e.g. "...which I helped grow to 9 concurrent
+    participants...") fails NumericGuard exactly like a fabricated one
+    would, and the retry loop either burns an attempt or, once exhausted,
+    deletes the whole sentence (strip_numbered_sentences) -- discarding
+    true, verified content instead of shipping it under its safe wording.
+    A sentence with no fact match is left untouched; NumericGuard still
+    catches it downstream exactly as before.
+
+    Splits on blank lines first and rejoins each paragraph independently --
+    joining every sentence in the whole letter with a single space (as a
+    naive split/rejoin would) collapses the required 3-short-paragraph
+    structure into one wall of text the moment any paragraph needs a
+    substitution.
+    """
+    if not _ANY_DIGIT_RE.search(text):
+        return text
+
+    def _fix_paragraph(para: str) -> str:
+        if not _ANY_DIGIT_RE.search(para):
+            return para
+        fixed = []
+        for sentence in _SENTENCE_SPLIT_RE.split(para):
+            if _ANY_DIGIT_RE.search(sentence):
+                recovered = fact_bank.match_similar(sentence)
+                if recovered is not None:
+                    fact_text = recovered[1]
+                    if not fact_text.endswith((".", "!", "?")):
+                        fact_text += "."
+                    fixed.append(fact_text)
+                    continue
+            fixed.append(sentence)
+        return " ".join(fixed)
+
+    return "\n\n".join(_fix_paragraph(p) for p in text.split("\n\n"))
+
+
 def _check_company_mentioned(letter: str, job: dict) -> str | None:
     """A cover letter that never names the company it's addressed to reads
     as generic/templated. Reuses the same job['site']-is-the-company-name
@@ -307,6 +355,7 @@ def generate_cover_letter(
         letter = sanitize_text(letter)  # auto-fix em dashes, smart quotes
         letter = _strip_preamble(letter)  # remove any "Here is the letter:" prefix
         letter = _strip_after_signoff(letter, sign_off_name)  # drop any trailing notes
+        letter = _recover_numeric_sentences(letter, fact_bank)  # swap in verified fact text before validating
 
         validation = _full_validate(letter)
 
@@ -395,18 +444,30 @@ def _preflight_pdf_converter() -> None:
 # ── Batch Entry Point ────────────────────────────────────────────────────
 
 def run_cover_letters(min_score: int = 7, limit: int = 20,
-                      validation_mode: str = "normal") -> dict:
+                      validation_mode: str | None = None,
+                      max_retries: int | None = None) -> dict:
     """Generate cover letters for high-scoring jobs that have tailored resumes.
 
     Args:
         min_score:       Minimum fit_score threshold.
         limit:           Maximum jobs to process.
-        validation_mode: "strict", "normal", or "lenient".
+        validation_mode: "strict", "normal", or "lenient". If not given,
+                         auto-picks "lenient" for a local provider or
+                         "normal" for cloud -- same as run_tailoring.
+        max_retries:     Per-job retry budget passed to generate_cover_letter().
+                         If not given, auto-picks 1 for a local provider vs.
+                         3 for cloud -- same reasoning as run_tailoring: a
+                         small local model rarely improves materially on a
+                         3rd/4th "avoid these issues" retry.
 
     Returns:
         {"generated": int, "failed_validation": int, "pdf_failed": int,
          "errors": int, "fallback_to_base": int, "elapsed": float}
     """
+    if max_retries is None:
+        max_retries = 1 if is_local_provider() else 3
+    if validation_mode is None:
+        validation_mode = "lenient" if is_local_provider() else "normal"
     profile = load_profile()
     base_resume_text = RESUME_PATH.read_text(encoding="utf-8")
     # Loaded once per batch, not per job -- also means a bad facts.yaml
@@ -481,6 +542,7 @@ def run_cover_letters(min_score: int = 7, limit: int = 20,
             letter, validation = generate_cover_letter(
                 resume_text, job, profile,
                 validation_mode=validation_mode, fact_bank=fact_bank,
+                max_retries=max_retries,
             )
 
             # Build safe, collision-resistant filename prefix
