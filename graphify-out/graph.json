@@ -3438,7 +3438,7 @@
       "file_type": "code",
       "norm_label": "open_dashboard()",
       "source_file": "src/applypilot/view.py",
-      "source_location": "L694"
+      "source_location": "L730"
     },
     {
       "id": "src_applypilot_view_serve_dashboard",
@@ -3450,7 +3450,7 @@
       "file_type": "code",
       "norm_label": "serve_dashboard()",
       "source_file": "src/applypilot/view.py",
-      "source_location": "L709"
+      "source_location": "L745"
     },
     {
       "id": "src_applypilot_config_get_locale_style",
@@ -3858,7 +3858,7 @@
       "file_type": "code",
       "norm_label": "_build_captcha_section()",
       "source_file": "src/applypilot/apply/prompt.py",
-      "source_location": "L238"
+      "source_location": "L244"
     },
     {
       "id": "src_applypilot_apply_prompt_build_hard_rules",
@@ -3870,7 +3870,7 @@
       "file_type": "code",
       "norm_label": "_build_hard_rules()",
       "source_file": "src/applypilot/apply/prompt.py",
-      "source_location": "L209"
+      "source_location": "L215"
     },
     {
       "id": "src_applypilot_apply_prompt_build_location_check",
@@ -3906,7 +3906,7 @@
       "file_type": "code",
       "norm_label": "build_prompt()",
       "source_file": "src/applypilot/apply/prompt.py",
-      "source_location": "L441"
+      "source_location": "L447"
     },
     {
       "id": "src_applypilot_apply_prompt_build_salary_section",
@@ -7834,7 +7834,7 @@
       "source_location": "L41"
     },
     {
-      "id": "src_applypilot_view_rationale_695",
+      "id": "src_applypilot_view_rationale_731",
       "label": "Generate a static dashboard snapshot and open it in the default browser -- a\u2026",
       "_origin": "ast",
       "community": 44,
@@ -7842,10 +7842,10 @@
       "file_type": "rationale",
       "norm_label": "generate a static dashboard snapshot and open it in the default browser -- a...",
       "source_file": "src/applypilot/view.py",
-      "source_location": "L695"
+      "source_location": "L731"
     },
     {
-      "id": "src_applypilot_view_rationale_710",
+      "id": "src_applypilot_view_rationale_746",
       "label": "Serve the dashboard over a local HTTP server, regenerating fresh from the DB on\u2026",
       "_origin": "ast",
       "community": 44,
@@ -7853,7 +7853,7 @@
       "file_type": "rationale",
       "norm_label": "serve the dashboard over a local http server, regenerating fresh from the db on...",
       "source_file": "src/applypilot/view.py",
-      "source_location": "L710"
+      "source_location": "L746"
     },
     {
       "id": "src_applypilot_llm",
@@ -8417,7 +8417,7 @@
       "source_location": "L21"
     },
     {
-      "id": "src_applypilot_apply_prompt_rationale_210",
+      "id": "src_applypilot_apply_prompt_rationale_216",
       "label": "Build the hard rules section with work auth and name from profile.",
       "_origin": "ast",
       "community": 7,
@@ -8425,10 +8425,10 @@
       "file_type": "rationale",
       "norm_label": "build the hard rules section with work auth and name from profile.",
       "source_file": "src/applypilot/apply/prompt.py",
-      "source_location": "L210"
+      "source_location": "L216"
     },
     {
-      "id": "src_applypilot_apply_prompt_rationale_239",
+      "id": "src_applypilot_apply_prompt_rationale_245",
       "label": "Build the CAPTCHA detection and solving instructions. Reads the CapSolver API\u2026",
       "_origin": "ast",
       "community": 7,
@@ -8436,10 +8436,10 @@
       "file_type": "rationale",
       "norm_label": "build the captcha detection and solving instructions. reads the capsolver api...",
       "source_file": "src/applypilot/apply/prompt.py",
-      "source_location": "L239"
+      "source_location": "L245"
     },
     {
-      "id": "src_applypilot_apply_prompt_rationale_444",
+      "id": "src_applypilot_apply_prompt_rationale_450",
       "label": "Build the full instruction prompt for the apply agent. Loads the user profile\u2026",
       "_origin": "ast",
       "community": 7,
@@ -8447,7 +8447,7 @@
       "file_type": "rationale",
       "norm_label": "build the full instruction prompt for the apply agent. loads the user profile...",
       "source_file": "src/applypilot/apply/prompt.py",
-      "source_location": "L444"
+      "source_location": "L450"
     },
     {
       "id": "src_applypilot_apply_prompt_rationale_98",
@@ -9567,7 +9567,7 @@
       "confidence_score": 1.0,
       "context": "call",
       "source_file": "src/applypilot/apply/prompt.py",
-      "source_location": "L244",
+      "source_location": "L250",
       "weight": 1.0
     },
     {
@@ -9591,7 +9591,7 @@
       "confidence_score": 1.0,
       "context": "call",
       "source_file": "src/applypilot/apply/prompt.py",
-      "source_location": "L459",
+      "source_location": "L465",
       "weight": 1.0
     },
     {
@@ -9603,7 +9603,7 @@
       "confidence_score": 1.0,
       "context": "call",
       "source_file": "src/applypilot/apply/prompt.py",
-      "source_location": "L460",
+      "source_location": "L466",
       "weight": 1.0
     },
     {
@@ -9615,7 +9615,7 @@
       "confidence_score": 1.0,
       "context": "call",
       "source_file": "src/applypilot/apply/prompt.py",
-      "source_location": "L475",
+      "source_location": "L481",
       "weight": 1.0
     },
     {
@@ -9627,7 +9627,7 @@
       "confidence_score": 1.0,
       "context": "call",
       "source_file": "src/applypilot/apply/prompt.py",
-      "source_location": "L502",
+      "source_location": "L508",
       "weight": 1.0
     },
     {
@@ -9639,7 +9639,7 @@
       "confidence_score": 1.0,
       "context": "call",
       "source_file": "src/applypilot/apply/prompt.py",
-      "source_location": "L503",
+      "source_location": "L509",
       "weight": 1.0
     },
     {
@@ -9651,7 +9651,7 @@
       "confidence_score": 1.0,
       "context": "call",
       "source_file": "src/applypilot/apply/prompt.py",
-      "source_location": "L504",
+      "source_location": "L510",
       "weight": 1.0
     },
     {
@@ -9663,7 +9663,7 @@
       "confidence_score": 1.0,
       "context": "call",
       "source_file": "src/applypilot/apply/prompt.py",
-      "source_location": "L505",
+      "source_location": "L511",
       "weight": 1.0
     },
     {
@@ -9675,7 +9675,7 @@
       "confidence_score": 1.0,
       "context": "call",
       "source_file": "src/applypilot/apply/prompt.py",
-      "source_location": "L506",
+      "source_location": "L512",
       "weight": 1.0
     },
     {
@@ -9687,7 +9687,7 @@
       "confidence_score": 1.0,
       "context": "call",
       "source_file": "src/applypilot/apply/prompt.py",
-      "source_location": "L507",
+      "source_location": "L513",
       "weight": 1.0
     },
     {
@@ -9699,7 +9699,7 @@
       "confidence_score": 1.0,
       "context": "call",
       "source_file": "src/applypilot/apply/prompt.py",
-      "source_location": "L525",
+      "source_location": "L531",
       "weight": 1.0
     },
     {
@@ -12975,7 +12975,7 @@
       "confidence_score": 1.0,
       "context": "call",
       "source_file": "src/applypilot/view.py",
-      "source_location": "L704",
+      "source_location": "L740",
       "weight": 1.0
     },
     {
@@ -14487,7 +14487,7 @@
       "confidence_score": 1.0,
       "context": "import",
       "source_file": "src/applypilot/apply/prompt.py",
-      "source_location": "L524",
+      "source_location": "L530",
       "weight": 1.0
     },
     {
@@ -17537,7 +17537,7 @@
       "confidence": "EXTRACTED",
       "confidence_score": 1.0,
       "source_file": "src/applypilot/apply/prompt.py",
-      "source_location": "L209",
+      "source_location": "L215",
       "weight": 1.0
     },
     {
@@ -17548,7 +17548,7 @@
       "confidence": "EXTRACTED",
       "confidence_score": 1.0,
       "source_file": "src/applypilot/apply/prompt.py",
-      "source_location": "L238",
+      "source_location": "L244",
       "weight": 1.0
     },
     {
@@ -17559,7 +17559,7 @@
       "confidence": "EXTRACTED",
       "confidence_score": 1.0,
       "source_file": "src/applypilot/apply/prompt.py",
-      "source_location": "L441",
+      "source_location": "L447",
       "weight": 1.0
     },
     {
@@ -19616,7 +19616,7 @@
       "confidence": "EXTRACTED",
       "confidence_score": 1.0,
       "source_file": "src/applypilot/view.py",
-      "source_location": "L694",
+      "source_location": "L730",
       "weight": 1.0
     },
     {
@@ -19627,7 +19627,7 @@
       "confidence": "EXTRACTED",
       "confidence_score": 1.0,
       "source_file": "src/applypilot/view.py",
-      "source_location": "L709",
+      "source_location": "L745",
       "weight": 1.0
     },
     {
@@ -21358,36 +21358,36 @@
       "weight": 1.0
     },
     {
-      "source": "src_applypilot_apply_prompt_rationale_210",
+      "source": "src_applypilot_apply_prompt_rationale_216",
       "target": "src_applypilot_apply_prompt_build_hard_rules",
       "relation": "rationale_for",
       "_origin": "ast",
       "confidence": "EXTRACTED",
       "confidence_score": 1.0,
       "source_file": "src/applypilot/apply/prompt.py",
-      "source_location": "L210",
+      "source_location": "L216",
       "weight": 1.0
     },
     {
-      "source": "src_applypilot_apply_prompt_rationale_239",
+      "source": "src_applypilot_apply_prompt_rationale_245",
       "target": "src_applypilot_apply_prompt_build_captcha_section",
       "relation": "rationale_for",
       "_origin": "ast",
       "confidence": "EXTRACTED",
       "confidence_score": 1.0,
       "source_file": "src/applypilot/apply/prompt.py",
-      "source_location": "L239",
+      "source_location": "L245",
       "weight": 1.0
     },
     {
-      "source": "src_applypilot_apply_prompt_rationale_444",
+      "source": "src_applypilot_apply_prompt_rationale_450",
       "target": "src_applypilot_apply_prompt_build_prompt",
       "relation": "rationale_for",
       "_origin": "ast",
       "confidence": "EXTRACTED",
       "confidence_score": 1.0,
       "source_file": "src/applypilot/apply/prompt.py",
-      "source_location": "L444",
+      "source_location": "L450",
       "weight": 1.0
     },
     {
@@ -23800,25 +23800,25 @@
       "weight": 1.0
     },
     {
-      "source": "src_applypilot_view_rationale_695",
+      "source": "src_applypilot_view_rationale_731",
       "target": "src_applypilot_view_open_dashboard",
       "relation": "rationale_for",
       "_origin": "ast",
       "confidence": "EXTRACTED",
       "confidence_score": 1.0,
       "source_file": "src/applypilot/view.py",
-      "source_location": "L695",
+      "source_location": "L731",
       "weight": 1.0
     },
     {
-      "source": "src_applypilot_view_rationale_710",
+      "source": "src_applypilot_view_rationale_746",
       "target": "src_applypilot_view_serve_dashboard",
       "relation": "rationale_for",
       "_origin": "ast",
       "confidence": "EXTRACTED",
       "confidence_score": 1.0,
       "source_file": "src/applypilot/view.py",
-      "source_location": "L710",
+      "source_location": "L746",
       "weight": 1.0
     },
     {
@@ -24739,5 +24739,5 @@
     }
   ],
   "hyperedges": [],
-  "built_at_commit": "b27a75072f5cedadc1b552541ee57c05773a9d53"
+  "built_at_commit": "ce9717539e73fd9e428194aa72fd13f49f0355af"
 }

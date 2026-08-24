@@ -48,9 +48,9 @@
     "semantic_hash": ""
   },
   "src/applypilot/apply/prompt.py": {
-    "mtime": 1787507799.6389372,
-    "seen": 1787520993.213898,
-    "ast_hash": "0636d5aaea7cc8c8dc816f134c69110c",
+    "mtime": 1787531479.9542396,
+    "seen": 1787531510.6046622,
+    "ast_hash": "801deda4431fec19ce7a372535a87fa5",
     "semantic_hash": ""
   },
   "src/applypilot/cli.py": {
@@ -156,9 +156,9 @@
     "semantic_hash": ""
   },
   "src/applypilot/view.py": {
-    "mtime": 1787503449.1458306,
-    "seen": 1787520993.213898,
-    "ast_hash": "b5f9eeeb1cf9c424e938e58e69f40c21",
+    "mtime": 1787531292.220605,
+    "seen": 1787531510.6046622,
+    "ast_hash": "6737574e5178726c4ad0000a8b00e9b7",
     "semantic_hash": ""
   },
   "src/applypilot/wizard/__init__.py": {
