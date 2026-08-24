@@ -416,6 +416,21 @@ _ACRONYM_STOPWORDS: frozenset[str] = frozenset({
     "cv", "phd", "bsc", "msc", "mba", "gpa",
     "ai", "ml", "api", "sdk", "sla", "kpi", "roi", "b2b", "b2c", "saas",
     "ci", "cd",
+    # Common short English words -- job descriptions frequently ALL-CAPS a
+    # heading ("WHO WE ARE", "WHY JOIN US") and the acronym-shape heuristic
+    # (isupper() + 2-6 chars) can't distinguish that from a real acronym.
+    # Confirmed live: a JD's stylized headings made "to"/"we"/"are"/"who"/
+    # "and"/"why" register as job-description "tools", so the word "to" in
+    # an otherwise-clean cover letter tripped ToolLeakGuard.
+    "a", "an", "the", "to", "of", "in", "on", "at", "by", "for", "and",
+    "or", "but", "not", "are", "is", "was", "were", "be", "been", "we",
+    "who", "why", "how", "what", "when", "where", "this", "that", "our",
+    "your", "their", "its", "it", "as", "if", "so", "no", "yes", "do",
+    "does", "did", "has", "have", "had", "can", "will", "would", "should",
+    "could", "may", "might", "must", "shall", "from", "with", "about",
+    "into", "than", "then", "also", "all", "any", "each", "some", "more",
+    "most", "much", "many", "few", "such", "only", "just", "very", "own",
+    "same", "other", "you", "he", "she", "they", "them",
 })
 
 # Well-known plain Title-Case tool/product names -- invisible to the shape
