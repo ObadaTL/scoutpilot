@@ -65,6 +65,9 @@ def generate_dashboard(output_path: str | None = None, serve_base_url: str | Non
     tailored = conn.execute("SELECT COUNT(*) FROM jobs WHERE tailored_resume_path IS NOT NULL").fetchone()[0]
     with_cl = conn.execute("SELECT COUNT(*) FROM jobs WHERE cover_letter_path IS NOT NULL").fetchone()[0]
     applied = conn.execute("SELECT COUNT(*) FROM jobs WHERE applied_at IS NOT NULL OR apply_status = 'applied'").fetchone()[0]
+    unavailable = conn.execute(
+        "SELECT COUNT(*) FROM jobs WHERE apply_status IN ('listing_closed', 'manual')"
+    ).fetchone()[0]
     ready_to_apply = conn.execute(
         "SELECT COUNT(*) FROM jobs WHERE tailored_resume_path IS NOT NULL AND applied_at IS NULL AND application_url IS NOT NULL"
     ).fetchone()[0]
@@ -193,6 +196,13 @@ def generate_dashboard(output_path: str | None = None, serve_base_url: str | Non
         elif apply_status == "in_progress":
             status_pill = '<span class="status-pill status-progress">⏳ IN PROGRESS</span>'
             data_status = "in_progress"
+        elif apply_status == "listing_closed":
+            status_pill = '<span class="status-pill status-closed">🚫 LISTING CLOSED</span>'
+            data_status = "closed"
+        elif apply_status == "manual":
+            err_msg = escape((j["apply_error"] or "Needs manual application")[:60])
+            status_pill = f'<span class="status-pill status-manual" title="{err_msg}">✋ MANUAL ONLY</span>'
+            data_status = "manual"
         elif apply_status in ("failed", "needs_review"):
             err_msg = escape((j["apply_error"] or "Review needed")[:60])
             status_pill = f'<span class="status-pill status-failed" title="{err_msg}">⚠ {apply_status.upper()}</span>'
@@ -361,6 +371,7 @@ def generate_dashboard(output_path: str | None = None, serve_base_url: str | Non
   .stat-tailored .stat-num {{ color: #a78bfa; }}
   .stat-cl .stat-num {{ color: #f472b6; }}
   .stat-applied .stat-num {{ color: #10b981; }}
+  .stat-unavailable .stat-num {{ color: #64748b; }}
 
   /* Filter Controls */
   .filter-panel {{ background: #151d30; border: 1px solid #243049; border-radius: 12px; padding: 1.25rem; margin-bottom: 2rem; display: flex; flex-direction: column; gap: 1rem; }}
@@ -373,6 +384,9 @@ def generate_dashboard(output_path: str | None = None, serve_base_url: str | Non
 
   .search-input {{ background: #1e293b; border: 1px solid #334155; color: #f8fafc; padding: 0.45rem 1rem; border-radius: 6px; font-size: 0.85rem; flex: 1; min-width: 250px; outline: none; }}
   .search-input:focus {{ border-color: #3b82f6; }}
+
+  .hide-toggle {{ display: flex; align-items: center; gap: 0.5rem; color: #cbd5e1; font-size: 0.85rem; font-weight: 600; cursor: pointer; user-select: none; }}
+  .hide-toggle input {{ width: 1rem; height: 1rem; cursor: pointer; accent-color: #3b82f6; }}
 
   /* Score & Site Visualizations */
   .analytics-grid {{ display: grid; grid-template-columns: 1fr 1fr; gap: 1.5rem; margin-bottom: 2.5rem; }}
@@ -423,6 +437,8 @@ def generate_dashboard(output_path: str | None = None, serve_base_url: str | Non
   .status-ready {{ background: #1e3a8a; color: #93c5fd; border: 1px solid #3b82f6; }}
   .status-tailored {{ background: #4c1d95; color: #c4b5fd; border: 1px solid #7c3aed; }}
   .status-none {{ background: #1e293b; color: #64748b; border: 1px solid #334155; }}
+  .status-closed {{ background: #1e293b; color: #64748b; border: 1px solid #475569; }}
+  .status-manual {{ background: #451a03; color: #fdba74; border: 1px solid #c2410c; }}
 
   .meta-row {{ display: flex; flex-wrap: wrap; gap: 0.4rem; margin-bottom: 0.85rem; }}
   .meta-tag {{ font-size: 0.74rem; padding: 0.2rem 0.55rem; border-radius: 6px; background: #1e293b; color: #94a3b8; font-weight: 500; }}
@@ -528,6 +544,7 @@ def generate_dashboard(output_path: str | None = None, serve_base_url: str | Non
   <div class="stat-card stat-tailored"><div class="stat-num">{tailored}</div><div class="stat-label">Tailored CVs Ready</div></div>
   <div class="stat-card stat-cl"><div class="stat-num">{with_cl}</div><div class="stat-label">Cover Letters Ready</div></div>
   <div class="stat-card stat-applied"><div class="stat-num">{applied}</div><div class="stat-label">Submitted Applications</div></div>
+  <div class="stat-card stat-unavailable"><div class="stat-num">{unavailable}</div><div class="stat-label">Unavailable (closed/manual)</div></div>
 </div>
 
 <div class="filter-panel">
@@ -549,11 +566,19 @@ def generate_dashboard(output_path: str | None = None, serve_base_url: str | Non
     <button class="filter-btn" onclick="filterStatus('tailored', this)">Has Tailored CV</button>
     <button class="filter-btn" onclick="filterStatus('cl', this)">Has Cover Letter</button>
     <button class="filter-btn" onclick="filterStatus('failed', this)">Needs Review / Failed</button>
+    <button class="filter-btn" onclick="filterStatus('unavailable', this)">Unavailable (Closed/Manual)</button>
   </div>
 
   <div class="filter-row">
     <span class="filter-label">Search:</span>
     <input type="text" class="search-input" placeholder="Search by title, company, skills, location..." oninput="filterText(this.value)">
+  </div>
+
+  <div class="filter-row">
+    <label class="hide-toggle">
+      <input type="checkbox" id="hide-toggle-input" onchange="toggleHideAppliedUnavailable(this.checked)">
+      Hide Applied &amp; Unavailable jobs
+    </label>
   </div>
 </div>
 
@@ -604,6 +629,12 @@ document.addEventListener('keydown', (e) => {{
 let activeScoreFilter = 'all';
 let activeStatusFilter = 'all';
 let searchText = '';
+let hideAppliedUnavailable = false;
+
+function toggleHideAppliedUnavailable(checked) {{
+  hideAppliedUnavailable = checked;
+  applyFilters();
+}}
 
 function filterScore(val, btn) {{
   activeScoreFilter = val;
@@ -651,11 +682,16 @@ function applyFilters() {{
     else if (activeStatusFilter === 'tailored') statusMatch = hasCV;
     else if (activeStatusFilter === 'cl') statusMatch = hasCL;
     else if (activeStatusFilter === 'failed') statusMatch = status === 'failed';
+    else if (activeStatusFilter === 'unavailable') statusMatch = status === 'closed' || status === 'manual';
+
+    // Hide Applied & Unavailable toggle (combines with the filters above)
+    const hideMatch = !hideAppliedUnavailable
+      || (status !== 'applied' && status !== 'closed' && status !== 'manual');
 
     // Search Text Match
     const textMatch = !searchText || text.includes(searchText);
 
-    if (scoreMatch && statusMatch && textMatch) {{
+    if (scoreMatch && statusMatch && hideMatch && textMatch) {{
       card.classList.remove('hidden');
       shown++;
     }} else {{

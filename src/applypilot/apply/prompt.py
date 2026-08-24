@@ -187,6 +187,7 @@ def _build_screening_section(profile: dict) -> str:
     """Build the screening questions guidance section."""
     personal = profile["personal"]
     exp = profile.get("experience", {})
+    eeo = profile.get("eeo_voluntary", {})
     city = personal.get("city", "their city")
     years = exp.get("years_of_experience_total", "multiple")
     target_role = exp.get("target_role", personal.get("current_job_title", "software engineer"))
@@ -203,7 +204,12 @@ Skills and tools -> be confident. This candidate is a {target_role} with {years}
 
 Open-ended questions ("Why do you want this role?", "Tell us about yourself", "What interests you?") -> Write 2-3 sentences. Be specific to THIS job. Reference something from the job description. Connect it to a real achievement from the resume. No generic fluff. No "I am passionate about..." -- sound like a real person.
 
-EEO/demographics -> "Decline to self-identify" or "Prefer not to say" for everything."""
+EEO/demographics -> answer from the profile, exactly as given, for whichever of these fields the form asks:
+  - Gender: {eeo.get('gender', 'Decline to self-identify')}
+  - Race/ethnicity: {eeo.get('race_ethnicity', 'Decline to self-identify')}
+  - Veteran status: {eeo.get('veteran_status', 'Decline to self-identify')}
+  - Disability status: {eeo.get('disability_status', 'Decline to self-identify')}
+If the form's dropdown doesn't have that exact wording, pick the closest matching option -- don't default to "decline" just because the wording differs."""
 
 
 def _build_hard_rules(profile: dict) -> str:
