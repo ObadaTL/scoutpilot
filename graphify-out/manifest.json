@@ -1,9 +1,9 @@
 {
   "profile.example.json": {
-    "mtime": 1772997154.0,
-    "seen": 1787442844.3562307,
-    "ast_hash": "b59e9b504d8d134d3cff806a4d2952c8",
-    "semantic_hash": "b59e9b504d8d134d3cff806a4d2952c8"
+    "mtime": 1787584118.0204306,
+    "seen": 1787595876.9822443,
+    "ast_hash": "219ce33c44a8f173c5b69c294abf176c",
+    "semantic_hash": ""
   },
   "pyproject.toml": {
     "mtime": 1772997154.0,
@@ -54,9 +54,9 @@
     "semantic_hash": ""
   },
   "src/applypilot/cli.py": {
-    "mtime": 1787502724.6534748,
-    "seen": 1787520993.213898,
-    "ast_hash": "fea4e8fdf187dbe810f767a79bdbd998",
+    "mtime": 1787583501.087895,
+    "seen": 1787595876.9822443,
+    "ast_hash": "8d89319804d9d83780ba96ba8b04f64b",
     "semantic_hash": ""
   },
   "src/applypilot/config.py": {
@@ -108,9 +108,9 @@
     "semantic_hash": ""
   },
   "src/applypilot/llm.py": {
-    "mtime": 1787501304.5763063,
-    "seen": 1787520993.213898,
-    "ast_hash": "26308aa5ede406f3ffa072354f723a08",
+    "mtime": 1787585222.3537772,
+    "seen": 1787595876.9822443,
+    "ast_hash": "6b9215167dba7bb1aa0e59f0afd601e8",
     "semantic_hash": ""
   },
   "src/applypilot/pipeline.py": {
@@ -126,15 +126,15 @@
     "semantic_hash": "8cdb13b4db9d2f656e2b236118259650"
   },
   "src/applypilot/scoring/cover_letter.py": {
-    "mtime": 1787507255.834646,
-    "seen": 1787520993.213898,
-    "ast_hash": "68723f74f5fbf00897ceebb774d556cd",
+    "mtime": 1787594875.1855955,
+    "seen": 1787595876.9822443,
+    "ast_hash": "e8f7cf02a35af1b47c5c75bacabf2a3f",
     "semantic_hash": ""
   },
   "src/applypilot/scoring/pdf.py": {
-    "mtime": 1787507609.9770994,
-    "seen": 1787520993.213898,
-    "ast_hash": "db1757406b8eb39e621a9fe064eeb3e9",
+    "mtime": 1787593743.4669917,
+    "seen": 1787595876.9822443,
+    "ast_hash": "24244440bebd3b3ef894cb91ad338b26",
     "semantic_hash": ""
   },
   "src/applypilot/scoring/scorer.py": {
@@ -144,15 +144,15 @@
     "semantic_hash": ""
   },
   "src/applypilot/scoring/tailor.py": {
-    "mtime": 1787511028.3394043,
-    "seen": 1787520993.213898,
-    "ast_hash": "bc3e0a05e99673f803f91c9aff970c00",
+    "mtime": 1787594158.7100456,
+    "seen": 1787595876.9822443,
+    "ast_hash": "7bf40fbf0299af9037d4456ae78b2602",
     "semantic_hash": ""
   },
   "src/applypilot/scoring/validator.py": {
-    "mtime": 1787505961.6739986,
-    "seen": 1787520993.213898,
-    "ast_hash": "f4571d4d4394de3ebdc2d4a8a64286f7",
+    "mtime": 1787535383.3172057,
+    "seen": 1787595876.9822443,
+    "ast_hash": "7ad90b4c3ea751c26716edff0692d0ed",
     "semantic_hash": ""
   },
   "src/applypilot/view.py": {
@@ -174,9 +174,9 @@
     "semantic_hash": "b724977a5284b2b35dbc637fec4e9dc9"
   },
   "src/applypilot/facts.py": {
-    "mtime": 1787455790.803416,
-    "seen": 1787455871.4017582,
-    "ast_hash": "c557e193cf18854b4f08cc475156a36c",
+    "mtime": 1787593906.7601204,
+    "seen": 1787595876.9822443,
+    "ast_hash": "5d044fbed9b029749570108bf1a9ad1b",
     "semantic_hash": ""
   },
   "src/applypilot/terminal_view.py": {
