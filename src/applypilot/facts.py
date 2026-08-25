@@ -53,6 +53,63 @@ def _significant_words(text: str) -> set[str]:
     return {w for w in _WORD_RE.findall(text.lower()) if w not in _BULLET_MATCH_STOPWORDS and len(w) > 1}
 
 
+# A rewording shorter than this isn't a bullet, it's a fragment -- almost
+# always the model echoing the fact id or emitting a stub. Fall back to the
+# pre-written variant rather than shipping it.
+_MIN_REWORD_WORDS = 5
+
+
+def _accept_reworded(text: str, fact: "Fact") -> bool:
+    """Whether the model's own wording of `fact` may be used in place of the
+    fact's pre-written variant.
+
+    Verbatim substitution (the original design) made fabricated numbers
+    impossible, but at the cost of the model's authorship: with 11 verified
+    facts and 2 variants each, every tailored CV became a permutation of the
+    same 22 sentences, and 450 bullets across 58 generated CVs collapsed to
+    87 distinct strings. The claim was safe and the document was generic.
+
+    The number is the part that has to be verified; the sentence around it
+    does not. So the model writes the sentence and this checks the digits:
+    the rewording is accepted only if every number in it is one this fact's
+    own evidence covers. A rewording that reaches for any other number is
+    rejected outright and the pre-written variant substituted -- the caller
+    never sees a bullet carrying a number the FactBank can't account for, so
+    NumericGuard's guarantee downstream is exactly as strong as before.
+
+    Note this is deliberately *tighter* than NumericGuard's global allowed
+    set: a bullet about the EMG pipelines may not borrow a number evidenced
+    only for the Kraydel placement, even though both are verified facts.
+    """
+    if not text or not text.strip():
+        return False
+    if len(text.split()) < _MIN_REWORD_WORDS:
+        return False
+    numbers = {int(n) for n in _NUMBER_TOKEN_RE.findall(text)}
+    return numbers <= set(fact.numbers)
+
+
+def format_facts_block(facts: list) -> str:
+    """Render verified facts as an id-keyed list for a prompt.
+
+    Shared by resume tailoring and cover-letter generation. The variants are
+    shown as reference wordings the model may reuse or rewrite -- what it
+    may NOT do is introduce a number the fact isn't evidenced for (see
+    `_accept_reworded`, and NumericGuard for the document-wide check).
+    """
+    if not facts:
+        return "(none relevant to this job -- do not use any numbers at all)"
+    lines = []
+    for fact in facts:
+        numbers = ", ".join(str(n) for n in fact.numbers) if fact.numbers else "none"
+        lines.append(f'- "{fact.id}"  (the only numbers this fact licenses: {numbers})')
+        for form in ("short", "long"):
+            text = fact.variants.get(form)
+            if text:
+                lines.append(f'    {form}: "{" ".join(text.split())}"')
+    return "\n".join(lines)
+
+
 class FactBankError(Exception):
     """Base class for fact-bank problems."""
 
@@ -371,17 +428,26 @@ class FactBank:
     def resolve_bullet_ex(self, bullet) -> tuple[str, str | None]:
         """Turn one LLM-output bullet into (literal text, fact id or None).
 
-        A fact-referencing bullet (``{"fact": id, "form": "short"|"long"}``)
-        is replaced VERBATIM with that fact's pre-written variant -- the
-        LLM's own phrasing for it, if any, is discarded entirely, so it
-        cannot rewrite numeric content no matter what it outputs alongside
-        the id. A plain-string bullet passes through only if it contains no
-        digits at all. The fact id (None for a plain bullet with no digits)
-        lets a caller recognize two differently-worded bullets that both
-        resolved to the same fact -- see _resolve_fact_bullets's dedup,
-        which needs this because two bullets pointing at the same fact can
-        land on very different-length text (a fact's `short` vs `long`
-        variant) that a text-similarity check alone won't reliably catch.
+        A fact-referencing bullet comes in two shapes:
+
+        * ``{"fact": id, "text": "<the model's own wording>"}`` -- the
+          model keeps authorship of the SENTENCE while the fact licenses
+          the NUMBERS. Its wording is accepted only if every number in it
+          is one this fact is evidenced for (``fact.numbers``); otherwise
+          the pre-written variant is substituted instead. See
+          `_accept_reworded` for why this replaced verbatim-only
+          substitution.
+        * ``{"fact": id, "form": "short"|"long"}`` -- the original shape,
+          replaced VERBATIM with that fact's pre-written variant. Still
+          supported, and still what a rejected rewording falls back to.
+
+        A plain-string bullet passes through only if it contains no digits
+        at all. The fact id (None for a plain bullet with no digits) lets a
+        caller recognize two differently-worded bullets that both resolved
+        to the same fact -- see _resolve_fact_bullets's dedup, which needs
+        this because two bullets pointing at the same fact can land on very
+        different-length text (a fact's `short` vs `long` variant) that a
+        text-similarity check alone won't reliably catch.
 
         Raises:
             ValueError: unknown/unverified fact id, missing variant text,
@@ -402,6 +468,13 @@ class FactBank:
             fact = self._facts.get(fact_id)
             if fact is None or fact.tier != "verified":
                 raise ValueError(f"Unknown or unverified fact id: {fact_id!r}")
+
+            # The model's own wording of this fact, when it supplied one and
+            # it doesn't smuggle in a number the fact isn't evidenced for.
+            reworded = bullet.get("text") or bullet.get("bullet")
+            if isinstance(reworded, str) and _accept_reworded(reworded, fact):
+                return " ".join(reworded.split()), fact.id
+
             form = bullet.get("form", "short")
             text = fact.variants.get(form) or fact.variants.get("short") or fact.variants.get("long")
             if not text:

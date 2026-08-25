@@ -169,20 +169,29 @@ _ANY_DIGIT_RE = re.compile(r"\d")
 
 def strip_numbered_sentences(text: str) -> str:
     """Deterministic, code-only last resort for a guard failure that survived
-    every LLM retry: drop any sentence containing a digit; if that would
-    empty the text, blank just the digit runs instead.
+    every LLM retry: drop any sentence containing a digit, and drop any
+    paragraph that leaves nothing behind.
 
     Shared by resume tailoring and cover-letter generation as the final
     fallback when NumericGuard keeps rejecting fabricated numbers -- a
-    fabricated statistic is worse than no statistic, even an ungainly one,
-    and this guarantees a shippable result without another (possibly
-    equally unreliable) LLM call.
+    fabricated statistic is worse than no statistic, and this guarantees a
+    result without another (possibly equally unreliable) LLM call.
 
     Processes paragraphs (blank-line-separated, or single-newline-separated
     when the text has no blank lines at all) independently and rejoins with
     the same separator -- joining every sentence in the whole text with a
     single space, as this used to, flattens any multi-paragraph structure
     the moment any paragraph has a sentence to drop.
+
+    What it deliberately no longer does is blank out the digit runs when
+    every sentence in a paragraph has to go. That branch existed to
+    guarantee *something* came back, and what it guaranteed was text like
+    "classifies hand gestures with % accuracy" and "reducing overfitting by
+    %" -- both shipped to a real employer on 2026-08-25. Deleting a number
+    leaves its unit, its preposition and its clause stranded; there is no
+    wording where that reads as anything but broken. Returning less text (or
+    none) is recoverable because the caller re-validates and refuses to ship
+    a letter that no longer stands up. Returning mangled text is not.
     """
     if not text or not _ANY_DIGIT_RE.search(text):
         return text
@@ -192,12 +201,48 @@ def strip_numbered_sentences(text: str) -> str:
             return para
         sentences = re.split(r"(?<=[.!?])\s+", para)
         kept = [s for s in sentences if not _ANY_DIGIT_RE.search(s)]
-        cleaned = " ".join(kept).strip()
-        return cleaned if cleaned else _ANY_DIGIT_RE.sub("", para).strip()
+        return " ".join(kept).strip()
 
     sep = "\n\n" if "\n\n" in text else "\n"
-    result = sep.join(_strip_para(p) for p in text.split(sep))
-    return result if result.strip() else _ANY_DIGIT_RE.sub("", text).strip()
+    kept_paras = [p for p in (_strip_para(p) for p in text.split(sep)) if p.strip()]
+    return sep.join(kept_paras)
+
+
+# A paragraph opening on one of these refers back to something -- and after
+# a sentence has been deleted ahead of it, that something may no longer be
+# in the document. See has_dangling_reference.
+_DANGLING_OPENER_RE = re.compile(
+    r"^\s*(?:This|These|That|Those|It|They|Both|Such|The same)\b", re.IGNORECASE
+)
+
+
+def has_dangling_reference(text: str) -> bool:
+    """True if a body paragraph opens with a back-reference to a sentence
+    that isn't there.
+
+    A cover letter's paragraphs are argument units, so the deterministic
+    fallback above can leave the *second* sentence of a paragraph as its
+    first: "This directly addresses the challenge of...", "This script
+    solves the same problem your team is likely facing." Four of five
+    letters generated on 2026-08-25 opened exactly that way, each pointing
+    at a sentence NumericGuard had caused to be deleted. Every other check
+    passed them -- they were grammatical, in-voice, free of banned words and
+    of unverified numbers -- so nothing stopped them shipping.
+
+    Scoped to the FIRST body paragraph only. A later paragraph opening
+    "That combination of..." is ordinary English pointing at the paragraph
+    above it, and flagging those would reject good letters; the first body
+    paragraph has nothing above it but the salutation, so a back-reference
+    there can only be pointing at something that is gone. That scope covers
+    every case observed live -- all four dangling openers were the first
+    body paragraph, because the fallback deletes the number-bearing sentence
+    that the prompt asks for in paragraph 1.
+    """
+    for para in (p.strip() for p in text.split("\n\n")):
+        if not para or para.lower().startswith("dear"):
+            continue
+        return bool(_DANGLING_OPENER_RE.match(para))
+    return False
 
 
 # ── JSON Field Validation ─────────────────────────────────────────────────
@@ -611,5 +656,53 @@ def validate_cover_letter(text: str, mode: str = "normal") -> dict:
     stripped = text.strip()
     if not stripped.lower().startswith("dear"):
         errors.append("Must start with 'Dear Hiring Manager,'")
+
+    # 6. Structural integrity — always an error, every mode.
+    #
+    # These are the checks that were missing on 2026-08-25, when five
+    # consecutive letters shipped with cover_letter_passed=1 after the
+    # deterministic numeric fallback had gutted them: 40-80 words, two
+    # paragraphs instead of three, opening on a back-reference to a deleted
+    # sentence. Nothing above catches that, because what was left was
+    # perfectly well-formed English — there was just far too little of it,
+    # and it pointed at text that no longer existed.
+    #
+    # Deliberately mode-independent. "lenient" is about tolerating stylistic
+    # sins from a small local model (banned words, length overruns), not
+    # about shipping a letter with holes in it — and lenient is exactly the
+    # mode a local provider runs in by default, i.e. the one where the
+    # fallback fires most.
+    body_paragraphs = [
+        p.strip() for p in text.split("\n\n")
+        if p.strip()
+        and not p.strip().lower().startswith("dear")
+        and not p.strip().lower().startswith("sincerely")
+    ]
+    # The sign-off name lands in its own paragraph after "Sincerely,".
+    body_paragraphs = [p for p in body_paragraphs if len(p.split()) > 3]
+
+    if words < 120:
+        errors.append(
+            f"Too short ({words} words). A letter this thin reads as a stub. Minimum 120."
+        )
+    # An orphaned unit symbol is the signature of a number having been
+    # removed from around it ("with % accuracy"). strip_numbered_sentences
+    # no longer produces these, but a model can emit one on its own and the
+    # cost of the check is a regex.
+    # Matches a '%' whose nearest preceding non-space character isn't a digit,
+    # so "92%" and the spaced-out "92 %" both pass and "with % accuracy" does
+    # not. A plain (?<!\d) lookbehind gets "92 %" wrong: it just re-anchors at
+    # the '%' itself, finds a space behind it, and reports a false positive.
+    if re.search(r"(?:^|[^\d\s])\s*%", text):
+        errors.append("Orphaned '%' with no number in front of it.")
+    if len(body_paragraphs) < 2:
+        errors.append(
+            f"Only {len(body_paragraphs)} body paragraph(s); the letter needs 3."
+        )
+    if has_dangling_reference(text):
+        errors.append(
+            "A paragraph opens with a back-reference ('This ...', 'These ...') "
+            "whose antecedent is missing. Open the paragraph with the claim itself."
+        )
 
     return {"passed": len(errors) == 0, "errors": errors, "warnings": warnings}

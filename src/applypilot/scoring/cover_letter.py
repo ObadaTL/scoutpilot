@@ -7,9 +7,27 @@ profile at runtime. No hardcoded personal information.
 Fabrication control mirrors resume tailoring (see scoring/tailor.py): the
 prompt instruction alone is not enforcement. NumericGuard and ToolLeakGuard
 are deterministic, post-generation checks -- a violation feeds back into the
-retry loop as an explicit negative constraint, and a letter that never passes
-never gets a cover_letter_path, so it re-enters the queue on the next run
-instead of silently shipping.
+retry loop, and a letter that never passes never gets a cover_letter_path,
+so it re-enters the queue on the next run instead of silently shipping.
+
+The guards only work as a *pair* with the prompt, though, and that pairing
+was broken until 2026-08-25: the prompt demanded numbers while the FactBank
+that decides which numbers are legal was never shown to it (see
+_build_cover_letter_prompt). Everything downstream behaved exactly as
+designed and the result was still five unusable letters -- the model
+guessed, the guard rejected, retries ran out, and the deterministic
+strip-and-ship fallback removed sentences until what was left was a 41-word
+fragment opening on a pronoun with no referent. Two lessons are now
+encoded here:
+
+  * a guard that rejects an input the prompt never gave the model a way to
+    satisfy is a guaranteed failure, not a safety net; and
+  * the last-resort fallback must re-validate what it produced, because
+    "deterministic" and "correct" are different properties -- deleting a
+    sentence is safe for the *claims* and destructive to the *prose*.
+
+validate_cover_letter therefore checks structure (length, paragraph count,
+dangling references) in every mode, including lenient.
 """
 
 import hashlib
@@ -22,7 +40,7 @@ from pathlib import Path
 
 from applypilot.config import COVER_LETTER_DIR, DEFAULTS, RESUME_PATH, get_locale_style, load_profile
 from applypilot.database import get_connection
-from applypilot.facts import FactBank, NumericGuard, NumericGuardViolation
+from applypilot.facts import FactBank, NumericGuard, NumericGuardViolation, format_facts_block
 from applypilot.llm import get_client, is_local_provider
 from applypilot.scoring.validator import (
     ToolLeakGuard,
@@ -68,13 +86,27 @@ _AGGREGATOR_SITES = {
 
 # ── Prompt Builder (profile-driven) ──────────────────────────────────────
 
-def _build_cover_letter_prompt(profile: dict, job: dict) -> str:
+def _build_cover_letter_prompt(profile: dict, job: dict, fact_bank: FactBank) -> str:
     """Build the cover letter system prompt from the user's profile.
 
     All personal data, skills, and sign-off name come from the profile.
     company_summary/company_hook (captured during scoring, see scorer.py --
     derived only from the job description, never the model's own training
     knowledge) drive PARAGRAPH 3 when present.
+
+    The FactBank is injected for the same reason tailor.py injects it: this
+    prompt asks for numbers, and NumericGuard rejects every number that
+    isn't traceable to a verified fact. Until 2026-08-25 the two halves were
+    never introduced -- the prompt said "Use numbers" while its only numeric
+    input was `resume_facts.real_metrics`, which is empty in a normal
+    profile, so the model was asked for numbers with no idea which ones were
+    permitted. It guessed, NumericGuard rejected the letter, retries
+    exhausted, and the deterministic fallback deleted the offending
+    sentences -- which is how letters shipped opening on "This directly
+    addresses..." with the sentence that "This" referred to already gone,
+    and how one shipped "classifies hand gestures with % accuracy". Showing
+    the model the allowed numbers up front is what stops that at the source;
+    the guards below stay exactly as strict.
     """
     personal = profile.get("personal", {})
     boundary = profile.get("skills_boundary", {})
@@ -90,8 +122,6 @@ def _build_cover_letter_prompt(profile: dict, job: dict) -> str:
             all_skills.extend(items)
     skills_str = ", ".join(all_skills) if all_skills else "the tools listed in the resume"
 
-    # Real metrics from resume_facts
-    real_metrics = resume_facts.get("real_metrics", [])
     preserved_projects = resume_facts.get("preserved_projects", [])
 
     # Build achievement examples for the prompt
@@ -99,9 +129,9 @@ def _build_cover_letter_prompt(profile: dict, job: dict) -> str:
     if preserved_projects:
         projects_hint = f"\nKnown projects to reference: {', '.join(preserved_projects)}"
 
-    metrics_hint = ""
-    if real_metrics:
-        metrics_hint = f"\nReal metrics to use: {', '.join(real_metrics)}"
+    facts_block = format_facts_block(
+        fact_bank.relevant_facts(job.get("full_description") or "")
+    )
 
     # Short steer, not the full list -- see module docstring/_PROMPT_*_SAMPLE.
     # validate_cover_letter is what actually rejects a letter.
@@ -117,9 +147,22 @@ def _build_cover_letter_prompt(profile: dict, job: dict) -> str:
             f'company in general, this exact thing.'
         )
     else:
+        # No scraped company fact for this job (true for well over half of
+        # them -- see scorer.py, which only captures a hook when the posting
+        # actually describes the company). This used to read "Do not make any
+        # company-specific claim -- you don't have enough to go on. Close on
+        # your own terms instead.", which took the one paragraph designed to
+        # be specific and instructed it to be generic; every such letter
+        # closed on an interchangeable "I'd welcome the opportunity to bring
+        # that combination of...". The job description itself is always
+        # present in the user message and is always specific to this job, so
+        # point the paragraph at that instead of at nothing.
         hook_instruction = (
-            "Do not make any company-specific claim -- you don't have enough "
-            "to go on. Close on your own terms instead."
+            "You have no company background for this one, so use the posting "
+            "itself: name ONE concrete requirement, system, or problem from "
+            "the job description above and say why that is work you want. "
+            "Quote their own terminology. Do not praise the company in "
+            "general terms and do not invent anything about them."
         )
 
     return f"""Write a cover letter for {sign_off_name}. The goal is to get an interview.
@@ -132,8 +175,10 @@ one full blank line (an actual empty line between them, not just a line
 break). Do NOT run paragraphs together into a single block of text.
 
 PARAGRAPH 1 (2-3 sentences): Open with a specific thing YOU built that solves THEIR problem. Not "I'm excited about this role." Not "This role aligns with my experience." Start with the work.
+Choose it by RELEVANCE to this job, not by how impressive it is. Read the job description first and pick the piece of experience closest to what they actually need. If they want backend, open on backend. If they want data work, open on data work. Opening on your most technically striking project when the job is about something else tells them you did not read the posting, and it is the single fastest way to sound like a form letter.
 
-PARAGRAPH 2 (3-4 sentences): Pick 2 achievements from the resume that are MOST relevant to THIS job. Use numbers. Frame as solving their problem, not listing your accomplishments.{projects_hint}{metrics_hint}
+PARAGRAPH 2 (3-4 sentences): Pick 2 achievements from the resume that are MOST relevant to THIS job -- different ones from paragraph 1. Frame as solving their problem, not listing your accomplishments.{projects_hint}
+Write them as full sentences in your own voice, with a subject and a verb. Do NOT paste a line out of the {style["doc_name"]} or a reference wording from VERIFIED FACTS as-is. To borrow an unrelated trade for the shape of it: "Rebuilt the kiln control loop" is a {style["doc_name"]} bullet, whereas "I rebuilt the kiln's control loop after the third batch cracked, and we stopped losing firings" is a sentence in a letter. Same fact, different job of work.
 
 PARAGRAPH 3 (1-2 sentences): {hook_instruction}
 Then close on its own line: "Happy to walk through any of this in more detail." or "Let's discuss." Nothing else.
@@ -149,14 +194,23 @@ BANNED PUNCTUATION: No em dashes (—) or en dashes (–). Use commas or periods
 
 VOICE:
 - Write like a real engineer emailing someone they respect. Not formal, not casual. Just direct.
-- NEVER narrate or explain what you're doing. BAD: "This demonstrates my commitment to X." GOOD: Just state the fact and move on.
-- NEVER hedge. BAD: "might address some of your challenges." GOOD: "solves the same problem your team is facing."
-- Every sentence should contain either a number, a tool name, or a specific outcome. If it doesn't, cut it.
+- NEVER narrate or explain what you're doing. Do not tell them what a fact demonstrates about you; state the fact and stop. The reader draws the conclusion.
+- NEVER hedge. No "might", "could help with", "some of your". Say what the work did.
+- Every paragraph needs at least one checkable detail: a named system, a named tool, or a verified number. A paragraph of pure characterisation is filler.
+- Vary your sentence lengths. Three medium declaratives in a row is the sound of a template.
 - Read it out loud. If it sounds like a robot wrote it, rewrite it.
 
 FABRICATION = INSTANT REJECTION:
 The candidate's real tools are ONLY: {skills_str}.
 Do NOT mention ANY tool not in this list. If the job asks for tools not listed, talk about the work you did, not the tools.
+
+NUMBERS (checked automatically after you respond -- a letter that fails this check is thrown away):
+Every digit you write must come from the verified facts below, used with the fact it belongs to. No other number may appear anywhere in the letter: not a percentage, not a headcount, not a duration, not a rounded "over 100". You may write these claims in your own words -- reword them for this job, that is the point -- but you may not attach a number to a claim that does not license it, and you may not import a number from one fact into a sentence about another.
+If no verified fact fits what you want to say, say it without a number. A sentence with no number is fine. An invented number destroys the letter.
+
+VERIFIED FACTS (the only numbers you may write):
+{facts_block}
+The short/long wordings above are there to tell you what each fact means and which numbers it covers. They are reference text, not sentences to copy. Say the same thing in your own words, in the first person, angled at this job.
 
 Then, on its own line, below "Sincerely,": "{sign_off_name}"
 
@@ -414,14 +468,26 @@ def generate_cover_letter(
     letter = ""
     validation: dict = {"passed": False, "errors": [], "warnings": []}
     client = get_client()
-    cl_prompt_base = _build_cover_letter_prompt(profile, job)
+    cl_prompt_base = _build_cover_letter_prompt(profile, job, fact_bank)
 
     for attempt in range(max_retries + 1):
         # Fresh conversation every attempt
         prompt = cl_prompt_base
         if avoid_notes:
-            prompt += "\n\n## AVOID THESE ISSUES:\n" + "\n".join(
-                f"- {n}" for n in avoid_notes[-5:]
+            # Retry feedback used to be purely negative -- a list of things
+            # not to do, with no statement of what to do instead. A local
+            # model handed only prohibitions retreats to the blandest text
+            # it can produce, which is how a retry reliably came back worse
+            # than the attempt that triggered it. Pair the violations with
+            # the positive instruction that resolves them.
+            prompt += (
+                "\n\n## YOUR LAST ATTEMPT WAS REJECTED FOR THESE:\n"
+                + "\n".join(f"- {n}" for n in avoid_notes[-5:])
+                + "\n\nFix those specifically. Do NOT fix them by writing a shorter or "
+                "vaguer letter -- it must still be three full paragraphs with concrete "
+                "detail in each. If a number was rejected, either use one from VERIFIED "
+                "FACTS with the fact it belongs to, or make the same point with no "
+                "number at all."
             )
 
         messages = [
@@ -433,7 +499,13 @@ def generate_cover_letter(
             )},
         ]
 
-        temperature = 0.7 if attempt == 0 else 0.3
+        # Held at 0.7 across retries. This used to drop to 0.3 after the
+        # first attempt, which made every retry *less* able to find another
+        # way to phrase whatever got rejected -- the model would re-emit
+        # near-identical text and fail the same check again, burning the
+        # attempt budget and landing in the deterministic strip fallback.
+        # The guards, not a low temperature, are what keep output truthful.
+        temperature = 0.7
         letter = client.chat(messages, max_tokens=1024, temperature=temperature)
         letter = sanitize_text(letter)  # auto-fix em dashes, smart quotes
         letter = _strip_preamble(letter)  # remove any "Here is the letter:" prefix
@@ -694,7 +766,13 @@ def cover_letter_one(url: str, validation_mode: str | None = None,
         {"status": "not_found", ...} / {"status": "no_tailored_resume", ...}.
     """
     if max_retries is None:
-        max_retries = 1 if is_local_provider() else 3
+        # 2, not 1, for a local model. A retry was previously near-worthless
+        # here -- it dropped the temperature and handed the model nothing but
+        # prohibitions, so it tended to re-emit the same rejected text. Now
+        # that retries keep temperature and carry a positive instruction, the
+        # second one is where a letter that tripped a guard usually recovers,
+        # instead of falling through to the deterministic strip fallback.
+        max_retries = 2 if is_local_provider() else 3
     if validation_mode is None:
         validation_mode = "lenient" if is_local_provider() else "normal"
 
@@ -746,7 +824,13 @@ def run_cover_letters(min_score: int = 7, limit: int = 20,
          "errors": int, "fallback_to_base": int, "elapsed": float}
     """
     if max_retries is None:
-        max_retries = 1 if is_local_provider() else 3
+        # 2, not 1, for a local model. A retry was previously near-worthless
+        # here -- it dropped the temperature and handed the model nothing but
+        # prohibitions, so it tended to re-emit the same rejected text. Now
+        # that retries keep temperature and carry a positive instruction, the
+        # second one is where a letter that tripped a guard usually recovers,
+        # instead of falling through to the deterministic strip fallback.
+        max_retries = 2 if is_local_provider() else 3
     if validation_mode is None:
         validation_mode = "lenient" if is_local_provider() else "normal"
     profile = load_profile()

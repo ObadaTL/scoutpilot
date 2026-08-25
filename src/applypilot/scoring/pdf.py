@@ -6,6 +6,7 @@ and exports to PDF using headless Chromium via Playwright.
 
 import base64
 import logging
+import re
 from functools import lru_cache
 from pathlib import Path
 
@@ -280,20 +281,19 @@ _PAGE_DIMS_IN: dict[str, tuple[float, float]] = {
 
 _TARGET_MAX_PAGES = 2
 
-# _fit_resume_html only ever stepped DOWN from "spacious" to avoid overflow
-# past _TARGET_MAX_PAGES -- there was no matching step UP for content that
-# falls short of it. Confirmed live 2026-08-24 on a real tailored resume:
-# "spacious" rendered at ~52% of the 2-page budget (~1.05 pages), which
-# ships as a 2-page PDF with a couple of stray lines on an otherwise blank
-# second page -- exactly the "1 page long, other page mostly empty" look.
-# _TARGET_FILL_RATIO is how much of the budget a stretch pass aims to
-# reach (not literally 100% -- a touch of bottom margin reads as
-# intentional, a page filled to the pixel reads as suspiciously tight).
-# _STRETCH_MAX_SCALE caps how far spacing/line-height are allowed to grow
-# so a genuinely thin resume gets MORE breathing room, not obviously
-# padded whitespace that would fail an "industry standard" look.
-_TARGET_FILL_RATIO = 0.92
-_STRETCH_MAX_SCALE = 1.45
+# Stretch scales tried, largest first, when the baseline density renders
+# SHORT of the page budget. _fit_resume_html only ever stepped DOWN from
+# "spacious" to avoid overflow -- there was no matching step up for content
+# that falls short, so a resume that filled ~1.05 pages shipped as a 2-page
+# PDF with a couple of stray lines on an otherwise blank second page.
+#
+# Tried as discrete candidates rather than computed from a fill ratio. The
+# old code derived one scale arithmetically from `budget/height` and trusted
+# it, which only works if height is proportional to printed pages -- and it
+# is not (see _printed_pages). A 0.92 fill ratio against a measure that
+# systematically under-counts is how a short CV got stretched onto a THIRD
+# page: the arithmetic said 92% of two pages, the printer said three.
+_STRETCH_SCALES: tuple[float, ...] = (1.45, 1.30, 1.15)
 
 
 def _stretch_density(base: dict, scale: float) -> dict:
@@ -694,6 +694,36 @@ body {{
 </html>"""
 
 
+_PDF_PAGE_RE = re.compile(rb"/Type\s*/Page[^s]")
+
+
+def _printed_pages(page, page_size: str) -> int:
+    """How many pages this HTML *actually prints to*.
+
+    Ground truth, not an estimate. The previous implementation measured
+    `document.body.scrollHeight` in a page-width viewport and divided by the
+    per-page content height, which quietly assumes printed length is
+    proportional to continuous scroll length. It is not: paginating breaks
+    content at page boundaries, and anything that can't be split across a
+    break (a heading with its first entry, an entry with `break-inside:
+    avoid`) gets pushed whole onto the next page, leaving the tail of the
+    previous one empty. That slack is invisible to scrollHeight, so the
+    estimate always reads low -- which is how a CV measured at "92% of two
+    pages" printed as three.
+
+    Rendering the PDF and counting its pages costs one extra Chromium
+    print per probe. That is a few hundred milliseconds against an LLM
+    pipeline that spends a minute per document, and it is the only measure
+    that cannot disagree with what the candidate opens.
+    """
+    pdf_bytes = page.pdf(
+        format=page_size,
+        margin={"top": "0", "right": "0", "bottom": "0", "left": "0"},
+        print_background=True,
+    )
+    return len(_PDF_PAGE_RE.findall(pdf_bytes)) or 1
+
+
 def _fit_resume_html(resume: dict, page_size: str) -> str:
     """Render `resume` at the density that best fills `_TARGET_MAX_PAGES`
     pages (2, matching the candidate's real baseline CV) without overflowing
@@ -703,57 +733,52 @@ def _fit_resume_html(resume: dict, page_size: str) -> str:
 
     Chromium's print layout has no built-in "shrink/grow to fit N pages" for
     @page-based pagination, so this does it manually in a single headless
-    Chromium session: render the baseline density at the page's actual
-    content width, measure the resulting content height, and:
-      - if it overflows the page budget, step down through the tighter
-        presets and stop at the first that fits (falls back to the most
-        compact preset if even that overflows -- a genuinely long resume
-        legitimately needs more room, but this keeps it as close to
-        `_TARGET_MAX_PAGES` as the presets allow rather than sprawling
-        further unchecked);
-      - if it falls short of `_TARGET_FILL_RATIO` of the budget, stretch
-        spacing/line-height by the ratio needed to reach that fill level
-        (capped at `_STRETCH_MAX_SCALE`) and use that instead, so short
-        content reads as a normally-spaced, well-filled CV rather than a
-        cramped one-and-a-bit pages with an empty tail.
+    Chromium session, measuring printed page count at each candidate density
+    (see _printed_pages) rather than estimating it:
+
+      - baseline over budget: step down through the tighter presets, stop at
+        the first that fits (falls back to the most compact -- a genuinely
+        long resume legitimately needs the room, but this keeps it as close
+        to the target as the presets allow rather than sprawling unchecked);
+      - baseline under budget: try progressively gentler stretches and take
+        the first that still prints within budget, so short content reads as
+        a well-spaced CV rather than a cramped page-and-a-bit with an empty
+        tail. Every stretch is verified by printing it -- a stretch that
+        tips onto an extra page is discarded, which is the check the old
+        arithmetic could not perform.
     """
     from playwright.sync_api import sync_playwright
-
-    page_w_in, page_h_in = _PAGE_DIMS_IN.get(page_size, _PAGE_DIMS_IN["Letter"])
 
     with sync_playwright() as p:
         browser = p.chromium.launch()
         try:
-            def _measure(density: dict) -> tuple[str, int, int]:
+            def _measure(density: dict) -> tuple[str, int]:
                 html = build_html(resume, page_size=page_size, density=density)
-                content_w_px = round((page_w_in - 2 * density["margin_h"]) * 96)
-                budget_px = round((page_h_in - 2 * density["margin_v"]) * 96) * _TARGET_MAX_PAGES
-                page = browser.new_page(viewport={"width": content_w_px, "height": 100})
+                page = browser.new_page()
                 page.set_content(html, wait_until="networkidle")
-                height = page.evaluate("document.body.scrollHeight")
-                page.close()
-                return html, height, budget_px
+                try:
+                    return html, _printed_pages(page, page_size)
+                finally:
+                    page.close()
 
             baseline = _DENSITY_PRESETS[0]
-            html, height, budget_px = _measure(baseline)
+            html, pages = _measure(baseline)
 
-            if height <= budget_px:
-                if height < budget_px * _TARGET_FILL_RATIO:
-                    scale = (budget_px * _TARGET_FILL_RATIO) / height
-                    stretched_html, stretched_height, _ = _measure(_stretch_density(baseline, scale))
-                    if stretched_height <= budget_px:
-                        return stretched_html
-                    # Overshot the single-pass estimate -- the un-stretched
-                    # baseline is still a safe, correctly-fitting result.
+            if pages > _TARGET_MAX_PAGES:
+                for density in _DENSITY_PRESETS[1:]:
+                    tighter_html, tighter_pages = _measure(density)
+                    if tighter_pages <= _TARGET_MAX_PAGES or density is _DENSITY_PRESETS[-1]:
+                        return tighter_html
                 return html
 
-            for density in _DENSITY_PRESETS[1:]:
-                html, height, budget_px = _measure(density)
-                if height <= budget_px or density is _DENSITY_PRESETS[-1]:
-                    return html
+            if pages < _TARGET_MAX_PAGES:
+                for scale in _STRETCH_SCALES:
+                    stretched_html, stretched_pages = _measure(_stretch_density(baseline, scale))
+                    if stretched_pages <= _TARGET_MAX_PAGES:
+                        return stretched_html
+            return html
         finally:
             browser.close()
-    return build_html(resume, page_size=page_size)  # unreachable, keeps type-checkers happy
 
 
 # ── PDF Renderer ─────────────────────────────────────────────────────────

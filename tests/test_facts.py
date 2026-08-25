@@ -270,3 +270,135 @@ class TestGuardFailureFallsBack:
         # Every attempt was used (the fake client never produces a clean response).
         assert report["attempts"] == 2
         assert "guard_violation" in report
+
+
+# ── Reworded fact bullets: authorship back, numbers still verified ──────
+#
+# Unconditional verbatim substitution made fabricated numbers impossible and
+# tailored documents impossible at the same time: 450 bullets across 58
+# generated CVs collapsed to 87 distinct strings, because selecting a fact id
+# was the model's only real lever. The fact now licenses the NUMBERS while
+# the model writes the SENTENCE.
+
+class TestRewordedFactBullets:
+    def _bank(self):
+        from applypilot.facts import Fact, FactBank
+        return FactBank(
+            [
+                Fact(
+                    id="emg.dual_pipeline", tier="verified", numbers=[2],
+                    variants={"short": "Built 2 parallel ML pipelines on surface-EMG signals"},
+                    evidence="resume: 2 ML pipelines",
+                ),
+                Fact(
+                    id="kraydel.tenure", tier="verified", numbers=[11],
+                    variants={"short": "11-month industry placement on a production platform"},
+                    evidence="LinkedIn: 11 mos",
+                ),
+            ],
+            unfilled=[], forbidden=[],
+        )
+
+    def test_own_wording_is_kept_when_numbers_check_out(self):
+        bank = self._bank()
+        text, fact_id = bank.resolve_bullet_ex({
+            "fact": "emg.dual_pipeline",
+            "text": "Designed and evaluated 2 independent classification pipelines end to end",
+        })
+        assert text == "Designed and evaluated 2 independent classification pipelines end to end"
+        assert fact_id == "emg.dual_pipeline"
+
+    def test_smuggled_number_falls_back_to_the_verbatim_variant(self):
+        """The wording is the model's; the numbers are not. A rewording that
+        reaches for a number the fact isn't evidenced for is discarded
+        entirely rather than partially trusted."""
+        bank = self._bank()
+        text, fact_id = bank.resolve_bullet_ex({
+            "fact": "emg.dual_pipeline",
+            "text": "Built 2 pipelines reaching 92 percent accuracy on held-out data",
+        })
+        assert text == "Built 2 parallel ML pipelines on surface-EMG signals"
+        assert fact_id == "emg.dual_pipeline"
+
+    def test_number_from_a_different_fact_is_not_borrowed(self):
+        """Tighter than NumericGuard's global allowed set on purpose: 11 is
+        verified, but not for this fact, so this bullet may not carry it."""
+        bank = self._bank()
+        text, _ = bank.resolve_bullet_ex({
+            "fact": "emg.dual_pipeline",
+            "text": "Built 2 pipelines over 11 months of signal data collection",
+        })
+        assert text == "Built 2 parallel ML pipelines on surface-EMG signals"
+
+    def test_fragment_falls_back_to_the_variant(self):
+        bank = self._bank()
+        text, _ = bank.resolve_bullet_ex({"fact": "emg.dual_pipeline", "text": "Built pipelines"})
+        assert text == "Built 2 parallel ML pipelines on surface-EMG signals"
+
+    def test_form_selection_still_works(self):
+        """Back-compat: the original select-a-variant shape is unchanged."""
+        bank = self._bank()
+        text, fact_id = bank.resolve_bullet_ex({"fact": "kraydel.tenure", "form": "short"})
+        assert text == "11-month industry placement on a production platform"
+        assert fact_id == "kraydel.tenure"
+
+
+# ── Cross-section dedup ────────────────────────────────────────────────
+
+class TestCrossSectionDedup:
+    """A fact is one real thing; it belongs on the CV once. But deduping a
+    section out of existence is worse than the duplicate."""
+
+    def _data_and_bank(self, dup: bool):
+        from applypilot.facts import Fact, FactBank
+        facts = [
+            Fact(id="emg.dual", tier="verified", numbers=[2],
+                 variants={"short": "Built 2 parallel ML pipelines on EMG signals",
+                           "long": "Built two parallel machine-learning pipelines over EMG signals"},
+                 evidence="resume: 2 pipelines"),
+            Fact(id="work.audit", tier="verified", numbers=[],
+                 variants={"short": "Shipped an end-to-end audit-event system"},
+                 evidence="report: audit events"),
+        ]
+        other = "emg.dual" if dup else "work.audit"
+        data = {
+            "experience": [{"header": "Placement", "bullets": [{"fact": "emg.dual", "form": "short"}]}],
+            "projects": [{"header": "EMG", "bullets": [{"fact": other, "form": "short"}]}],
+        }
+        return data, FactBank(facts, unfilled=[], forbidden=[])
+
+    def test_repeated_fact_is_dropped_from_the_later_section(self):
+        """The duplicate bullet goes; the entry survives on its other one."""
+        from applypilot.facts import Fact, FactBank
+        from applypilot.scoring.tailor import _resolve_fact_bullets
+
+        bank = FactBank(
+            [
+                Fact(id="emg.dual", tier="verified", numbers=[2],
+                     variants={"short": "Built 2 parallel ML pipelines on EMG signals"},
+                     evidence="resume: 2 pipelines"),
+                Fact(id="work.audit", tier="verified", numbers=[],
+                     variants={"short": "Shipped an end-to-end audit-event system"},
+                     evidence="report: audit events"),
+            ],
+            unfilled=[], forbidden=[],
+        )
+        data = {
+            "experience": [{"header": "Placement", "bullets": [{"fact": "work.audit", "form": "short"}]}],
+            "projects": [{"header": "EMG", "bullets": [
+                {"fact": "work.audit", "form": "short"},   # already used above
+                {"fact": "emg.dual", "form": "short"},     # unique to this section
+            ]}],
+        }
+        resolved, _ = _resolve_fact_bullets(data, bank)
+        assert resolved["projects"][0]["bullets"] == ["Built 2 parallel ML pipelines on EMG signals"]
+
+    def test_a_section_is_never_emptied_by_dedup_alone(self):
+        """If dedup would leave PROJECTS with no entries at all, the section
+        falls back to per-section dedup: validate_json_fields requires the
+        field, so emptying it costs the whole document a retry."""
+        from applypilot.scoring.tailor import _resolve_fact_bullets
+        data, bank = self._data_and_bank(dup=True)
+        resolved, _ = _resolve_fact_bullets(data, bank)
+        assert len(resolved["projects"]) == 1
+        assert resolved["projects"][0]["bullets"]

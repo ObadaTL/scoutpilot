@@ -9,11 +9,20 @@ is always code-injected, never LLM-generated. Each retry starts a fresh conversa
 to avoid apologetic spirals.
 
 Numeric content is a separate control from the rest of the tailoring text: the LLM
-never writes a number itself. It selects a fact id + short/long form from the
-FactBank (facts.yaml) and code substitutes the pre-written text verbatim; any bullet
-with no fact id must contain zero digits. NumericGuard re-checks the assembled text
-against FactBank.allowed_numbers() after generation, deterministically -- this is
-enforcement, not just a prompt instruction the model could ignore.
+never writes a number that isn't licensed by a verified fact. It attaches a fact id
+to any bullet carrying a number, and code checks that every digit in that bullet is
+one the fact's own evidence covers (FactBank._accept_reworded) -- the WORDING is the
+model's, the NUMBERS are the FactBank's. A bullet whose rewording reaches for any
+other number is replaced by that fact's pre-written variant rather than shipped; any
+bullet with no fact id must contain zero digits. NumericGuard re-checks the assembled
+text against FactBank.allowed_numbers() after generation, deterministically -- this
+is enforcement, not just a prompt instruction the model could ignore.
+
+Substituting the pre-written variant *unconditionally* (the original design) was safe
+but produced interchangeable documents: 450 bullets across 58 generated CVs collapsed
+to 87 distinct strings, because the model's only real lever was which of ~11 facts to
+select and in what order. Verifying the numbers instead of dictating the sentence
+gives per-job wording back without weakening the fabrication guarantee.
 """
 
 import hashlib
@@ -26,7 +35,7 @@ from pathlib import Path
 
 from applypilot.config import RESUME_PATH, TAILORED_DIR, get_locale_style, load_profile
 from applypilot.database import get_connection, get_jobs_by_stage
-from applypilot.facts import FactBank, NumericGuard, NumericGuardViolation
+from applypilot.facts import FactBank, NumericGuard, NumericGuardViolation, format_facts_block
 from applypilot.llm import get_client, is_local_provider
 from applypilot.scoring.pdf import split_sections
 from applypilot.scoring.validator import (
@@ -45,24 +54,16 @@ log = logging.getLogger(__name__)
 # not duplicated here.
 _DIGIT_TOKEN_RE = re.compile(r"\d+")
 
+# Short, hand-picked steer for the tailoring prompt -- NOT the enforcement
+# list. validate_json_fields (the full BANNED_WORDS set in validator.py)
+# remains authoritative. Same rationale as cover_letter._PROMPT_BANNED_SAMPLE.
+_PROMPT_BANNED_SAMPLE = [
+    "passionate", "spearheaded", "cutting-edge", "synergy",
+    "utilize", "proven track record", "robust", "seamless",
+]
+
 
 # ── Prompt Builders (profile-driven) ──────────────────────────────────────
-
-def _format_facts_block(facts: list) -> str:
-    """Render verified facts as an id-keyed list of pre-written variants
-    for the prompt. The LLM selects among these; it never writes the text
-    itself, so nothing here can be reworded into a fabricated number."""
-    if not facts:
-        return "(none relevant to this job -- do not reference any fact id)"
-    lines = []
-    for fact in facts:
-        lines.append(f'- "{fact.id}"')
-        for form in ("short", "long"):
-            text = fact.variants.get(form)
-            if text:
-                lines.append(f'    {form}: "{" ".join(text.split())}"')
-    return "\n".join(lines)
-
 
 def _build_tailor_prompt(profile: dict, fact_bank: FactBank, job_description: str = "") -> str:
     """Build the resume tailoring system prompt from the user's profile.
@@ -100,11 +101,17 @@ def _build_tailor_prompt(profile: dict, fact_bank: FactBank, job_description: st
     companies_str = ", ".join(companies) if companies else "N/A"
     projects_str = ", ".join(projects) if projects else "N/A"
 
-    facts_block = _format_facts_block(fact_bank.relevant_facts(job_description))
+    facts_block = format_facts_block(fact_bank.relevant_facts(job_description))
 
-    # Include ALL banned words from the validator so the LLM knows exactly
-    # what will be rejected — the validator checks for these automatically.
-    banned_str = ", ".join(BANNED_WORDS)
+    # A short, hand-picked steer -- NOT the full enforcement list. This used
+    # to dump all ~50 BANNED_WORDS into every call, on the reasoning that the
+    # model should know exactly what gets rejected. cover_letter.py already
+    # worked out why that backfires (see its _PROMPT_BANNED_SAMPLE): a long
+    # list of forbidden phrasings primes a local model to produce text in
+    # their neighbourhood, and it crowds out the instructions that actually
+    # shape the writing. validate_json_fields still checks the full list --
+    # the enforcement is unchanged, only the priming is gone.
+    banned_str = ", ".join(f'"{w}"' for w in _PROMPT_BANNED_SAMPLE)
 
     education = profile.get("experience", {})
     education_level = education.get("education_level", "")
@@ -133,7 +140,10 @@ You MAY add 1-2 tools closely related to something already in the SKILLS BOUNDAR
 
 TITLE: Match the target role. Keep seniority (Senior/Lead/Staff). Drop company suffixes and team names.
 
-SUMMARY: Rewrite from scratch. Lead with the 1-2 skills that matter most for THIS role. Sound like someone who's done this job.
+SUMMARY: Rewrite from scratch, for this job specifically. Lead with the single most relevant thing this person has actually done -- name the system, the domain, or the problem, not a category. It may carry numbers on the same terms as any bullet (see NUMBERS): if a verified fact belongs here, use it.
+Two rules, because summaries drift into template:
+- No sentence may begin "Experienced in ...", "Proven ability ...", "Skilled in ..." or "Familiar with ...". Those name categories of experience instead of saying what was done. State the work.
+- Do not default to whatever the base {doc} leads with. If the base {doc} opens on a specialism this job never mentions, that specialism does not belong in the first sentence. Backend role, lead with backend. Support role, lead with production systems and debugging.
 
 SKILLS: Reorder each category so the job's must-haves appear first.
 
@@ -148,17 +158,20 @@ BULLETS: Strong verb + what you built + impact. Vary verbs (Built, Designed, Imp
 - GOOD: "Automated financial reporting with Python and API integrations, eliminating a manual end-of-month process"
 - BAD: "Leveraged cutting-edge AI technologies to drive transformative operational efficiencies"
 - Use {style["spelling"]} English spelling and terminology throughout. Call it a "{doc}", never the other term.
-- BANNED WORDS (using ANY of these = validation failure — do not use them even once):
+- Recruiter-brochure words are rejected by an automated validator that checks a much
+  larger list than this sample -- avoid anything that reads like these:
   {banned_str}
 - No em dashes. Use commas, periods, or hyphens.
 
 ## NUMBERS -- READ THIS CAREFULLY (hard constraint, enforced by an automated checker after you respond, not just this instruction):
-You do not write numbers. You select from a fixed list of pre-written, verified facts below. Every bullet is one of two shapes:
-1. A plain string, with ZERO digits anywhere in it -- not a rounded number, not a vague one, not a year, nothing. "Automated a manual reporting workflow" is fine. "Automated 5 reporting workflows" is NOT, even if you think 5 sounds plausible.
-2. A fact reference: {{"fact": "<id>", "form": "short"}} or {{"fact": "<id>", "form": "long"}}, using ONLY an id from VERIFIED FACTS below. Pick the id whose pre-written text best fits the bullet's slot; you do not edit or paraphrase that text, code substitutes it verbatim.
+You write the sentences. You do NOT choose the numbers. Every bullet is one of two shapes:
+1. A plain string with ZERO digits anywhere in it -- not a rounded number, not a vague one, not a year, nothing. "Automated a manual reporting workflow" is fine. "Automated 5 reporting workflows" is NOT, even if you think 5 sounds plausible.
+2. A bullet built on a verified fact: {{"fact": "<id>", "text": "<your own sentence for this fact, written for THIS job>"}}, using ONLY an id from VERIFIED FACTS below. Write that sentence yourself -- angle it at this job, lead with the verb that matters here, use the job's vocabulary. The ONLY constraint is numeric: the sentence may contain the numbers that fact licenses and no others. Any other digit and your wording is discarded and replaced with the canned variant, so the bullet stops being tailored at all.
 If an achievement has no fact backing it, describe it with a plain zero-digit bullet. A fabricated statistic is worse than no statistic -- there is no partial credit for a plausible-sounding number.
 
-## VERIFIED FACTS (the only source of numbers -- reference by id, never invent your own):
+Do not copy a fact's `short`/`long` text verbatim unless it genuinely is the best sentence for this job. They are reference wordings showing what the fact means and which numbers it covers -- not a menu to pick from. Two CVs for two different jobs should not share a bullet word for word.
+
+## VERIFIED FACTS (the only source of numbers -- attach the id, write your own sentence):
 {facts_block}
 
 ## HARD RULES:
@@ -169,7 +182,7 @@ If an achievement has no fact backing it, describe it with a plain zero-digit bu
 
 ## OUTPUT: Return ONLY valid JSON. No markdown fences. No commentary. No "here is" preamble.
 
-{{"title":"Role Title","summary":"2-3 tailored sentences, zero digits.","skills":{{{skills_schema}}},"experience":[{{"header":"Title at Company","subtitle":"Tech | Dates","bullets":["plain zero-digit bullet",{{"fact":"some.fact.id","form":"short"}}]}}],"projects":[{{"header":"Project Name - Description","subtitle":"Tech | Dates","bullets":["plain zero-digit bullet",{{"fact":"some.fact.id","form":"long"}}]}}],"education":"{school} | {education_level}"}}"""
+{{"title":"Role Title","summary":"2-3 sentences written for this job.","skills":{{{skills_schema}}},"experience":[{{"header":"Title at Company","subtitle":"Tech | Dates","bullets":["plain zero-digit bullet",{{"fact":"some.fact.id","text":"your own sentence for this fact, angled at this job"}}]}}],"projects":[{{"header":"Project Name - Description","subtitle":"Tech | Dates","bullets":["plain zero-digit bullet",{{"fact":"some.fact.id","text":"your own sentence for this fact"}}]}}],"education":"{school} | {education_level}"}}"""
 
 
 def _build_judge_prompt(profile: dict, fact_bank: FactBank | None = None) -> str:
@@ -272,6 +285,13 @@ def _resume_json_schema() -> dict:
                 "type": "object",
                 "properties": {
                     "fact": {"type": "string"},
+                    # The model's own sentence for this fact. Accepted only
+                    # if every number in it is one the fact is evidenced for
+                    # (FactBank._accept_reworded); otherwise the pre-written
+                    # variant named by `form` is substituted instead. `form`
+                    # is kept both as that fallback and for back-compat with
+                    # the older select-a-variant shape.
+                    "text": {"type": "string"},
                     "form": {"type": "string", "enum": ["short", "long"]},
                 },
                 "required": ["fact"],
@@ -397,21 +417,43 @@ def extract_extra_sections(original_text: str) -> dict[str, str]:
     return extra
 
 
-_EDU_FALLBACK = (
-    "Master of Engineering (MEng), Software and Electronic Systems Engineering "
-    "| Queen's University Belfast | Upper Second-Class Honours (2:1) | 2020 - 2025"
-)
+# Last-resort education line for a profile that declares neither a school
+# nor an education level. Deliberately generic: this module is otherwise
+# free of personal data, and the constant that used to live here held one
+# candidate's degree, university, classification and dates in the source.
+_EDU_FALLBACK = "Education details available on request"
 
 
-def _format_education(edu: object) -> str:
+def _profile_education(profile: dict | None) -> str:
+    """The education line as the profile itself states it."""
+    if not profile:
+        return _EDU_FALLBACK
+    school = (profile.get("resume_facts", {}) or {}).get("preserved_school", "")
+    level = (profile.get("experience", {}) or {}).get("education_level", "")
+    parts = [str(p).strip() for p in (school, level) if str(p or "").strip()]
+    return " | ".join(parts) if parts else _EDU_FALLBACK
+
+
+def _format_education(edu: object, profile: dict | None = None) -> str:
     """Normalize `education` into the single "degree | institution | honours
     | dates" line the template expects, regardless of the shape the LLM
-    actually returned it in.
+    actually returned it in, and guarantee the real school is named.
 
     The prompt asks for a plain string, but a model will sometimes nest it
     as {"degree": ..., "institution": ..., "dates": ..., ...} instead --
     `str(that_dict)` would otherwise ship a raw Python-repr dump straight
     onto the resume (e.g. "{'degree': 'MEng', 'institution': ...}").
+
+    The school check is new. `education` is the one field with no creative
+    content in it at all -- it is profile data the model is asked to copy --
+    and yet a dropped institution name was the single most common tailoring
+    failure on record ("Education 'X' missing", the deep validator's error,
+    seen across separate runs both before and after this rewrite). Failing a
+    whole CV over it, then retrying the entire document in the hope the model
+    copies the field correctly next time, spends minutes of local inference
+    on something a string check fixes for certain. Anything else the model
+    wrote in the field -- degree title, classification, dates carried over
+    from the base CV -- is kept; only the missing institution is restored.
     """
     if isinstance(edu, dict):
         parts = [
@@ -421,17 +463,56 @@ def _format_education(edu: object) -> str:
             edu.get("dates") or edu.get("date") or edu.get("graduation") or edu.get("period"),
         ]
         parts = [str(p).strip() for p in parts if p]
-        return " | ".join(parts) if parts else _EDU_FALLBACK
-    if isinstance(edu, (list, tuple)):
-        joined = " | ".join(str(e).strip() for e in edu if e)
-        return joined or _EDU_FALLBACK
-    edu_str = str(edu).strip() if edu else ""
-    return edu_str or _EDU_FALLBACK
+        edu_str = " | ".join(parts)
+    elif isinstance(edu, (list, tuple)):
+        edu_str = " | ".join(str(e).strip() for e in edu if e)
+    else:
+        edu_str = str(edu).strip() if edu else ""
+
+    if not edu_str:
+        return _profile_education(profile)
+
+    school = str((profile or {}).get("resume_facts", {}).get("preserved_school", "") or "").strip()
+    # Compare sanitized. A model writing the school with a typographic
+    # apostrophe ("Queen’s") against a profile holding a straight one
+    # ("Queen's") is not a missing school, but a raw substring test says it
+    # is -- and then prepends the name to a line that already had it, so the
+    # rendered CV reads "Queen's University Belfast | Queen's University
+    # Belfast | MEng ...". sanitize_text is what normalizes those quotes
+    # everywhere else in assembly, so match on its output.
+    if school and sanitize_text(school).lower() not in sanitize_text(edu_str).lower():
+        edu_str = f"{school} | {edu_str}"
+    return edu_str
 
 
 # ── Resume Assembly (profile-driven header) ──────────────────────────────
 
-def assemble_resume_text(data: dict, profile: dict, extra_sections: dict[str, str] | None = None) -> str:
+_SUMMARY_HEADERS = "|".join(re.escape(v) for v in SECTION_VARIANTS["SUMMARY"])
+_NEXT_HEADER_RE = "|".join(
+    re.escape(v) for variants in SECTION_VARIANTS.values() for v in variants
+)
+
+
+def _base_summary(base_resume_text: str) -> str:
+    """The SUMMARY section of the candidate's base CV, if it has one.
+
+    Used only when the LLM returns an empty `summary` field -- their own
+    existing summary is the one candidate-agnostic thing that is certainly
+    true of them, and it beats both a hardcoded paragraph and a headerless
+    CV. Header matching reuses SECTION_VARIANTS so it accepts the same
+    aliases ("PROFILE", "PROFESSIONAL SUMMARY") the validator does.
+    """
+    if not base_resume_text:
+        return ""
+    match = re.search(
+        rf"^[ \t]*(?:{_SUMMARY_HEADERS})[ \t]*:?[ \t]*$\n(.*?)(?=^[ \t]*(?:{_NEXT_HEADER_RE})[ \t]*:?[ \t]*$|\Z)",
+        base_resume_text, re.IGNORECASE | re.MULTILINE | re.DOTALL,
+    )
+    return " ".join(match.group(1).split()) if match else ""
+
+
+def assemble_resume_text(data: dict, profile: dict, extra_sections: dict[str, str] | None = None,
+                         base_resume_text: str = "") -> str:
     """Convert JSON resume data to formatted plain text.
 
     Header (name, location, contact) is ALWAYS code-injected from the profile,
@@ -442,6 +523,8 @@ def assemble_resume_text(data: dict, profile: dict, extra_sections: dict[str, st
         data: Parsed JSON resume from the LLM.
         profile: User profile dict from load_profile().
         extra_sections: Non-standard sections carried through from the base CV.
+        base_resume_text: The candidate's base CV text, used only to recover a
+            SUMMARY when the LLM left that field empty.
 
     Returns:
         Formatted resume text.
@@ -480,15 +563,20 @@ def assemble_resume_text(data: dict, profile: dict, extra_sections: dict[str, st
         or data.get("summary_statement")
         or ""
     )
+    # No hardcoded fallback here. This used to carry one candidate's own
+    # summary baked into the source, which meant any run where the model
+    # left `summary` empty silently shipped that identical paragraph -- the
+    # single most visible "why does every CV say the same thing" failure,
+    # and a personal-data leak into a profile-driven codebase besides.
+    # Falling back to the base CV's own SUMMARY section is both correct and
+    # candidate-agnostic; dropping the header entirely beats inventing one.
     if not summary:
-        summary = (
-            "MEng graduate in Software & Electronic Systems Engineering with hands-on "
-            "machine learning and full-stack software engineering experience. Proven ability in "
-            "Python/scikit-learn ML pipelines with rigorous evaluation integrity, alongside "
-            "production backend microservices in Java, Kotlin, and AWS."
-        )
-    lines.append(sanitize_text(summary))
-    lines.append("")
+        summary = _base_summary(base_resume_text)
+    if summary:
+        lines.append(sanitize_text(summary))
+        lines.append("")
+    else:
+        lines.pop()  # no summary to show -- drop the bare "SUMMARY" header
 
     # Technical Skills
     lines.append("TECHNICAL SKILLS")
@@ -592,7 +680,7 @@ def assemble_resume_text(data: dict, profile: dict, extra_sections: dict[str, st
 
     # Education
     lines.append("EDUCATION")
-    lines.append(sanitize_text(_format_education(data.get("education"))))
+    lines.append(sanitize_text(_format_education(data.get("education"), profile)))
 
     # Extra sections carried through verbatim from the base CV
     if extra_sections:
@@ -645,6 +733,14 @@ def _resolve_fact_bullets(data: dict, fact_bank: FactBank) -> tuple[dict, list[s
         bullet that had to be dropped.
     """
     errors: list[str] = []
+    # Document-wide, NOT per-entry. A fact is one real thing that happened;
+    # it belongs on the CV once. Scoping this per-entry (as it was) meant a
+    # final-year project listed under EXPERIENCE and again under PROJECTS
+    # carried the same three bullets verbatim in both places -- observed on
+    # a live backend tailoring run, three identical lines a few centimetres
+    # apart. Experience is resolved first, so a fact keeps its place in the
+    # more senior section and the weaker restatement is the one dropped.
+    seen_fact_ids: set[str] = set()
 
     def _resolve_section(entries):
         resolved_entries = []
@@ -653,7 +749,6 @@ def _resolve_fact_bullets(data: dict, fact_bank: FactBank) -> tuple[dict, list[s
                 continue
             new_entry = dict(entry)
             new_bullets: list[str] = []
-            seen_fact_ids: set[str] = set()
             raw_bullets = entry.get("bullets", [])
             if isinstance(raw_bullets, str):
                 raw_bullets = [raw_bullets]
@@ -699,12 +794,31 @@ def _resolve_fact_bullets(data: dict, fact_bank: FactBank) -> tuple[dict, list[s
                     seen_fact_ids.add(fact_id)
                 new_bullets.append(resolved)
             new_entry["bullets"] = new_bullets
-            resolved_entries.append(new_entry)
+            # An entry whose every bullet deduped away against an earlier
+            # section is a header with nothing under it -- drop it rather
+            # than render a bare title into the PDF.
+            if new_bullets:
+                resolved_entries.append(new_entry)
         return resolved_entries
 
     resolved = dict(data)
     resolved["experience"] = _resolve_section(data.get("experience"))
     resolved["projects"] = _resolve_section(data.get("projects"))
+
+    # Document-wide dedup can consume a whole section: when the model lists
+    # the same work under EXPERIENCE and again under PROJECTS, experience is
+    # resolved first and every projects bullet dedups away, leaving PROJECTS
+    # with no entries at all. That trips validate_json_fields' "Missing
+    # required field: projects" and costs the entire document a retry --
+    # strictly worse than the duplicate it was trying to prevent. Rebuild the
+    # section with per-section dedup only, so it keeps its content and the
+    # repetition is the only thing lost to.
+    if data.get("projects") and not resolved["projects"]:
+        section_local = set(seen_fact_ids)
+        seen_fact_ids.clear()
+        resolved["projects"] = _resolve_section(data.get("projects"))
+        seen_fact_ids.update(section_local)
+
     return resolved, errors
 
 
@@ -836,6 +950,105 @@ def _apply_canonical_entries(data: dict, profile: dict) -> dict:
     return result
 
 
+_RUT_FILLER_SENTENCE = re.compile(
+    r"^\s*(?:Experienced in|Proven ability|Skilled in|Familiar with)\b", re.IGNORECASE
+)
+
+
+def _summary_rut(summary: str) -> str:
+    """Describe the template the summary fell into, or "" if it didn't.
+
+    Scoped to filler *sentences*, not to the opening verb. An earlier version
+    also flagged summaries opening "Built ..." / "Developed ...", on the
+    evidence that 51 of 56 generated CVs began with one of those two words.
+    That statistic is real but it is a symptom, not the defect: verb-first
+    with an implied subject is ordinary CV register, and instructing a 14B
+    model to open on a noun instead got exactly what you would expect --
+    "Surface-EMG signal processing in Python, addressing real-world data
+    challenges." A headless noun phrase where a sentence belongs is worse
+    than a predictable verb, and it was the fix that introduced it.
+
+    What genuinely carries no information is the follow-on sentence that
+    lists categories of thing the candidate has been near rather than
+    anything they did. 30 of those same 56 summaries used "Experienced in
+    ..." as their second sentence; that one is worth a rewrite, and asking
+    for a replacement sentence is a request a small model can satisfy
+    without dismantling the grammar.
+
+    Returns the note as an instruction rather than a complaint -- telling a
+    model only what was wrong leaves it guessing at what would be right. See
+    the call site in tailor_resume for why this never blocks.
+    """
+    summary = (summary or "").strip()
+    if not summary:
+        return ""
+    for sentence in re.split(r"(?<=[.!?])\s+", summary)[1:]:
+        match = _RUT_FILLER_SENTENCE.match(sentence)
+        if match:
+            return (
+                f'A summary sentence began "{match.group().strip()} ...", which lists '
+                f"categories of experience instead of stating anything that was done. "
+                f"Replace that sentence with what was actually built, fixed or shipped."
+            )
+    return ""
+
+
+def _repair_summary_rut(resolved_data: dict, client, job: dict, guard: NumericGuard) -> None:
+    """Rewrite `resolved_data["summary"]` in place if it fell into a rut.
+
+    Mutates only on success, and "success" is strict: the replacement must
+    itself be rut-free, must be a plausible summary length, and must pass
+    NumericGuard (a rewrite is LLM-authored text like any other, so it gets
+    the same numeric scrutiny as the bullets around it). Any failure -- a
+    bad rewrite, an unparseable response, or the LLM call raising at all --
+    leaves the original summary exactly as it was. A stylistic improvement
+    is never worth risking the document over, which is also why this
+    swallows exceptions rather than letting a transient LLM error take down
+    a CV that had already passed everything else.
+    """
+    summary = str(resolved_data.get("summary", ""))
+    rut = _summary_rut(summary)
+    if not rut:
+        return
+
+    messages = [
+        {"role": "system", "content": (
+            "You rewrite one paragraph. Output the rewritten paragraph and nothing "
+            "else -- no preamble, no quotes, no explanation, no JSON."
+        )},
+        {"role": "user", "content": (
+            f"TARGET JOB: {job.get('title', '')}\n\n"
+            f"JOB DESCRIPTION:\n{(job.get('full_description') or '')[:2000]}\n\n"
+            f"CURRENT SUMMARY:\n{summary}\n\n"
+            f"PROBLEM: {rut}\n\n"
+            "Rewrite the summary in 2-3 sentences, angled at the target job above. "
+            "Keep every claim it makes -- same facts, same numbers, invent nothing new "
+            "and drop nothing real. Every sentence must be a complete sentence: CV "
+            "register with an implied subject is fine (\"Built the ingest pipeline...\"), "
+            "a headless noun phrase is not (\"Signal processing in Python, addressing "
+            "...\"). Return the rewritten summary only:"
+        )},
+    ]
+
+    try:
+        rewritten = sanitize_text(client.chat(messages, max_tokens=300, temperature=0.7)).strip()
+    except Exception:
+        log.warning("Summary rut repair call failed; keeping the original summary.", exc_info=True)
+        return
+
+    if not (40 <= len(rewritten) <= 700) or _summary_rut(rewritten):
+        log.debug("Summary rut repair produced an unusable result; keeping the original.")
+        return
+    try:
+        guard.check(rewritten)
+    except NumericGuardViolation as e:
+        log.debug("Summary rut repair introduced unverified number(s) %s; keeping the original.", e.numbers)
+        return
+
+    log.debug("Summary rut repaired: %s", rut)
+    resolved_data["summary"] = rewritten
+
+
 def _build_guard_scan_text(resolved_data: dict) -> str:
     """Text scope NumericGuard checks: LLM-authored content (title, summary,
     skills, education, bullets). Deliberately excludes the code-injected
@@ -868,7 +1081,7 @@ def _build_guard_scan_text(resolved_data: dict) -> str:
     return "\n".join(parts)
 
 
-def _fallback_unquantified(data: dict, fact_bank: FactBank) -> dict:
+def _fallback_unquantified(data: dict, fact_bank: FactBank, profile: dict | None = None) -> dict:
     """Deterministic, code-only fallback for when the guard still fails
     after every retry: keep only verified facts and bullets that carry zero unverified numbers.
     """
@@ -883,7 +1096,7 @@ def _fallback_unquantified(data: dict, fact_bank: FactBank) -> dict:
     # code-injected header along with it (email/phone/dates). Defaulting to
     # the same known-safe education string _format_education() already uses
     # elsewhere closes this at the source: nothing downstream can fail on it.
-    result["education"] = _EDU_FALLBACK
+    result["education"] = _profile_education(profile)
 
     skills = data.get("skills", {})
     if isinstance(skills, dict):
@@ -1077,7 +1290,7 @@ def tailor_resume(
             # still at its initial "" (a silently empty resume file, worse
             # than shipping the best imperfect attempt we actually have).
             if is_last_attempt and last_good_data is not None:
-                tailored = _ship_unquantified_fallback(last_good_data, profile, extra_sections, fact_bank, guard)
+                tailored = _ship_unquantified_fallback(last_good_data, profile, extra_sections, fact_bank, guard, resume_text)
                 report["status"] = "approved_unquantified_fallback"
                 report["guard_violation"] = {
                     "errors": ["Final attempt's output was not valid JSON; used the last attempt that did parse."]
@@ -1115,10 +1328,36 @@ def tailor_resume(
             avoid_notes.extend(resolution_errors)
             if not is_last_attempt:
                 continue
-            tailored = _ship_unquantified_fallback(data, profile, extra_sections, fact_bank, guard)
+            tailored = _ship_unquantified_fallback(data, profile, extra_sections, fact_bank, guard, resume_text)
             report["status"] = "approved_unquantified_fallback"
             report["guard_violation"] = {"errors": resolution_errors}
             return tailored, report
+
+        # Summary rut: prompt instruction + deterministic check + a targeted
+        # repair, the same three-part control this module already uses for
+        # numbers. The prompt asks for a summary written for this job and
+        # names the ruts explicitly; a 14B local model reads that and opens
+        # with "Built ..." anyway. Measured across 56 generated CVs: 51 began
+        # "Built" or "Developed", 53 were exactly two sentences, and 30 used
+        # "Experienced in ..." as the second -- every summary technically
+        # unique, all of them the same sentence with the nouns swapped, which
+        # is what "the summary never changes" actually describes.
+        #
+        # Repaired in place rather than by retrying the whole document. A
+        # full retry would spend an attempt from the budget and discard an
+        # otherwise-good CV over a stylistic nit -- if the replacement then
+        # failed validation the run would end up shipping something worse
+        # than what it threw away. Rewriting one field costs one short call,
+        # cannot lose the rest of the document, and asking for a single
+        # sentence is a much easier request than re-deriving the whole CV.
+        _repair_summary_rut(resolved_data, client, job, guard)
+
+        # Normalize `education` here, not at assembly time. validate_json_fields
+        # below inspects the raw field, so repairing it during assembly (which
+        # runs after) left Layer 1 still failing on "Education '<school>'
+        # missing" -- the most common tailoring failure on record -- and burnt
+        # the whole retry budget re-rolling a document over one copied string.
+        resolved_data["education"] = _format_education(resolved_data.get("education"), profile)
 
         # Layer 1: Validate JSON fields
         validation = validate_json_fields(resolved_data, profile, mode=validation_mode)
@@ -1132,12 +1371,12 @@ def tailor_resume(
             # Last attempt — assemble whatever we got (bullets are already
             # resolved to plain text, so this is safe to ship structurally;
             # the numeric guard below still runs before we return).
-            tailored = assemble_resume_text(resolved_data, profile, extra_sections)
+            tailored = assemble_resume_text(resolved_data, profile, extra_sections, resume_text)
             report["status"] = "failed_validation"
             return tailored, report
 
         # Assemble text (header injected by code, em dashes auto-fixed)
-        tailored = assemble_resume_text(resolved_data, profile, extra_sections)
+        tailored = assemble_resume_text(resolved_data, profile, extra_sections, resume_text)
 
         # NumericGuard: deterministic post-generation check that every number
         # in the LLM-authored content traces back to a verified fact (or the
@@ -1152,7 +1391,7 @@ def tailor_resume(
             )
             if not is_last_attempt:
                 continue
-            tailored = _ship_unquantified_fallback(data, profile, extra_sections, fact_bank, guard)
+            tailored = _ship_unquantified_fallback(data, profile, extra_sections, fact_bank, guard, resume_text)
             report["status"] = "approved_unquantified_fallback"
             report["guard_violation"] = {"numbers": e.numbers, "bullets": e.bullets}
             return tailored, report
@@ -1200,6 +1439,7 @@ def tailor_resume(
 
 def _ship_unquantified_fallback(
     data: dict, profile: dict, extra_sections: dict, fact_bank: FactBank, guard: NumericGuard,
+    base_resume_text: str = "",
 ) -> str:
     """Build, assemble, and re-verify the unquantified fallback.
 
@@ -1221,7 +1461,7 @@ def _ship_unquantified_fallback(
     was never LLM content and never needed sanitizing, structurally out of
     reach.
     """
-    fallback_data = _fallback_unquantified(data, fact_bank)
+    fallback_data = _fallback_unquantified(data, fact_bank, profile)
     resolved_fallback, _ = _resolve_fact_bullets(fallback_data, fact_bank)
     resolved_fallback = _apply_canonical_entries(resolved_fallback, profile)
     try:
@@ -1229,7 +1469,7 @@ def _ship_unquantified_fallback(
     except NumericGuardViolation:
         log.error("Unquantified fallback still failed NumericGuard -- stripping all digits as last resort")
         resolved_fallback = _strip_all_digits_from_fields(resolved_fallback)
-    return assemble_resume_text(resolved_fallback, profile, extra_sections)
+    return assemble_resume_text(resolved_fallback, profile, extra_sections, base_resume_text)
 
 
 def _strip_all_digits_from_fields(data: dict) -> dict:
@@ -1239,7 +1479,7 @@ def _strip_all_digits_from_fields(data: dict) -> dict:
     result = dict(data)
     result["title"] = _DIGIT_TOKEN_RE.sub("", str(data.get("title", "")))
     result["summary"] = _DIGIT_TOKEN_RE.sub("", str(data.get("summary", "")))
-    result["education"] = _DIGIT_TOKEN_RE.sub("", str(data.get("education", ""))) or _EDU_FALLBACK
+    result["education"] = _DIGIT_TOKEN_RE.sub("", str(data.get("education", ""))) or _EDU_FALLBACK  # profile-agnostic here by design
 
     skills = data.get("skills", {})
     if isinstance(skills, dict):

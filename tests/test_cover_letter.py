@@ -148,7 +148,17 @@ class TestGenerateCoverLetterNeverShipsOnFailedGuard:
         assert validation["passed"] is False
         assert any("500" in e for e in validation["errors"])
 
-    def test_temperature_lowered_after_first_attempt(self, monkeypatch):
+    def test_temperature_stays_high_across_retries(self, monkeypatch):
+        """Retries must keep sampling temperature, not drop it.
+
+        The old behaviour was 0.7 on the first attempt and 0.3 on every
+        retry, which asked the model to find a *different* phrasing for
+        whatever the guard rejected while giving it less freedom to do so.
+        In practice it re-emitted near-identical text, failed the same
+        check, and burned the attempt budget down into the deterministic
+        strip fallback -- the path that produced the mangled letters of
+        2026-08-25.
+        """
         import applypilot.scoring.cover_letter as cl_mod
 
         seen_temperatures = []
@@ -170,8 +180,8 @@ class TestGenerateCoverLetterNeverShipsOnFailedGuard:
             max_retries=2, validation_mode="lenient", fact_bank=bank,
         )
 
-        assert seen_temperatures[0] == 0.7
-        assert all(t == 0.3 for t in seen_temperatures[1:])
+        assert len(seen_temperatures) == 3  # every attempt ran
+        assert all(t == 0.7 for t in seen_temperatures)
 
 
 # ── run_cover_letters: isolated integration cases ──────────────────────
@@ -289,12 +299,111 @@ class TestRunCoverLettersIntegration:
 
 class _CleanClient:
     """A well-behaved local model: no fabricated numbers, no leaked tools,
-    and names the company (required by _check_company_mentioned)."""
+    names the company (required by _check_company_mentioned), and produces a
+    letter of real length and shape -- validate_cover_letter now rejects a
+    stub in every mode, so a two-line fixture would fail for reasons that
+    have nothing to do with what these integration tests are checking."""
 
     def chat(self, messages, max_tokens=1024, temperature=0.7):
         return (
             "Dear Hiring Manager,\n\n"
-            "I built a reporting workflow that removed a manual process end to end, "
-            "and I'd bring that same instinct to Acme.\n\n"
-            "Happy to discuss further.\n\nJordan"
+            "I built a reporting workflow that removed a manual end-of-month "
+            "process end to end, from the ingest job through to the queries the "
+            "finance team actually ran. That is the same shape of problem Acme "
+            "describes in this posting, and it is the part of the work I like "
+            "most.\n\n"
+            "Most of my production experience is backend: services owned end to "
+            "end, deployed and monitored rather than handed over at merge. I have "
+            "spent as much time on the failure paths as the happy ones, which is "
+            "usually where the interesting bugs live, and I am comfortable being "
+            "the person who goes and finds them.\n\n"
+            "The service ownership Acme describes is the reason I applied. "
+            "Happy to walk through any of this in more detail.\n\n"
+            "Sincerely,\n\nJordan"
         )
+
+
+# ── Structural integrity: the 2026-08-25 shipped-garbage regressions ────
+#
+# Five letters shipped with cover_letter_passed=1 after the deterministic
+# numeric fallback had gutted them. Each case below is one of those letters,
+# reduced to the shape that made it through. They are regression tests in
+# the literal sense: every one of them passed validation at the time.
+
+class TestStructuralValidation:
+    def _wrap(self, body: str) -> str:
+        return f"Dear Hiring Manager,\n\n{body}\n\nSincerely,\n\nJordan"
+
+    def test_orphaned_percent_is_rejected(self):
+        """"...with % accuracy" -- the digit-blanking fallback's signature."""
+        from applypilot.scoring.validator import validate_cover_letter
+
+        letter = self._wrap(
+            "I built a machine-learning pipeline for signal processing that "
+            "classifies hand gestures with % accuracy, solving the same problem "
+            "your team is facing. This system also includes a correction module "
+            "that improved robustness by reducing overfitting by %. At Acme I "
+            "designed and shipped an audit-event system across the backend, the "
+            "hub and the datastore, which kept data integrity intact in a live "
+            "production environment under real load."
+        )
+        result = validate_cover_letter(letter, mode="lenient")
+        assert result["passed"] is False
+        assert any("%" in e for e in result["errors"])
+
+    def test_dangling_opener_is_rejected(self):
+        """A first body paragraph opening on a referent that was deleted."""
+        from applypilot.scoring.validator import validate_cover_letter
+
+        letter = self._wrap(
+            "This directly addresses the challenge of developing robust models "
+            "from noisy, real-world data, a core requirement for the research "
+            "work described in the posting and something I have spent a good "
+            "deal of time on.\n\n"
+            "These results demonstrate an ability to build models with Python "
+            "and scikit-learn, skills that apply directly to the analysis work "
+            "your team does day to day across its research systems."
+        )
+        result = validate_cover_letter(letter, mode="lenient")
+        assert result["passed"] is False
+        assert any("back-reference" in e for e in result["errors"])
+
+    def test_midletter_back_reference_is_allowed(self):
+        """Only the FIRST body paragraph can dangle -- a later "That ..."
+        points at the paragraph above it and is ordinary English."""
+        from applypilot.scoring.validator import has_dangling_reference
+
+        letter = self._wrap(
+            "I built a reporting workflow that removed a manual end-of-month "
+            "process, from ingest through to the queries the finance team "
+            "actually ran.\n\n"
+            "That combination of ownership and follow-through is what I would "
+            "bring here, and it is why the posting caught my attention in the "
+            "first place rather than any one technology on the list."
+        )
+        assert has_dangling_reference(letter) is False
+
+    def test_stub_letter_is_rejected_even_in_lenient_mode(self):
+        """lenient tolerates style sins, not a letter with holes in it --
+        and lenient is what a local provider runs in by default."""
+        from applypilot.scoring.validator import validate_cover_letter
+
+        letter = self._wrap(
+            "At Acme I designed and shipped an audit-event system across the "
+            "backend and the datastore."
+        )
+        result = validate_cover_letter(letter, mode="lenient")
+        assert result["passed"] is False
+        assert any("Too short" in e for e in result["errors"])
+
+    def test_strip_no_longer_blanks_digits(self):
+        """The fallback drops the paragraph rather than leaving its units
+        stranded. Less text is recoverable; mangled text is not."""
+        from applypilot.scoring.validator import strip_numbered_sentences
+
+        stripped = strip_numbered_sentences(
+            "Built it and reached 92% accuracy. Improved it by a further 15%.\n\n"
+            "Owned the service end to end."
+        )
+        assert "%" not in stripped
+        assert stripped == "Owned the service end to end."
