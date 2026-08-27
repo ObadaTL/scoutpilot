@@ -222,15 +222,18 @@ class TestEvaluateCvObservations:
         )
         assert len(findings) == 1
 
-    def test_same_work_pair_is_flagged(self):
+    def test_same_work_pairs_no_longer_penalised(self):
+        """Removed 2026-08-27: check_no_cross_section_duplicates decides this
+        in code from the fact bank, over every bullet pair in the document.
+        A stale key left in an extraction must be ignored, not double-count."""
         observations = {
             "bullet_counts": {},
             "header_restating_bullets": [], "bullet_jd_relevance": [],
             "same_work_pairs": [["Built two parallel ML pipelines", "Built dual ML pipelines"]],
         }
         findings, score = evaluate_cv_observations(observations)
-        assert len(findings) == 1
-        assert "same work" in findings[0]
+        assert findings == []
+        assert score == 10.0
 
     def test_score_never_goes_below_zero(self):
         observations = {

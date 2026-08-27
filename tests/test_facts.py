@@ -516,6 +516,113 @@ class TestCrossSectionDuplicateAssertion:
         except BulletPlacementViolation as e:
             assert "emg.dual" in e.reasons[0]
 
+    def test_raises_on_identical_bullet_twice_in_one_entry(self):
+        """The blind spot the projects-vs-experience loop had by
+        construction: two bullets under the SAME heading were never held up
+        against each other at all."""
+        from applypilot.facts import BulletPlacementViolation
+        from applypilot.scoring.tailor import check_no_cross_section_duplicates
+        data = {
+            "projects": [{"header": "EMG Project", "bullets": [
+                "Built two parallel ML pipelines on EMG signals.",
+                "Built two parallel ML pipelines on EMG signals.",
+            ]}],
+        }
+        try:
+            check_no_cross_section_duplicates(data)
+            assert False, "expected BulletPlacementViolation"
+        except BulletPlacementViolation as e:
+            assert "twice under" in e.reasons[0]
+            assert "EMG Project" in e.reasons[0]
+
+    def test_raises_on_reworded_duplicate_inside_one_entry(self):
+        """The exact pairing named in _likely_fact_id's docstring: 'Built
+        dual ML pipelines...' against a fact worded 'Built 2 parallel ML
+        pipelines...'. No shared fact id at resolution time and too little
+        literal overlap for text equality -- only _likely_fact_id unifies
+        them, and only an all-pairs loop ever compares them."""
+        from applypilot.facts import BulletPlacementViolation, Fact, FactBank
+        from applypilot.scoring.tailor import check_no_cross_section_duplicates
+
+        bank = FactBank(
+            [
+                Fact(id="emg.dual", tier="verified", numbers=[2], source="emg",
+                     variants={"short": "Built 2 parallel ML pipelines on surface-EMG signals in Python/scikit-learn"},
+                     evidence="resume: 2 pipelines"),
+            ],
+            unfilled=[], forbidden=[],
+        )
+        data = {
+            "projects": [{"header": "EMG Project", "bullets": [
+                "Built two parallel machine-learning pipelines for surface-EMG signal processing in Python",
+                "Built dual ML pipelines in Python and scikit-learn for hand-gesture classification from surface-EMG signals",
+            ]}],
+        }
+        try:
+            check_no_cross_section_duplicates(data, fact_bank=bank)
+            assert False, "expected BulletPlacementViolation"
+        except BulletPlacementViolation as e:
+            assert "emg.dual" in e.reasons[0]
+            assert "Two bullets under" in e.reasons[0]
+
+    def test_raises_on_reworded_duplicate_across_entries_in_one_section(self):
+        """Same section, two different headings -- also invisible to the old
+        loop, which only ever walked projects against experience."""
+        from applypilot.facts import BulletPlacementViolation, Fact, FactBank
+        from applypilot.scoring.tailor import check_no_cross_section_duplicates
+
+        bank = FactBank(
+            [
+                Fact(id="emg.dual", tier="verified", numbers=[2], source="emg",
+                     variants={"short": "Built 2 parallel ML pipelines on surface-EMG signals in Python/scikit-learn"},
+                     evidence="resume: 2 pipelines"),
+            ],
+            unfilled=[], forbidden=[],
+        )
+        data = {
+            "projects": [
+                {"header": "EMG Gesture Recognition", "bullets": [
+                    "Built two parallel machine-learning pipelines for surface-EMG signal processing in Python",
+                ]},
+                {"header": "EMG Biometrics", "bullets": [
+                    "Built dual ML pipelines in Python and scikit-learn for hand-gesture classification from surface-EMG signals",
+                ]},
+            ],
+        }
+        try:
+            check_no_cross_section_duplicates(data, fact_bank=bank)
+            assert False, "expected BulletPlacementViolation"
+        except BulletPlacementViolation as e:
+            assert "emg.dual" in e.reasons[0]
+            assert "EMG Gesture Recognition" in e.reasons[0]
+            assert "EMG Biometrics" in e.reasons[0]
+
+    def test_two_distinct_bullets_in_one_entry_are_not_a_duplicate(self):
+        """All-pairs must not turn every multi-bullet entry into a finding.
+        Every CV in the 2026-08-26 corpus had 2-9 bullets under one heading
+        and none of them was a self-duplicate."""
+        from applypilot.facts import Fact, FactBank
+        from applypilot.scoring.tailor import check_no_cross_section_duplicates
+
+        bank = FactBank(
+            [
+                Fact(id="emg.dual", tier="verified", numbers=[2], source="emg",
+                     variants={"short": "Built 2 parallel ML pipelines on surface-EMG signals in Python/scikit-learn"},
+                     evidence="resume: 2 pipelines"),
+                Fact(id="emg.leakage", tier="verified", numbers=[], source="emg",
+                     variants={"short": "Diagnosed and corrected evaluation data-leakage that had inflated reported accuracy"},
+                     evidence="resume: leakage"),
+            ],
+            unfilled=[], forbidden=[],
+        )
+        data = {
+            "projects": [{"header": "EMG Project", "bullets": [
+                "Built 2 parallel ML pipelines on surface-EMG signals in Python/scikit-learn",
+                "Diagnosed and corrected evaluation data-leakage that had inflated reported accuracy",
+            ]}],
+        }
+        check_no_cross_section_duplicates(data, fact_bank=bank)  # must not raise
+
     def test_no_fact_bank_falls_back_to_exact_text_only(self):
         """Backward compatible: omitting fact_bank still catches exact
         duplicates, just not paraphrased ones."""

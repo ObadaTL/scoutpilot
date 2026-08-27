@@ -5,11 +5,18 @@ of it is a rule violation: nothing here is fabricated, misplaced, or an
 exact/paraphrased duplicate (NumericGuard, BulletPlacementViolation,
 ToolLeakGuard, and check_no_cross_section_duplicates already own those). A
 bullet can be perfectly true and still be a restatement of its own job
-title, or address nothing in the posting, or say the same thing as another
-bullet in different-enough words that the fact-id/text-equality dedup in
-tailor.py never saw it as a duplicate at all -- and a cover letter sentence
-can be true in spirit while asserting something the CV itself never
-actually backs.
+title, or address nothing in the posting -- and a cover letter sentence can
+be true in spirit while asserting something the CV itself never actually
+backs.
+
+A SAME_WORK_PAIRS question used to live here, asking the model whether two
+bullets described the same underlying work. It was removed on 2026-08-27:
+check_no_cross_section_duplicates now compares every bullet pair in the
+document, including pairs inside one section, and decides the same question
+from the fact bank in code. Measured across the 2026-08-26 corpus, this
+model answers countable questions reliably and semantic ones unreliably, so
+where a check can be made structural it should be -- and it should then run
+in one place, not two.
 
 DESIGN CONSTRAINT -- read before changing any prompt here: the critic is
 NEVER asked for a verdict. A small local model asked "is this good?" or
@@ -105,7 +112,6 @@ def _normalize_header(header: str) -> str:
 _WEIGHT_BULLET_COUNT = 1.5
 _WEIGHT_HEADER_RESTATE = 1.0
 _WEIGHT_JD_IRRELEVANCE = 1.5
-_WEIGHT_SAME_WORK = 1.5
 _WEIGHT_UNSUPPORTED_CLAIM = 2.0
 
 
@@ -125,7 +131,7 @@ class CriticResult:
 
 _CV_CRITIC_INSTRUCTIONS = """You are extracting factual observations from a CV, tailored for a specific job. Do NOT evaluate, judge, rate, or comment on quality anywhere in your answer -- only quote and count what is literally present in the text you are given. Every quote must be copied EXACTLY as it appears in the CV; do not paraphrase, summarize, correct, or shorten it.
 
-Answer these four extraction questions about the CV:
+Answer these three extraction questions about the CV:
 
 1. BULLET_COUNTS: For each entry under the CV's EXPERIENCE section, count how many bullet lines appear under it. Key each count by that entry's exact header line (e.g. "Software Engineering Intern | Acme Ltd"), value is the integer count of bullets under it.
 
@@ -133,9 +139,7 @@ Answer these four extraction questions about the CV:
 
 3. BULLET_JD_RELEVANCE: For EVERY bullet on the CV (every bullet, in both experience and projects, one entry per bullet), quote the specific line from the JOB DESCRIPTION that bullet most directly addresses. If no single line in the job description matches what that bullet describes, write exactly the word NONE instead of a quote for that bullet.
 
-4. SAME_WORK_PAIRS: Find any two bullets anywhere on this CV (same section or different sections) that describe the same real underlying piece of work, just worded differently -- not two different things that happen to share a tool or keyword, the SAME achievement restated. Quote both bullets as a pair, each copied exactly. Empty list if none.
-
-Output ONLY a JSON object with exactly these four keys: bullet_counts, header_restating_bullets, bullet_jd_relevance, same_work_pairs. No commentary, no markdown fences, no text before or after the JSON."""
+Output ONLY a JSON object with exactly these three keys: bullet_counts, header_restating_bullets, bullet_jd_relevance. No commentary, no markdown fences, no text before or after the JSON."""
 
 _CV_CRITIC_SCHEMA = {
     "type": "object",
@@ -150,9 +154,8 @@ _CV_CRITIC_SCHEMA = {
                 "required": ["bullet", "jd_line"],
             },
         },
-        "same_work_pairs": {"type": "array", "items": {"type": "array", "items": {"type": "string"}}},
     },
-    "required": ["bullet_counts", "header_restating_bullets", "bullet_jd_relevance", "same_work_pairs"],
+    "required": ["bullet_counts", "header_restating_bullets", "bullet_jd_relevance"],
 }
 
 
@@ -226,13 +229,6 @@ def evaluate_cv_observations(
                 f"description (over {_JD_IRRELEVANCE_MAX_FRACTION:.0%}){exempt_note}."
             )
             penalty += _WEIGHT_JD_IRRELEVANCE
-
-    pairs = observations.get("same_work_pairs")
-    if isinstance(pairs, list):
-        for pair in pairs:
-            if isinstance(pair, list) and len(pair) == 2 and all(isinstance(p, str) and p.strip() for p in pair):
-                findings.append(f"Two bullets describe the same work: {pair[0]!r} and {pair[1]!r}")
-                penalty += _WEIGHT_SAME_WORK
 
     return findings, max(0.0, round(10.0 - penalty, 1))
 

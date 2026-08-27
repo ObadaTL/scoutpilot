@@ -1010,59 +1010,79 @@ def _likely_fact_id(text: str, fact_bank: "FactBank") -> str | None:
     return best[1] if best else None
 
 
+_DUP_CHECK_SECTIONS = ("experience", "projects")
+
+
 def check_no_cross_section_duplicates(resolved_data: dict, fact_bank: "FactBank | None" = None) -> None:
-    """Hard assertion: no bullet's text may appear in more than one section
-    of the assembled CV -- and, when `fact_bank` is given, no two bullets
-    describing the SAME verified fact may either, even paraphrased
-    differently in each section (see _likely_fact_id).
+    """Hard assertion: the same claim may not appear twice anywhere in the
+    assembled CV -- not as repeated text, and, when `fact_bank` is given,
+    not as the same verified fact worded two different ways (see
+    _likely_fact_id).
+
+    Compares every bullet against every other bullet in the document. It
+    used to compare only PROJECTS bullets against EXPERIENCE ones, which
+    made a duplicate *inside* one section structurally invisible: the two
+    ApplyPilot bullets under a single PROJECTS entry, or the two EMG
+    bullets under another, were never held up against each other at all.
+    Measured on the 2026-08-26 validation corpus, that blind spot was the
+    single largest residual defect -- 5 of the 10 CVs shipped a reworded
+    self-duplicate the projects-vs-experience loop could not see. The name
+    is historical; the check is document-wide.
+
+    This also makes the critic's old SAME_WORK_PAIRS question redundant, and
+    it was removed with this change: "are these two bullets the same work"
+    is a semantic judgment a 14B model answers unreliably, and everything
+    it was catching is decidable here in code from the fact bank instead.
 
     _resolve_fact_bullets' fact-id dedup and _entry_owns_fact's ownership
     check exist specifically to make this unreachable -- this is the
     backstop that fails generation outright (see tailor_resume's caller) if
     they somehow didn't, rather than shipping a CV with the same
-    achievement typed twice under two different headings.
+    achievement typed twice.
 
     Raises:
         BulletPlacementViolation: with one reason per duplicate found.
     """
-    def _bullets_of(section: str) -> list[tuple[str, str, str]]:
-        out = []
+    bullets: list[tuple[str, str, str, str, str | None]] = []
+    for section in _DUP_CHECK_SECTIONS:
         for entry in resolved_data.get(section) or []:
             if not isinstance(entry, dict):
                 continue
             header = str(entry.get("header") or "?")
             for b in entry.get("bullets", []):
-                out.append((_normalize_bullet_for_dup_check(b), header, str(b)))
-        return out
+                original = str(b)
+                fact_id = _likely_fact_id(original, fact_bank) if fact_bank is not None else None
+                bullets.append(
+                    (section, header, _normalize_bullet_for_dup_check(b), original, fact_id)
+                )
 
-    exp_bullets = _bullets_of("experience")
-    exp_by_text: dict[str, str] = {}
-    for norm, header, _original in exp_bullets:
-        exp_by_text.setdefault(norm, header)
-    exp_by_fact: dict[str, str] = {}
-    if fact_bank is not None:
-        for norm, header, original in exp_bullets:
-            fact_id = _likely_fact_id(original, fact_bank)
-            if fact_id is not None:
-                exp_by_fact.setdefault(fact_id, header)
+    def _where(section: str, header: str) -> str:
+        return f"'{header}' ({section})"
 
     reasons = []
-    for norm, header, original in _bullets_of("projects"):
-        other_header = exp_by_text.get(norm)
-        if other_header is None and fact_bank is not None:
-            fact_id = _likely_fact_id(original, fact_bank)
-            if fact_id is not None and fact_id in exp_by_fact:
-                other_header = exp_by_fact[fact_id]
-                reasons.append(
-                    f"Bullet under '{other_header}' (experience) and '{header}' (projects) both "
-                    f"describe fact '{fact_id}', just worded differently: {original[:100]!r}"
+    for i, (sec_a, head_a, norm_a, _orig_a, fact_a) in enumerate(bullets):
+        for sec_b, head_b, norm_b, orig_b, fact_b in bullets[i + 1:]:
+            same_place = sec_a == sec_b and head_a == head_b
+            if norm_a == norm_b:
+                if same_place:
+                    reasons.append(
+                        f"Bullet appears twice under {_where(sec_a, head_a)}: {orig_b[:100]!r}"
+                    )
+                else:
+                    reasons.append(
+                        f"Bullet appears under both {_where(sec_a, head_a)} and "
+                        f"{_where(sec_b, head_b)}: {orig_b[:100]!r}"
+                    )
+            elif fact_a is not None and fact_a == fact_b:
+                place = (
+                    f"Two bullets under {_where(sec_a, head_a)}"
+                    if same_place
+                    else f"Bullet under {_where(sec_a, head_a)} and {_where(sec_b, head_b)}"
                 )
-                continue
-        if other_header is not None:
-            reasons.append(
-                f"Bullet appears under both '{other_header}' (experience) and "
-                f"'{header}' (projects): {original[:100]!r}"
-            )
+                reasons.append(
+                    f"{place} both describe fact '{fact_a}', just worded differently: "
+                    f"{orig_b[:100]!r}"
+                )
     if reasons:
         raise BulletPlacementViolation(reasons)
 
