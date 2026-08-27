@@ -4,10 +4,9 @@ Catches weak-but-true content none of the other guards can, because none
 of it is a rule violation: nothing here is fabricated, misplaced, or an
 exact/paraphrased duplicate (NumericGuard, BulletPlacementViolation,
 ToolLeakGuard, and check_no_cross_section_duplicates already own those). A
-bullet can be perfectly true and still be a restatement of its own job
-title, or address nothing in the posting -- and a cover letter sentence can
-be true in spirit while asserting something the CV itself never actually
-backs.
+bullet can be perfectly true and still address nothing in the posting --
+and a cover letter sentence can be true in spirit while asserting something
+the CV itself never actually backs.
 
 A SAME_WORK_PAIRS question used to live here, asking the model whether two
 bullets described the same underlying work. It was removed on 2026-08-27:
@@ -17,6 +16,12 @@ from the fact bank in code. Measured across the 2026-08-26 corpus, this
 model answers countable questions reliably and semantic ones unreliably, so
 where a check can be made structural it should be -- and it should then run
 in one place, not two.
+
+A HEADER_RESTATING_BULLETS question went the same way on 2026-08-27, for a
+blunter reason: it returned an empty list on all 10 extractions across all
+6 postings in the validation corpus, including CVs carrying the defect in
+plain sight. tailor.find_header_restating_bullets now decides it by
+comparing each bullet against its own header, subtitle and date range.
 
 DESIGN CONSTRAINT -- read before changing any prompt here: the critic is
 NEVER asked for a verdict. A small local model asked "is this good?" or
@@ -97,6 +102,66 @@ def _is_differentiator_bullet(text: str) -> bool:
     return bool(_DIFFERENTIATOR_BULLET_RE.search(text or ""))
 
 
+def _quote_key(text: str) -> str:
+    """Normalised form for checking a model-supplied quote against the CV.
+
+    Case and whitespace are normalised and a leading bullet marker is
+    stripped, because the model quotes bullets AS RENDERED ("- Built ...")
+    while nothing else in the pipeline carries the dash. Nothing else is
+    normalised: the point of this check is that the quote is verbatim, so
+    loosening it any further would defeat it.
+    """
+    return " ".join(re.sub(r"^[-\u2022*]\s*", "", (text or "").strip()).split()).casefold()
+
+
+def drop_unverifiable_quotes(observations: dict, cv_text: str) -> tuple[dict, list[str]]:
+    """Remove any model-quoted bullet that does not actually occur in the CV.
+
+    The critic is built on the promise that every finding traces back to
+    text a human can go re-read (see the module docstring). A quote that
+    isn't in the document breaks that promise outright, and it happens: on
+    2026-08-26, r1 Slovakia, the critic reported
+    '- Corrected data-leakage that inflated model accuracy' as a bullet.
+    That line appears nowhere in that CV. The real text was a clause inside
+    the SUMMARY paragraph -- 'diagnosing and correcting data-leakage that
+    inflated model accuracy' -- which the model reformatted into a bullet
+    and then reported on. A finding built on invented evidence is worse
+    than no finding: it goes into avoid_notes and asks the next attempt to
+    fix something that was never there.
+
+    Containment is checked against the WHOLE rendered CV, not against the
+    bullet lines alone, which is the rule as specified. Note the
+    consequence: a real SUMMARY sentence quoted as though it were a bullet
+    still passes here. Only quotes with no basis in the document at all are
+    dropped.
+
+    Returns:
+        (cleaned observations, list of dropped quotes). The input is never
+        mutated. With no cv_text, nothing is dropped.
+    """
+    if not cv_text:
+        return observations, []
+
+    hay = " ".join(cv_text.split()).casefold()
+    dropped: list[str] = []
+    cleaned = dict(observations)
+
+    relevance = observations.get("bullet_jd_relevance")
+    if isinstance(relevance, list):
+        kept_rel = []
+        for r in relevance:
+            if not isinstance(r, dict):
+                continue
+            q = _quote_key(str(r.get("bullet", "")))
+            if q and q in hay:
+                kept_rel.append(r)
+            else:
+                dropped.append(str(r.get("bullet", "")))
+        cleaned["bullet_jd_relevance"] = kept_rel
+
+    return cleaned, dropped
+
+
 def _normalize_header(header: str) -> str:
     """Loose key for matching a header the model quoted back out of the CV
     against the same header as tailor.py built it. Only case and whitespace
@@ -110,7 +175,6 @@ def _normalize_header(header: str) -> str:
 # it's built from. Adjust these, not a black-box formula, if the balance
 # ever needs to change.
 _WEIGHT_BULLET_COUNT = 1.5
-_WEIGHT_HEADER_RESTATE = 1.0
 _WEIGHT_JD_IRRELEVANCE = 1.5
 _WEIGHT_UNSUPPORTED_CLAIM = 2.0
 
@@ -125,27 +189,27 @@ class CriticResult:
     score: float
     findings: list[str] = field(default_factory=list)
     raw: dict = field(default_factory=dict)
+    # Quotes the model attributed to the CV that are not in it, dropped
+    # before any threshold ran. See drop_unverifiable_quotes.
+    dropped_quotes: list[str] = field(default_factory=list)
 
 
 # ── CV critic ────────────────────────────────────────────────────────────
 
 _CV_CRITIC_INSTRUCTIONS = """You are extracting factual observations from a CV, tailored for a specific job. Do NOT evaluate, judge, rate, or comment on quality anywhere in your answer -- only quote and count what is literally present in the text you are given. Every quote must be copied EXACTLY as it appears in the CV; do not paraphrase, summarize, correct, or shorten it.
 
-Answer these three extraction questions about the CV:
+Answer these two extraction questions about the CV:
 
 1. BULLET_COUNTS: For each entry under the CV's EXPERIENCE section, count how many bullet lines appear under it. Key each count by that entry's exact header line (e.g. "Software Engineering Intern | Acme Ltd"), value is the integer count of bullets under it.
 
-2. HEADER_RESTATING_BULLETS: A bullet "restates its header" if it adds nothing beyond what its own entry's header/subtitle line already says -- e.g. it just repeats the job title, the company name, or the exact date range in different words, with no other information. Quote every such bullet found anywhere on the CV (experience or projects), copied exactly. Empty list if none.
+2. BULLET_JD_RELEVANCE: For EVERY bullet on the CV (every bullet, in both experience and projects, one entry per bullet), quote the specific line from the JOB DESCRIPTION that bullet most directly addresses. If no single line in the job description matches what that bullet describes, write exactly the word NONE instead of a quote for that bullet.
 
-3. BULLET_JD_RELEVANCE: For EVERY bullet on the CV (every bullet, in both experience and projects, one entry per bullet), quote the specific line from the JOB DESCRIPTION that bullet most directly addresses. If no single line in the job description matches what that bullet describes, write exactly the word NONE instead of a quote for that bullet.
-
-Output ONLY a JSON object with exactly these three keys: bullet_counts, header_restating_bullets, bullet_jd_relevance. No commentary, no markdown fences, no text before or after the JSON."""
+Output ONLY a JSON object with exactly these two keys: bullet_counts, bullet_jd_relevance. No commentary, no markdown fences, no text before or after the JSON."""
 
 _CV_CRITIC_SCHEMA = {
     "type": "object",
     "properties": {
         "bullet_counts": {"type": "object", "additionalProperties": {"type": "integer"}},
-        "header_restating_bullets": {"type": "array", "items": {"type": "string"}},
         "bullet_jd_relevance": {
             "type": "array",
             "items": {
@@ -155,7 +219,7 @@ _CV_CRITIC_SCHEMA = {
             },
         },
     },
-    "required": ["bullet_counts", "header_restating_bullets", "bullet_jd_relevance"],
+    "required": ["bullet_counts", "bullet_jd_relevance"],
 }
 
 
@@ -204,13 +268,6 @@ def evaluate_cv_observations(
                 findings.append(f"'{header}' has {count} bullet(s), above the maximum of {max_bullets}.")
                 penalty += _WEIGHT_BULLET_COUNT
 
-    restaters = observations.get("header_restating_bullets")
-    if isinstance(restaters, list):
-        for b in restaters:
-            if isinstance(b, str) and b.strip():
-                findings.append(f"Bullet restates its own entry's header/date range: {b.strip()!r}")
-                penalty += _WEIGHT_HEADER_RESTATE
-
     relevance = observations.get("bullet_jd_relevance")
     if isinstance(relevance, list) and relevance:
         counted = [
@@ -244,10 +301,16 @@ def run_cv_critic(
     ]
     raw = client.chat(messages, max_tokens=2048, temperature=0.0, json_schema=_CV_CRITIC_SCHEMA)
     observations = extract_json(raw)
+    observations, dropped = drop_unverifiable_quotes(observations, cv_text)
+    if dropped:
+        log.warning(
+            "Critic quoted %d bullet(s) that are not in the CV; dropped before scoring: %s",
+            len(dropped), "; ".join(repr(d[:80]) for d in dropped[:3]),
+        )
     findings, score = evaluate_cv_observations(
         observations, min_bullets, max_bullets, min_bullets_by_header=min_bullets_by_header,
     )
-    return CriticResult(score=score, findings=findings, raw=observations)
+    return CriticResult(score=score, findings=findings, raw=observations, dropped_quotes=dropped)
 
 
 # ── Cover letter critic ─────────────────────────────────────────────────

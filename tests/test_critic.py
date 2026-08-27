@@ -69,15 +69,17 @@ class TestEvaluateCvObservations:
         assert len(findings) == 1
         assert "above the maximum" in findings[0]
 
-    def test_header_restating_bullet_is_flagged(self):
+    def test_header_restating_no_longer_penalised(self):
+        """Removed 2026-08-27: tailor.find_header_restating_bullets decides
+        this deterministically. A stale key in an extraction is ignored."""
         observations = {
             "bullet_counts": {},
             "header_restating_bullets": ["Worked at Kraydel from Jul 2022 to May 2023"],
-            "bullet_jd_relevance": [], "same_work_pairs": [],
+            "bullet_jd_relevance": [],
         }
         findings, score = evaluate_cv_observations(observations)
-        assert len(findings) == 1
-        assert "restates its own entry's header" in findings[0]
+        assert findings == []
+        assert score == 10.0
 
     def test_over_half_none_relevance_is_flagged(self):
         observations = {
@@ -348,3 +350,137 @@ class TestBuildBulletFloorMap:
         data = {"experience": ["not a dict", {"subtitle": "no header", "bullets": ["x"]}],
                 "projects": None}
         assert build_bullet_floor_map(data, self._bank(), "any job") == {}
+
+
+class TestDropUnverifiableQuotes:
+    """The guard that keeps a finding from resting on a quote the CV does
+    not contain. Origin: 2026-08-26, r1 Slovakia -- the critic reported
+    '- Corrected data-leakage that inflated model accuracy' as a bullet;
+    that line is nowhere in that CV, the SUMMARY said 'diagnosing and
+    correcting data-leakage that inflated model accuracy'."""
+
+    CV = (
+        "SUMMARY\n"
+        "Built two parallel machine-learning pipelines, diagnosing and correcting "
+        "data-leakage that inflated model accuracy.\n\n"
+        "EXPERIENCE\n"
+        "Software Engineering Intern | Kraydel LTD\n"
+        "- Designed and shipped an end-to-end audit-event system\n"
+    )
+
+    def test_quote_absent_from_the_cv_is_dropped(self):
+        from applypilot.scoring.critic import drop_unverifiable_quotes
+        obs = {"bullet_counts": {}, "bullet_jd_relevance": [
+            {"bullet": "- Corrected data-leakage that inflated model accuracy", "jd_line": "NONE"},
+        ]}
+        cleaned, dropped = drop_unverifiable_quotes(obs, self.CV)
+        assert cleaned["bullet_jd_relevance"] == []
+        assert len(dropped) == 1
+
+    def test_real_bullet_survives_despite_the_rendered_dash(self):
+        """The model quotes bullets as rendered; resolved bullets have no
+        dash. Stripping it is the whole reason _quote_key exists."""
+        from applypilot.scoring.critic import drop_unverifiable_quotes
+        obs = {"bullet_counts": {}, "bullet_jd_relevance": [
+            {"bullet": "- Designed and shipped an end-to-end audit-event system", "jd_line": "x"},
+        ]}
+        cleaned, dropped = drop_unverifiable_quotes(obs, self.CV)
+        assert dropped == []
+        assert len(cleaned["bullet_jd_relevance"]) == 1
+
+    def test_a_summary_sentence_quoted_as_a_bullet_still_passes(self):
+        """Documented consequence of the rule as specified: containment is
+        checked against the whole CV, so real summary text quoted as a
+        bullet is not a fabrication. Only text with no basis at all goes."""
+        from applypilot.scoring.critic import drop_unverifiable_quotes
+        obs = {"bullet_counts": {}, "bullet_jd_relevance": [
+            {"bullet": "diagnosing and correcting data-leakage that inflated model accuracy",
+             "jd_line": "NONE"},
+        ]}
+        cleaned, dropped = drop_unverifiable_quotes(obs, self.CV)
+        assert dropped == []
+
+    def test_dropping_shrinks_the_relevance_denominator(self):
+        from applypilot.scoring.critic import drop_unverifiable_quotes
+        obs = {"bullet_counts": {}, "bullet_jd_relevance": [
+            {"bullet": "- Designed and shipped an end-to-end audit-event system", "jd_line": "x"},
+            {"bullet": "Invented bullet that is not in the document", "jd_line": "NONE"},
+        ]}
+        cleaned, dropped = drop_unverifiable_quotes(obs, self.CV)
+        assert len(cleaned["bullet_jd_relevance"]) == 1
+        assert len(dropped) == 1
+
+    def test_no_cv_text_drops_nothing(self):
+        from applypilot.scoring.critic import drop_unverifiable_quotes
+        obs = {"bullet_counts": {}, "bullet_jd_relevance": [{"bullet": "anything", "jd_line": "x"}]}
+        cleaned, dropped = drop_unverifiable_quotes(obs, "")
+        assert dropped == []
+        assert cleaned is obs
+
+
+class TestFindHeaderRestatingBullets:
+    """The code check that replaced the model clause."""
+
+    def test_bullet_adding_nothing_to_its_header_is_flagged(self):
+        from applypilot.scoring.tailor import find_header_restating_bullets
+        data = {"experience": [{
+            "header": "Software Engineering Intern | Kraydel LTD - Belfast",
+            "subtitle": "Kotlin, Java | Jul 2022 - May 2023",
+            "bullets": ["Software engineering intern at Kraydel LTD in Belfast"],
+        }]}
+        v = find_header_restating_bullets(data)
+        assert len(v) == 1 and "adds nothing" in v[0]
+
+    def test_duration_restating_the_date_range_is_flagged(self):
+        """The exact bullet the model never flagged: '11-month industry
+        placement ...' under a subtitle already reading Jul 2022 - May 2023."""
+        from applypilot.scoring.tailor import find_header_restating_bullets
+        data = {"experience": [{
+            "header": "Software Engineering Intern | Kraydel LTD - Belfast",
+            "subtitle": "Kotlin, Java | Jul 2022 - May 2023",
+            "bullets": ["11-month industry placement on a production video-care platform"],
+        }]}
+        v = find_header_restating_bullets(data)
+        assert len(v) == 1 and "restates the date range as a duration" in v[0]
+
+    def test_repeating_the_date_range_verbatim_is_flagged(self):
+        from applypilot.scoring.tailor import find_header_restating_bullets
+        data = {"experience": [{
+            "header": "Software Engineering Intern | Kraydel LTD",
+            "subtitle": "Kotlin, Java | Jul 2022 - May 2023",
+            "bullets": ["Worked on the platform from Jul 2022 - May 2023 shipping audit events"],
+        }]}
+        v = find_header_restating_bullets(data)
+        assert len(v) == 1 and "repeats the entry's own date range" in v[0]
+
+    def test_real_bullet_is_not_flagged(self):
+        from applypilot.scoring.tailor import find_header_restating_bullets
+        data = {"experience": [{
+            "header": "Software Engineering Intern | Kraydel LTD - Belfast",
+            "subtitle": "Kotlin, Java | Jul 2022 - May 2023",
+            "bullets": ["Designed and shipped an end-to-end audit-event system across hub, cloud and DynamoDB"],
+        }]}
+        assert find_header_restating_bullets(data) == []
+
+    def test_a_year_shared_with_the_date_range_is_not_a_restatement(self):
+        """'1st place, QUB Dragon's Den 2024' under 'Apr 2024 - Mar 2026'
+        shares a year and is still real content. A bare year must never
+        flag on its own."""
+        from applypilot.scoring.tailor import find_header_restating_bullets
+        data = {"experience": [{
+            "header": "Co-Founder & Shareholder | VIOFEEL Ltd",
+            "subtitle": "MedTech Wearable Tech | Apr 2024 - Mar 2026",
+            "bullets": ["1st place, QUB Dragon's Den 2024"],
+        }]}
+        assert find_header_restating_bullets(data) == []
+
+    def test_open_ended_range_never_produces_a_duration_finding(self):
+        """'Aug 2026 - Present' has no fixed span, so a duration claim
+        against it can't be decided deterministically and must not fire."""
+        from applypilot.scoring.tailor import find_header_restating_bullets
+        data = {"projects": [{
+            "header": "ApplyPilot",
+            "subtitle": "Python, SQLite | Aug 2026 - Present",
+            "bullets": ["Spent 3 months building an autonomous application pipeline in Python"],
+        }]}
+        assert find_header_restating_bullets(data) == []

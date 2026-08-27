@@ -1186,6 +1186,104 @@ def build_bullet_floor_map(
     return floors
 
 
+_MONTHS = {
+    "jan": 1, "feb": 2, "mar": 3, "apr": 4, "may": 5, "jun": 6,
+    "jul": 7, "aug": 8, "sep": 9, "oct": 10, "nov": 11, "dec": 12,
+}
+_DATE_POINT = r"(?:([A-Za-z]{3,9})\.?\s+)?((?:19|20)\d{2})"
+_DATE_RANGE_RE = re.compile(
+    rf"{_DATE_POINT}\s*(?:-|--|\u2013|\u2014|to)\s*(?:{_DATE_POINT}|(present|current|now))",
+    re.IGNORECASE,
+)
+_DURATION_RE = re.compile(r"(\d+)[\s-]*(month|year)s?\b", re.IGNORECASE)
+
+
+def _entry_span_months(text: str) -> int | None:
+    """Length in months of the first date range in `text`, or None.
+
+    An open-ended range ("Apr 2024 - Present") returns None: its length
+    depends on today's date, so any duration claim against it would be a
+    moving target and this must stay deterministic.
+    """
+    m = _DATE_RANGE_RE.search(text or "")
+    if not m:
+        return None
+    smon, syear, emon, eyear, present = m.groups()
+    if present or not eyear:
+        return None
+    s_m = _MONTHS.get((smon or "jan")[:3].lower(), 1)
+    e_m = _MONTHS.get((emon or "dec")[:3].lower(), 12)
+    return (int(eyear) - int(syear)) * 12 + (e_m - s_m)
+
+
+def find_header_restating_bullets(resolved_data: dict) -> list[str]:
+    """Bullets that only say again what their own entry header already says.
+
+    This replaces a critic prompt clause (HEADER_RESTATING_BULLETS, removed
+    2026-08-27). That clause asked a 14B model to judge whether a bullet
+    "adds nothing beyond its header", and it returned an empty list on
+    every one of 10 extractions across 6 postings -- including CVs where
+    the defect is plainly present. A check that has never once fired is not
+    a check. This is the same question decided in code.
+
+    Three deterministic rules, each independently reportable:
+
+    * NO NEW CONTENT -- every significant word in the bullet already
+      appears in the entry's own header or subtitle, so the bullet cannot
+      be telling the reader anything the two lines above it didn't.
+    * DATE RANGE RESTATED -- the bullet repeats the entry's date range.
+    * DURATION RESTATES THE SPAN -- the bullet claims a duration that is
+      what the header's date range already spells out. The case this was
+      built for: "11-month industry placement ..." under a subtitle
+      reading "... | Jul 2022 - May 2023". A month of slack is allowed
+      because inclusive and exclusive counting differ by one and both
+      readings are honest.
+
+    Returns human-readable violation strings for the avoid_notes retry
+    path, the same shape find_min_bullet_violations returns. Nothing here
+    calls an LLM.
+    """
+    violations: list[str] = []
+    for section in ("experience", "projects"):
+        for entry in resolved_data.get(section) or []:
+            if not isinstance(entry, dict):
+                continue
+            header = str(entry.get("header") or "")
+            subtitle = str(entry.get("subtitle") or "")
+            context = f"{header} {subtitle}"
+            context_words = _significant_words(context)
+            span = _entry_span_months(context)
+            range_match = _DATE_RANGE_RE.search(context)
+            range_key = (
+                " ".join(range_match.group(0).split()).casefold() if range_match else None
+            )
+
+            for b in entry.get("bullets") or []:
+                text = _bullet_text(b)
+                words = _significant_words(text)
+                if words and words <= context_words:
+                    violations.append(
+                        f"Bullet under '{header}' adds nothing its own header/subtitle "
+                        f"doesn't already say: {text[:100]!r}"
+                    )
+                    continue
+                if range_key and range_key in " ".join(text.split()).casefold():
+                    violations.append(
+                        f"Bullet under '{header}' repeats the entry's own date range: {text[:100]!r}"
+                    )
+                    continue
+                if span is not None:
+                    for count, unit in _DURATION_RE.findall(text):
+                        months = int(count) * (12 if unit.lower() == "year" else 1)
+                        if abs(months - span) <= 1:
+                            violations.append(
+                                f"Bullet under '{header}' restates the date range as a duration "
+                                f"({count} {unit}(s) vs the header's own span): {text[:100]!r}"
+                            )
+                            break
+    return violations
+
+
 def _bullet_text(bullet) -> str:
     """Best-effort plain text for a bullet, which may still be a raw
     {"fact": id, "form": ...} dict at this point (canonicalization runs
@@ -1774,6 +1872,20 @@ def tailor_resume(
                 job.get("title", "?"), "; ".join(min_bullet_violations),
             )
             report.setdefault("warnings", []).extend(min_bullet_violations)
+
+        # Header restatement -- deterministic, see find_header_restating_bullets.
+        # Advisory like the min-bullet check above: worth a retry, not worth
+        # refusing to ship a CV over.
+        restating = find_header_restating_bullets(resolved_data)
+        if restating:
+            if not is_last_attempt:
+                avoid_notes.extend(restating)
+                continue
+            log.warning(
+                "Shipping '%s' with header-restating bullet(s): %s",
+                job.get("title", "?"), "; ".join(restating),
+            )
+            report.setdefault("warnings", []).extend(restating)
 
         # Summary rut: prompt instruction + deterministic check + a targeted
         # repair, the same three-part control this module already uses for
