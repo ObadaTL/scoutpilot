@@ -132,6 +132,105 @@ class TestEligibilityGate:
         assert result["score"] == 8
         assert result["gate_reason"] is None
 
+    # ---- work-authorisation gate: false rejections found 2026-08-27 ----
+
+    def _uk_profile(self):
+        """The real profile shape: structured authorisation flags alongside
+        the free-text permit name."""
+        return {
+            "personal": {"country": "United Kingdom"},
+            "work_authorization": {
+                "legally_authorized_to_work": True,
+                "require_sponsorship": False,
+                "work_permit_type": "Settled Status",
+            },
+            "experience": {"years_of_experience_total": "0.9"},
+        }
+
+    def _parsed(self, **kw):
+        base = {"score": 8, "required_country": None,
+                "required_work_auth": None, "min_years_commercial": None}
+        base.update(kw)
+        return base
+
+    def test_settled_status_satisfies_a_uk_right_to_work_requirement(self):
+        """The exact defect: 'Right to work in the UK' vs 'Settled Status'
+        matched as substrings in neither direction, so the gate capped the
+        score at 1 -- on 112 jobs in the live database. Settled status IS an
+        unrestricted right to work in the UK."""
+        from applypilot.scoring.scorer import apply_eligibility_gate
+        result = apply_eligibility_gate(
+            self._parsed(required_work_auth="Right to work in the UK"), self._uk_profile())
+        assert result["score"] == 8
+        assert result["gate_reason"] is None
+
+    def test_iso_country_code_gb_resolves_to_united_kingdom(self):
+        """The most obviously wrong reason in the database, on 30 jobs:
+        'Requires work authorisation/location in GB; profile is based in
+        United Kingdom.' GB was simply missing from the alias map."""
+        from applypilot.scoring.scorer import apply_eligibility_gate
+        result = apply_eligibility_gate(
+            self._parsed(required_country="GB"), self._uk_profile())
+        assert result["score"] == 8
+        assert result["gate_reason"] is None
+
+    def test_requirement_naming_the_home_country_is_satisfied(self):
+        """Covers the security-clearance phrasing that gated 6 more jobs:
+        'UK security cleared or willing & eligible to go through the
+        process' names the candidate's own country and is not a foreign
+        visa category."""
+        from applypilot.scoring.scorer import apply_eligibility_gate
+        result = apply_eligibility_gate(
+            self._parsed(required_work_auth=
+                         "UK security cleared or willing & eligible to go through the process"),
+            self._uk_profile())
+        assert result["gate_reason"] is None
+
+    def test_named_foreign_visa_category_still_gates(self):
+        """The counterpart the fix must not swallow. An unrestricted permit
+        at home says nothing about holding STEM OPT/F1, which names no
+        country and is not a generic right-to-work line."""
+        from applypilot.scoring.scorer import apply_eligibility_gate
+        result = apply_eligibility_gate(
+            self._parsed(required_work_auth="STEM OPT/F1"), self._uk_profile())
+        assert result["score"] == 1
+        assert "STEM OPT/F1" in result["gate_reason"]
+
+    def test_requirement_naming_a_foreign_country_still_gates(self):
+        from applypilot.scoring.scorer import apply_eligibility_gate
+        result = apply_eligibility_gate(
+            self._parsed(required_work_auth="Must be authorized to work in the United States"),
+            self._uk_profile())
+        assert result["score"] == 1
+        assert "United States" in result["gate_reason"]
+
+    def test_candidate_needing_sponsorship_still_gates(self):
+        """The structured flags are what decide it, so a candidate who does
+        need sponsorship is still gated by the same requirement that the
+        settled-status holder passes."""
+        from applypilot.scoring.scorer import apply_eligibility_gate
+        profile = self._uk_profile()
+        profile["work_authorization"] = {
+            "legally_authorized_to_work": False,
+            "require_sponsorship": True,
+            "work_permit_type": "Student visa",
+        }
+        result = apply_eligibility_gate(
+            self._parsed(required_work_auth="Right to work in the UK"), profile)
+        assert result["score"] == 1
+
+    def test_lowercase_us_pronoun_is_not_read_as_a_country(self):
+        """'us' is a pronoun far more often than a country in job text, so
+        the two-letter codes only count when capitalised."""
+        from applypilot.scoring.scorer import _country_in_text
+        assert _country_in_text("Come and build great things with us") is None
+        assert _country_in_text("Authorised to work in the US") == "united states"
+
+    def test_copyright_does_not_match_the_right_to_work_phrase(self):
+        from applypilot.scoring.scorer import _GENERIC_RIGHT_TO_WORK_RE
+        assert not _GENERIC_RIGHT_TO_WORK_RE.search("copyright to work products assigned")
+        assert _GENERIC_RIGHT_TO_WORK_RE.search("must have the right to work here")
+
     def test_country_and_years_combine_to_the_lower_cap(self):
         from applypilot.scoring.scorer import apply_eligibility_gate
         parsed = {"score": 8, "required_country": "United States", "required_work_auth": None, "min_years_commercial": 3}

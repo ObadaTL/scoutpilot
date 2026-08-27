@@ -254,7 +254,85 @@ _COUNTRY_ALIASES: dict[str, str] = {
     "uk": "united kingdom", "u.k.": "united kingdom", "great britain": "united kingdom",
     "britain": "united kingdom", "england": "united kingdom", "scotland": "united kingdom",
     "wales": "united kingdom", "northern ireland": "united kingdom",
+    # ISO-3166 codes. Their absence produced the most obviously wrong gate
+    # reason in the database (30 jobs on 2026-08-27): "Requires work
+    # authorisation/location in GB; profile is based in United Kingdom."
+    "gb": "united kingdom", "gbr": "united kingdom",
+    "united kingdom of great britain and northern ireland": "united kingdom",
+    "usa": "united states", "u.s.a": "united states",
 }
+
+# Permit types that confer an UNRESTRICTED right to work in the holder's own
+# country -- i.e. the holder needs no sponsorship and no employer action.
+# Matched as substrings of the profile's free-text work_permit_type.
+_UNRESTRICTED_PERMITS = (
+    "settled status", "pre-settled status", "eu settlement scheme",
+    "indefinite leave to remain", "ilr", "right of abode",
+    "citizen", "citizenship", "national",
+    "permanent resident", "permanent residency", "green card",
+)
+
+# "UK"/"US" are only country names when capitalised -- lowercase "us" is a
+# pronoun and matched "join us" style boilerplate. Everything else is
+# unambiguous enough to match case-insensitively.
+_CASE_SENSITIVE_COUNTRY_TOKENS = {"UK", "US", "GB", "EU"}
+
+# A requirement phrased as a GENERIC right to work, as opposed to one naming
+# a specific visa category. The distinction matters: an unrestricted permit
+# at home satisfies "must have the right to work here", but it says nothing
+# about "STEM OPT/F1", which is a specific US status the candidate either
+# holds or doesn't.
+_GENERIC_RIGHT_TO_WORK_RE = re.compile(
+    r"\b(right to work"
+    r"|authoris(?:ed|ation)\s+to\s+work|authoriz(?:ed|ation)\s+to\s+work"
+    r"|eligible\s+to\s+work|permission\s+to\s+work"
+    r"|work\s+authoris\w*|work\s+authoriz\w*"
+    r"|legally\s+(?:able|entitled|authorised|authorized)\s+to\s+work"
+    r"|able\s+to\s+work\s+(?:in|within))\b",
+    re.IGNORECASE,
+)
+
+
+def _country_in_text(text: str) -> str | None:
+    """First country named anywhere in a free-text requirement, normalised.
+
+    `required_country` is often null while the requirement string itself
+    names the country ("Must be authorised to work in the United States"),
+    so the work-auth check needs to resolve a country of its own rather
+    than relying on the separate extraction.
+    """
+    if not text:
+        return None
+    tokens = sorted(
+        set(_COUNTRY_ALIASES) | set(_COUNTRY_ALIASES.values()), key=len, reverse=True
+    )
+    for tok in tokens:
+        upper = tok.upper()
+        if upper in _CASE_SENSITIVE_COUNTRY_TOKENS:
+            if re.search(rf"\b{re.escape(upper)}\b", text):
+                return _COUNTRY_ALIASES.get(tok, tok)
+        elif re.search(rf"\b{re.escape(tok)}\b", text, re.IGNORECASE):
+            return _COUNTRY_ALIASES.get(tok, tok)
+    return None
+
+
+def _candidate_is_unrestricted(work_auth: dict) -> bool:
+    """Whether the candidate needs nothing from an employer to be hired in
+    their own country.
+
+    Reads the profile's STRUCTURED fields first. The gate used to compare
+    the posting's free-text requirement against the free-text
+    `work_permit_type` by substring in both directions, which meant
+    "Right to work in the UK" vs "Settled Status" failed to match and
+    capped the score at 1 -- settled status being, of course, exactly an
+    unrestricted right to work in the UK. That single mismatch gated 112
+    jobs in the live database on 2026-08-27, with another 6 gated on a
+    security-clearance line the same way.
+    """
+    if work_auth.get("legally_authorized_to_work") is True and not work_auth.get("require_sponsorship"):
+        return True
+    permit = str(work_auth.get("work_permit_type") or "").strip().lower()
+    return any(tok in permit for tok in _UNRESTRICTED_PERMITS)
 
 
 def _normalize_country(name: str | None) -> str | None:
@@ -306,14 +384,34 @@ def apply_eligibility_gate(parsed: dict, profile: dict | None) -> dict:
             f"profile is based in {personal.get('country') or 'unknown'}."
         )
 
-    required_auth = str(parsed.get("required_work_auth") or "").strip().lower()
+    required_auth_raw = str(parsed.get("required_work_auth") or "").strip()
+    required_auth = required_auth_raw.lower()
     candidate_permit = str(work_auth.get("work_permit_type") or "").strip().lower()
-    if required_auth and required_auth not in candidate_permit and candidate_permit not in required_auth:
-        caps.append(1)
-        reasons.append(
-            f"Requires '{parsed.get('required_work_auth')}'; profile's work authorisation is "
-            f"'{work_auth.get('work_permit_type') or 'not specified'}'."
-        )
+    if required_auth:
+        # A requirement naming a country the candidate isn't in is a real
+        # bar, whatever their permit says at home.
+        auth_country = _country_in_text(required_auth_raw)
+        if auth_country and candidate_country and auth_country != candidate_country:
+            if not (required_country and _normalize_country(parsed.get("required_country")) == auth_country):
+                caps.append(1)
+                reasons.append(
+                    f"Requires work authorisation in {auth_country.title()}; "
+                    f"profile is based in {personal.get('country') or 'unknown'}."
+                )
+        elif _candidate_is_unrestricted(work_auth) and (
+            _GENERIC_RIGHT_TO_WORK_RE.search(required_auth_raw)
+            or (auth_country and auth_country == candidate_country)
+        ):
+            # Unrestricted at home, and the requirement is either a generic
+            # right-to-work line or explicitly names the candidate's own
+            # country. A named foreign visa category still falls through.
+            pass
+        elif required_auth not in candidate_permit and candidate_permit not in required_auth:
+            caps.append(1)
+            reasons.append(
+                f"Requires '{parsed.get('required_work_auth')}'; profile's work authorisation is "
+                f"'{work_auth.get('work_permit_type') or 'not specified'}'."
+            )
 
     min_years = parsed.get("min_years_commercial")
     if min_years is not None:
