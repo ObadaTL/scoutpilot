@@ -35,13 +35,17 @@ from pathlib import Path
 
 from applypilot.config import RESUME_PATH, TAILORED_DIR, get_locale_style, load_profile
 from applypilot.database import get_connection, get_jobs_by_stage
-from applypilot.facts import FactBank, NumericGuard, NumericGuardViolation, format_facts_block
+from applypilot.facts import (
+    BulletPlacementViolation, FactBank, NumericGuard, NumericGuardViolation, format_facts_block,
+)
 from applypilot.llm import get_client, is_local_provider
 from applypilot.scoring.pdf import split_sections
 from applypilot.scoring.validator import (
     BANNED_WORDS,
     FABRICATION_WATCHLIST,
     SECTION_VARIANTS,
+    ToolLeakGuard,
+    ToolLeakViolation,
     sanitize_text,
     validate_json_fields,
     validate_tailored_resume,
@@ -113,9 +117,6 @@ def _build_tailor_prompt(profile: dict, fact_bank: FactBank, job_description: st
     # the enforcement is unchanged, only the priming is gone.
     banned_str = ", ".join(f'"{w}"' for w in _PROMPT_BANNED_SAMPLE)
 
-    education = profile.get("experience", {})
-    education_level = education.get("education_level", "")
-
     style = get_locale_style(profile)
     doc = style["doc_name"]
     pages = style["pages"]
@@ -134,7 +135,7 @@ Take the base {doc} and job description. Return a tailored {doc} as a JSON objec
 ## SKILLS BOUNDARY (real skills only):
 {skills_block}
 
-You MAY add 1-2 tools closely related to something already in the SKILLS BOUNDARY above (e.g. Kubernetes if Docker is listed, Terraform if AWS is listed). Never add a tool in a category the candidate has no entry for at all -- if there's no database listed, don't invent one.
+The SKILLS section of your output is used ONLY to decide display order within each category -- code renders the category's real items verbatim, in whatever order your text implies. Do NOT add a tool that isn't already listed above, even one closely related to something that is (no Kubernetes because Docker is listed, no Terraform because AWS is listed) -- it will never render regardless, and any bullet mentioning it will be rejected as fabrication.
 
 ## TAILORING RULES:
 
@@ -178,11 +179,12 @@ Do not copy a fact's `short`/`long` text verbatim unless it genuinely is the bes
 - Do NOT invent work, companies, degrees, certifications, or projects
 - Preserved companies: {companies_str} -- names stay as-is
 - Preserved school: {school}
+- EDUCATION is code-overridden after you respond -- whatever you write in that field is discarded and replaced with the candidate's real degree, honours, and dates. Fill it with anything non-empty (e.g. just the school name); do not spend effort on it.
 - Must fill {pages} full page{'s' if pages != 1 else ''} -- do not compress to fewer, do not pad with filler to reach more.
 
 ## OUTPUT: Return ONLY valid JSON. No markdown fences. No commentary. No "here is" preamble.
 
-{{"title":"Role Title","summary":"2-3 sentences written for this job.","skills":{{{skills_schema}}},"experience":[{{"header":"Title at Company","subtitle":"Tech | Dates","bullets":["plain zero-digit bullet",{{"fact":"some.fact.id","text":"your own sentence for this fact, angled at this job"}}]}}],"projects":[{{"header":"Project Name - Description","subtitle":"Tech | Dates","bullets":["plain zero-digit bullet",{{"fact":"some.fact.id","text":"your own sentence for this fact"}}]}}],"education":"{school} | {education_level}"}}"""
+{{"title":"Role Title","summary":"2-3 sentences written for this job.","skills":{{{skills_schema}}},"experience":[{{"header":"Title at Company","subtitle":"Tech | Dates","bullets":["plain zero-digit bullet",{{"fact":"some.fact.id","text":"your own sentence for this fact, angled at this job"}}]}}],"projects":[{{"header":"Project Name - Description","subtitle":"Tech | Dates","bullets":["plain zero-digit bullet",{{"fact":"some.fact.id","text":"your own sentence for this fact"}}]}}],"education":"{school}"}}"""
 
 
 def _build_judge_prompt(profile: dict, fact_bank: FactBank | None = None) -> str:
@@ -424,10 +426,40 @@ def extract_extra_sections(original_text: str) -> dict[str, str]:
 _EDU_FALLBACK = "Education details available on request"
 
 
+def _canonical_education_line(profile: dict | None) -> str:
+    """The profile's own verbatim education line -- institution, degree,
+    honours, dates -- built from resume_facts.canonical_entries.education,
+    exactly the way _apply_canonical_entries forces a real header/subtitle
+    onto experience and project entries.
+
+    Returns "" if the profile has no canonical education record configured
+    (an older/example profile that only has the short `education_level`
+    field), so callers can fall back to that.
+    """
+    if not profile:
+        return ""
+    edu = (profile.get("resume_facts", {}) or {}).get("canonical_entries", {}).get("education")
+    if not edu or not isinstance(edu, dict):
+        return ""
+    parts = [
+        edu.get("institution"),
+        edu.get("degree"),
+        edu.get("honours"),
+        edu.get("dates"),
+    ]
+    parts = [str(p).strip() for p in parts if str(p or "").strip()]
+    return " | ".join(parts)
+
+
 def _profile_education(profile: dict | None) -> str:
-    """The education line as the profile itself states it."""
+    """The education line as the profile itself states it -- the full
+    canonical record when the profile has one configured, else the older
+    bare "school | level" short form."""
     if not profile:
         return _EDU_FALLBACK
+    canonical = _canonical_education_line(profile)
+    if canonical:
+        return canonical
     school = (profile.get("resume_facts", {}) or {}).get("preserved_school", "")
     level = (profile.get("experience", {}) or {}).get("education_level", "")
     parts = [str(p).strip() for p in (school, level) if str(p or "").strip()]
@@ -435,26 +467,31 @@ def _profile_education(profile: dict | None) -> str:
 
 
 def _format_education(edu: object, profile: dict | None = None) -> str:
-    """Normalize `education` into the single "degree | institution | honours
-    | dates" line the template expects, regardless of the shape the LLM
-    actually returned it in, and guarantee the real school is named.
+    """The rendered EDUCATION line.
 
-    The prompt asks for a plain string, but a model will sometimes nest it
-    as {"degree": ..., "institution": ..., "dates": ..., ...} instead --
-    `str(that_dict)` would otherwise ship a raw Python-repr dump straight
-    onto the resume (e.g. "{'degree': 'MEng', 'institution': ...}").
+    Education is pure fact -- institution, degree, honours classification,
+    graduation dates -- with no room for the LLM's creative tailoring the
+    way a bullet has. Unlike everything else in assemble_resume_text, it is
+    NOT LLM-authored: whenever the profile has a canonical education record
+    (resume_facts.canonical_entries.education), that record IS the line,
+    full stop, the same way the resume header is always code-injected from
+    the profile rather than generated. `edu` (the LLM's own field) is
+    accepted only as a fallback for a profile with no canonical record.
 
-    The school check is new. `education` is the one field with no creative
-    content in it at all -- it is profile data the model is asked to copy --
-    and yet a dropped institution name was the single most common tailoring
-    failure on record ("Education 'X' missing", the deep validator's error,
-    seen across separate runs both before and after this rewrite). Failing a
-    whole CV over it, then retrying the entire document in the hope the model
-    copies the field correctly next time, spends minutes of local inference
-    on something a string check fixes for certain. Anything else the model
-    wrote in the field -- degree title, classification, dates carried over
-    from the base CV -- is kept; only the missing institution is restored.
+    This replaces a previous "trust the model, patch the one field it drops
+    most" approach: the model was asked for education as either a plain
+    string or a nested {"degree":...,"institution":...} dict, and reliably
+    produced BOTH shapes across different attempts -- when it filled the
+    dict only partially (degree + institution, no honours/dates), nothing
+    forced the missing fields back in, so about a quarter of generated CVs
+    silently shipped "Institution | Degree" with no classification or dates
+    at all, on jobs that explicitly required a 2:1. A field with zero
+    creative content doesn't need the LLM's cooperation to render correctly.
     """
+    canonical = _canonical_education_line(profile)
+    if canonical:
+        return canonical
+
     if isinstance(edu, dict):
         parts = [
             edu.get("degree") or edu.get("title"),
@@ -509,6 +546,43 @@ def _base_summary(base_resume_text: str) -> str:
         base_resume_text, re.IGNORECASE | re.MULTILINE | re.DOTALL,
     )
     return " ".join(match.group(1).split()) if match else ""
+
+
+def _canonical_skills_lines(data: dict, profile: dict) -> list[str]:
+    """The TECHNICAL SKILLS lines, one per profile.skills_boundary category,
+    composed ONLY from the profile's own declared items -- [] if the
+    profile has no skills_boundary configured at all.
+
+    Skills are the other field (with EDUCATION) that has no business being
+    LLM-authored content: it is a boundary the candidate declared, not
+    something to embellish. The LLM's own `skills` dict (see
+    _build_tailor_prompt's skills_schema) is used ONLY to decide the order
+    items render in within their category, so job-relevant skills still
+    lead -- reordering is real tailoring. Confirmed live 2026-08-26: given
+    free rein over this field, a 14B model added "LangChain (agent
+    frameworks)" and "Kubernetes" to categories that never listed them,
+    both lifted straight from that job's own requirements list -- a
+    fabrication a recruiter can disprove in one follow-up question, not a
+    stylistic liberty.
+    """
+    boundary = profile.get("skills_boundary", {}) or {}
+    llm_skills = data.get("skills") or data.get("technical_skills")
+    llm_skills = llm_skills if isinstance(llm_skills, dict) else {}
+
+    lines: list[str] = []
+    for category, items in boundary.items():
+        if not isinstance(items, list) or not items:
+            continue
+        label = category.replace("_", " ").title()
+        llm_value_lower = str(llm_skills.get(label) or "").lower()
+
+        def _rank(item: str, _text: str = llm_value_lower) -> float:
+            idx = _text.find(str(item).lower())
+            return idx if idx >= 0 else float("inf")
+
+        ordered = sorted(items, key=_rank)
+        lines.append(f"{label}: {sanitize_text(', '.join(str(i) for i in ordered))}")
+    return lines
 
 
 def assemble_resume_text(data: dict, profile: dict, extra_sections: dict[str, str] | None = None,
@@ -578,24 +652,32 @@ def assemble_resume_text(data: dict, profile: dict, extra_sections: dict[str, st
     else:
         lines.pop()  # no summary to show -- drop the bare "SUMMARY" header
 
-    # Technical Skills
+    # Technical Skills -- deterministic, from the profile's own
+    # skills_boundary (see _canonical_skills_lines). Nothing the LLM wrote
+    # for `skills` is ever rendered directly, only used to pick an order.
     lines.append("TECHNICAL SKILLS")
-    skills_data = data.get("skills") or data.get("technical_skills")
-    if isinstance(skills_data, dict) and skills_data:
-        for cat, val in skills_data.items():
-            if isinstance(val, (list, tuple)):
-                val_str = ", ".join(str(item) for item in val)
-            else:
-                val_str = str(val)
-            lines.append(f"{cat}: {sanitize_text(val_str)}")
-    elif isinstance(skills_data, (list, tuple)) and skills_data:
-        lines.append(f"Core Skills: {', '.join(str(s) for s in skills_data)}")
+    skills_lines = _canonical_skills_lines(data, profile)
+    if skills_lines:
+        lines.extend(skills_lines)
     else:
-        # Fallback to comprehensive skills from candidate's profile
-        lines.append("Languages: Python (scikit-learn, pandas), Java, Kotlin, SQL, TypeScript, JavaScript")
-        lines.append("Frameworks & Tools: Spring Boot, Angular, Git, Bitbucket, Jira, CI/CD, Docker, SonarQube")
-        lines.append("Cloud & Infrastructure: AWS (DynamoDB, IoT Core, Lambda, CloudFormation)")
-        lines.append("Domains & ML: Machine Learning Pipelines, Evaluation Integrity, Feature Extraction, EMG/Biosignal Processing")
+        # No skills_boundary configured in this profile at all -- nothing to
+        # render deterministically, so fall back to whatever the LLM wrote
+        # rather than an empty section.
+        skills_data = data.get("skills") or data.get("technical_skills")
+        if isinstance(skills_data, dict) and skills_data:
+            for cat, val in skills_data.items():
+                if isinstance(val, (list, tuple)):
+                    val_str = ", ".join(str(item) for item in val)
+                else:
+                    val_str = str(val)
+                lines.append(f"{cat}: {sanitize_text(val_str)}")
+        elif isinstance(skills_data, (list, tuple)) and skills_data:
+            lines.append(f"Core Skills: {', '.join(str(s) for s in skills_data)}")
+        else:
+            lines.append("Languages: Python (scikit-learn, pandas), Java, Kotlin, SQL, TypeScript, JavaScript")
+            lines.append("Frameworks & Tools: Spring Boot, Angular, Git, Bitbucket, Jira, CI/CD, Docker, SonarQube")
+            lines.append("Cloud & Infrastructure: AWS (DynamoDB, IoT Core, Lambda, CloudFormation)")
+            lines.append("Domains & ML: Machine Learning Pipelines, Evaluation Integrity, Feature Extraction, EMG/Biosignal Processing")
     lines.append("")
 
     # Experience
@@ -707,16 +789,48 @@ def assemble_resume_text(data: dict, profile: dict, extra_sections: dict[str, st
 
 # ── Fact-bullet resolution & NumericGuard integration ─────────────────────
 
+def _entry_owns_fact(entry: dict, fact, all_sources: set[str]) -> bool:
+    """True if `fact` is allowed to appear under `entry` (an experience or
+    project entry that has already been through _apply_canonical_entries,
+    so its header/subtitle are the profile's own verbatim text whenever a
+    canonical record matched).
+
+    A fact's `source` is the facts.yaml group it was parsed from -- e.g.
+    "kraydel", "emg", "viofeel" -- which by construction is a real fragment
+    of that entry's own canonical header ("Software Engineering Intern |
+    Kraydel LTD - Belfast", "Surface EMG-Based Gesture Recognition...",
+    "Co-Founder & Shareholder | VIOFEEL Ltd").
+
+    Only fires when the entry is RECOGNIZABLY someone else's: its header
+    mentions a different known source and not this fact's own one. An entry
+    that mentions no known source at all (freelance work, a project with no
+    facts.yaml group, anything the LLM invented) has no ground truth to
+    check against and is always allowed -- this only blocks a fact from
+    landing on an entry we can positively identify as a different real
+    employer/project, not merely an entry that fails to name this one.
+    "education" facts (grade callouts) aren't tied to any single entry, so
+    they're exempt.
+    """
+    source = (getattr(fact, "source", "") or "").lower()
+    if not source or source == "education":
+        return True
+    haystack = f"{entry.get('header', '')} {entry.get('subtitle', '')}".lower()
+    if source in haystack:
+        return True
+    return not any(other in haystack for other in all_sources if other and other != source)
+
+
 def _resolve_fact_bullets(data: dict, fact_bank: FactBank) -> tuple[dict, list[str]]:
     """Resolve every experience/project bullet into literal text.
 
     A fact-id bullet is replaced verbatim with that fact's pre-written
     variant (see FactBank.resolve_bullet) -- the LLM's own wording for it
     is discarded, so it cannot rewrite numeric content. A bad bullet
-    (unknown fact id, or a plain bullet with a digit with no fact match) is
-    dropped and reported as an error rather than let through;
-    assemble_resume_text only ever sees plain strings, same as before this
-    change.
+    (unknown fact id, a plain bullet with a digit with no fact match, or a
+    fact resolved under an entry that isn't its real owner -- see
+    _entry_owns_fact) is dropped and reported as an error rather than let
+    through; assemble_resume_text only ever sees plain strings, same as
+    before this change.
 
     Two differently-worded bullets can independently resolve to the SAME
     fact -- both a literal {"fact": id} reference and FactBank.match_similar
@@ -733,6 +847,7 @@ def _resolve_fact_bullets(data: dict, fact_bank: FactBank) -> tuple[dict, list[s
         bullet that had to be dropped.
     """
     errors: list[str] = []
+    all_sources = {f.source.lower() for f in fact_bank.verified() if f.source and f.source != "education"}
     # Document-wide, NOT per-entry. A fact is one real thing that happened;
     # it belongs on the CV once. Scoping this per-entry (as it was) meant a
     # final-year project listed under EXPERIENCE and again under PROJECTS
@@ -776,12 +891,37 @@ def _resolve_fact_bullets(data: dict, fact_bank: FactBank) -> tuple[dict, list[s
                     if implicit is not None:
                         fact_id = implicit[0]
 
+                # A fact-id bullet is checked against its real owner BEFORE
+                # anything else. The tailoring step may select, reorder, and
+                # drop bullets, but it must never move one to an entry that
+                # didn't earn it -- dropping (and asking the model to redo
+                # it, see the caller's retry loop) is the only allowed
+                # response to a misplacement, never silently keeping it
+                # where the model put it.
+                if fact_id is not None:
+                    fact = fact_bank.get(fact_id)
+                    if fact is not None and not _entry_owns_fact(entry, fact, all_sources):
+                        log.warning(
+                            "Dropped bullet under '%s': fact '%s' belongs to '%s', not this entry -- %r",
+                            entry.get("header", "?"), fact_id, fact.source, resolved[:100],
+                        )
+                        errors.append(
+                            f"Bullet for fact '{fact_id}' (belongs to '{fact.source}') was placed "
+                            f"under '{entry.get('header', '?')}', which isn't its real owner. "
+                            f"Only use this fact under the entry it actually describes."
+                        )
+                        continue
+
                 # Two bullets pointing at the same fact are ALWAYS a
                 # duplicate even if the resolved text differs a lot --
                 # exact-match on the id is reliable where a text-similarity
                 # score isn't (a fact's short vs long variant can be too
                 # different in length for that to catch).
                 if fact_id is not None and fact_id in seen_fact_ids:
+                    log.info(
+                        "Dropped bullet under '%s': fact '%s' already used elsewhere in this CV -- %r",
+                        entry.get("header", "?"), fact_id, resolved[:100],
+                    )
                     continue
                 # Still check word-coverage against everything kept so far
                 # (regardless of fact id) -- catches two independently
@@ -789,6 +929,10 @@ def _resolve_fact_bullets(data: dict, fact_bank: FactBank) -> tuple[dict, list[s
                 # no fact involved at all.
                 is_dup = any(_bullets_similar(resolved, kept) for kept in new_bullets)
                 if is_dup:
+                    log.info(
+                        "Dropped bullet under '%s': near-duplicate of an earlier bullet in this entry -- %r",
+                        entry.get("header", "?"), resolved[:100],
+                    )
                     continue
                 if fact_id is not None:
                     seen_fact_ids.add(fact_id)
@@ -808,18 +952,218 @@ def _resolve_fact_bullets(data: dict, fact_bank: FactBank) -> tuple[dict, list[s
     # Document-wide dedup can consume a whole section: when the model lists
     # the same work under EXPERIENCE and again under PROJECTS, experience is
     # resolved first and every projects bullet dedups away, leaving PROJECTS
-    # with no entries at all. That trips validate_json_fields' "Missing
-    # required field: projects" and costs the entire document a retry --
-    # strictly worse than the duplicate it was trying to prevent. Rebuild the
-    # section with per-section dedup only, so it keeps its content and the
-    # repetition is the only thing lost to.
+    # with no entries at all. This USED to be patched by silently
+    # re-resolving projects with per-section-only dedup, reintroducing the
+    # very duplicate this function exists to prevent (see
+    # tests/test_facts.py::TestCrossSectionDedup, which asserted that was
+    # correct). It isn't: a duplicate under two headings is a worse failure
+    # than an empty section assemble_resume_text already has a deterministic
+    # fallback for. Report it as an actionable retry note instead, so the
+    # next attempt writes distinct PROJECTS bullets rather than repeating
+    # EXPERIENCE ones.
     if data.get("projects") and not resolved["projects"]:
-        section_local = set(seen_fact_ids)
-        seen_fact_ids.clear()
-        resolved["projects"] = _resolve_section(data.get("projects"))
-        seen_fact_ids.update(section_local)
+        errors.append(
+            "PROJECTS ended up empty because every one of its bullets duplicated "
+            "content already used under EXPERIENCE. Write NEW, distinct bullets for "
+            "the projects entry -- do not repeat an experience bullet under projects."
+        )
 
     return resolved, errors
+
+
+def _normalize_bullet_for_dup_check(text: object) -> str:
+    return " ".join(str(text).split()).strip().lower()
+
+
+def _likely_fact_id(text: str, fact_bank: "FactBank") -> str | None:
+    """Best-guess verified fact a resolved bullet is describing, by the
+    same word-coverage similarity _bullets_similar uses against each
+    fact's own short/long variant -- looser than resolve_bullet_ex's
+    exact-id/inline-marker matching, and deliberately so.
+
+    resolve_bullet_ex only assigns a fact id when the bullet either carries
+    an explicit {"fact": id} reference or its wording happens to satisfy
+    match_similar's strict word-superset requirement. A plain bullet that
+    paraphrases a fact loosely -- "Built dual ML pipelines..." for a fact
+    whose own wording is "Built 2 parallel ML pipelines..." -- gets neither,
+    so it carries no fact id at all through the rest of the pipeline, and
+    the document-wide fact-id dedup in _resolve_fact_bullets never sees it
+    as a duplicate of the bullet that DID resolve. Confirmed live
+    2026-08-26: exactly that pairing shipped on the same CV, worded
+    differently, one per section -- caught neither by fact-id dedup (no
+    shared id) nor by exact-text matching (different words). This is used
+    ONLY to decide "are these two bullets the same underlying claim" for
+    the cross-section duplicate check below, never to license a number or
+    substitute text, so a looser threshold than resolve_bullet_ex costs
+    nothing a human reviewing a caught duplicate wouldn't immediately see
+    is right.
+    """
+    best: tuple[float, str] | None = None
+    for fact in fact_bank.verified():
+        for variant in (fact.variants.get("short"), fact.variants.get("long")):
+            if not variant or not _bullets_similar(text, variant):
+                continue
+            wa, wb = _significant_words(text), _significant_words(variant)
+            coverage = len(wa & wb) / max(len(wa), 1)
+            if best is None or coverage > best[0]:
+                best = (coverage, fact.id)
+    return best[1] if best else None
+
+
+def check_no_cross_section_duplicates(resolved_data: dict, fact_bank: "FactBank | None" = None) -> None:
+    """Hard assertion: no bullet's text may appear in more than one section
+    of the assembled CV -- and, when `fact_bank` is given, no two bullets
+    describing the SAME verified fact may either, even paraphrased
+    differently in each section (see _likely_fact_id).
+
+    _resolve_fact_bullets' fact-id dedup and _entry_owns_fact's ownership
+    check exist specifically to make this unreachable -- this is the
+    backstop that fails generation outright (see tailor_resume's caller) if
+    they somehow didn't, rather than shipping a CV with the same
+    achievement typed twice under two different headings.
+
+    Raises:
+        BulletPlacementViolation: with one reason per duplicate found.
+    """
+    def _bullets_of(section: str) -> list[tuple[str, str, str]]:
+        out = []
+        for entry in resolved_data.get(section) or []:
+            if not isinstance(entry, dict):
+                continue
+            header = str(entry.get("header") or "?")
+            for b in entry.get("bullets", []):
+                out.append((_normalize_bullet_for_dup_check(b), header, str(b)))
+        return out
+
+    exp_bullets = _bullets_of("experience")
+    exp_by_text: dict[str, str] = {}
+    for norm, header, _original in exp_bullets:
+        exp_by_text.setdefault(norm, header)
+    exp_by_fact: dict[str, str] = {}
+    if fact_bank is not None:
+        for norm, header, original in exp_bullets:
+            fact_id = _likely_fact_id(original, fact_bank)
+            if fact_id is not None:
+                exp_by_fact.setdefault(fact_id, header)
+
+    reasons = []
+    for norm, header, original in _bullets_of("projects"):
+        other_header = exp_by_text.get(norm)
+        if other_header is None and fact_bank is not None:
+            fact_id = _likely_fact_id(original, fact_bank)
+            if fact_id is not None and fact_id in exp_by_fact:
+                other_header = exp_by_fact[fact_id]
+                reasons.append(
+                    f"Bullet under '{other_header}' (experience) and '{header}' (projects) both "
+                    f"describe fact '{fact_id}', just worded differently: {original[:100]!r}"
+                )
+                continue
+        if other_header is not None:
+            reasons.append(
+                f"Bullet appears under both '{other_header}' (experience) and "
+                f"'{header}' (projects): {original[:100]!r}"
+            )
+    if reasons:
+        raise BulletPlacementViolation(reasons)
+
+
+_MIN_BULLETS_WHEN_MATERIAL_EXISTS = 3
+
+
+def _facts_available_for_entry(entry: dict, relevant: list) -> list:
+    """The verified facts this CV entry is the real-world owner of.
+
+    A Fact's `source` is its facts.yaml group ("kraydel", "viofeel",
+    "emg", "applypilot"), i.e. the employer or project it actually
+    describes; an entry owns a fact when that group name appears in the
+    entry's own header/subtitle. Same binding the bullet-placement check
+    uses, so "which facts belong here" has exactly one definition.
+    """
+    haystack = f"{entry.get('header', '')} {entry.get('subtitle', '')}".lower()
+    return [f for f in relevant if f.source and f.source.lower() in haystack]
+
+
+def find_min_bullet_violations(
+    resolved_data: dict, fact_bank: FactBank, job_description: str,
+    min_bullets: int = _MIN_BULLETS_WHEN_MATERIAL_EXISTS,
+) -> list[str]:
+    """For each canonical EXPERIENCE entry with at least `min_bullets`
+    relevant verified facts available for this job, require the entry to
+    actually use at least `min_bullets` of them.
+
+    The prompt only ever states a ceiling ("Max N per section", see
+    _build_tailor_prompt) -- nothing states a floor, so a real employer
+    with plenty of true, relevant material can render as a single bullet
+    purely because the model chose not to write more (observed live
+    2026-08-26: the Kraydel entry collapsed to one generic bullet on a
+    Python-focused role, omitting the candidate's only production Python
+    work, while nine real verified facts existed for that entry). Gated on
+    "enough real material exists" rather than on the entry being
+    chronologically the most recent: VIOFEEL is also EXPERIENCE but has
+    only one verified fact, so nothing here would ever demand three
+    bullets out of it -- there's nothing real to pad it with, and this
+    must never manufacture content the way an artificial minItems count
+    would invite. (Ollama's grammar-constrained decoding was tried and
+    confirmed to silently ignore JSON-schema minItems entirely -- see
+    _resume_json_schema -- so this has to be a code-level check, not a
+    schema one.)
+
+    Returns a list of human-readable violation strings (empty if nothing to
+    report), meant to be fed back as retry notes the same way every other
+    check in this module is.
+    """
+    relevant = fact_bank.relevant_facts(job_description)
+    violations: list[str] = []
+    for entry in resolved_data.get("experience") or []:
+        if not isinstance(entry, dict):
+            continue
+        available = _facts_available_for_entry(entry, relevant)
+        if len(available) < min_bullets:
+            continue  # not a recognized entry, or not enough real material to require a minimum from
+        actual = len(entry.get("bullets") or [])
+        if actual < min_bullets:
+            unused_ids = ", ".join(f.id for f in available)
+            violations.append(
+                f"'{entry.get('header')}' has only {actual} bullet(s) but {len(available)} verified "
+                f"facts are available for it ({unused_ids}). Use at least {min_bullets}."
+            )
+    return violations
+
+
+def build_bullet_floor_map(
+    resolved_data: dict, fact_bank: FactBank, job_description: str,
+    default_min: int = 2,
+) -> dict[str, int]:
+    """Per-entry minimum bullet counts for the critic, derived from how much
+    real material each entry actually has.
+
+    The critic's bullet-count floor used to be flat: every entry owed two
+    bullets. That is a guard arguing for fabrication on any entry with less
+    than two verified facts behind it -- VIOFEEL has exactly one
+    (viofeel.dragons_den), so "below the minimum of 2" went into avoid_notes
+    on run after run with nothing true left to satisfy it. Observed live
+    across the 2026-08-26 validation corpus: 6 of 10 CVs carried that finding
+    and every one of them was correct to have one VIOFEEL bullet.
+
+    The floor is therefore `min(default_min, facts available for this entry)`,
+    never more than the entry can honestly fill, and never below 1. An entry
+    the fact bank recognises nothing for gets a floor of 1 -- which never
+    fires, since assemble_resume_text already drops bullet-less entries.
+    Covers PROJECTS as well as EXPERIENCE, because the critic counts bullets
+    under both.
+    """
+    relevant = fact_bank.relevant_facts(job_description)
+    floors: dict[str, int] = {}
+    for section in ("experience", "projects"):
+        for entry in resolved_data.get(section) or []:
+            if not isinstance(entry, dict):
+                continue
+            header = entry.get("header") or entry.get("title") or entry.get("role") or ""
+            if not header:
+                continue
+            available = len(_facts_available_for_entry(entry, relevant))
+            floors[str(header)] = max(1, min(default_min, available))
+    return floors
 
 
 def _bullet_text(bullet) -> str:
@@ -867,16 +1211,19 @@ def _bullets_similar(a: str, b: str) -> bool:
     return min(len(inter) / len(wa), len(inter) / len(wb)) >= _BULLET_DUP_MIN_COVERAGE
 
 
-def _merge_canonical_section(entries: list, records: list[dict]) -> list:
+def _merge_canonical_section(entries: list, records: list[dict]) -> tuple[list, list]:
     """Match each LLM-authored entry against the profile's canonical records
     by keyword, force the matched record's header/subtitle onto it, and
     merge together every entry that matches the SAME record (fixing a
     single real job/project the model split into two JSON entries) into one,
     deduping bullets that are the same underlying claim reworded.
 
-    Entries matching no canonical record pass through untouched -- the
-    registry only needs to cover the entries you actually want protected;
-    anything else keeps today's fully LLM-authored behavior.
+    Returns:
+        (merged, leftover) -- merged is the canonicalized entries in
+        first-matched order; leftover is whatever matched no record at all.
+        The caller decides what to do with leftover: keep it (additive,
+        e.g. PROJECTS) or reject it (exclusive, e.g. EXPERIENCE) -- see
+        _apply_canonical_entries.
     """
     merged_bullets: dict[int, list] = {}
     match_order: list[int] = []
@@ -914,14 +1261,15 @@ def _merge_canonical_section(entries: list, records: list[dict]) -> list:
         {"header": records[idx]["header"], "subtitle": records[idx]["subtitle"], "bullets": merged_bullets[idx]}
         for idx in match_order
     ]
-    return merged + leftover
+    return merged, leftover
 
 
-def _apply_canonical_entries(data: dict, profile: dict) -> dict:
+def _apply_canonical_entries(data: dict, profile: dict) -> tuple[dict, list[str]]:
     """Overwrite the LLM-authored header/subtitle of any experience/project
     entry that describes a known real job or project with the profile's own
-    verbatim text (profile.resume_facts.canonical_entries), and collapse
-    duplicates that match the same record into a single entry.
+    verbatim text (profile.resume_facts.canonical_entries), collapse
+    duplicates that match the same record into a single entry, and reject
+    any EXPERIENCE entry that matches no real employer at all.
 
     The header ("Title | Company") and subtitle ("Tech | Dates") lines are
     free text the LLM generates fresh every attempt -- unlike numeric
@@ -932,22 +1280,61 @@ def _apply_canonical_entries(data: dict, profile: dict) -> dict:
     two JSON entries that both reference the same company/project, and
     NumericGuard's scan deliberately skips headers/subtitles (they
     legitimately carry real dates it can't otherwise authorize -- see
-    _build_guard_scan_text), so neither failure mode was ever caught. This
-    is optional and additive: entries with no matching canonical record are
-    left exactly as the LLM produced them.
+    _build_guard_scan_text), so neither failure mode was ever caught.
+
+    EXPERIENCE is exclusive, not additive, once any canonical experience
+    records are configured: once the ownership check (_entry_owns_fact)
+    started blocking a fact-bearing bullet from landing on the wrong REAL
+    employer, the model's next move -- confirmed live 2026-08-26 -- was to
+    invent a THIRD entry that matches no employer at all ("MEng Software
+    and Electronic Systems Engineering | Queen's University Belfast" filed
+    under EXPERIENCE, the candidate's degree rendered as a job) and put the
+    bullets there instead. A leftover entry with no canonical match has no
+    ground truth to correct, but it can still be REJECTED outright: if the
+    profile declares its real employers, that list is exhaustive, and
+    anything else in EXPERIENCE is invented by construction.
+
+    PROJECTS stays additive/optional: an unmatched project entry is kept
+    as-is (the prompt's own "only use projects that already appear in the
+    original {doc}" rule is the (weaker) control there instead), since a
+    profile can legitimately have real projects not yet added to
+    canonical_entries.projects, and there is no equivalent "your real
+    projects are exactly this list" claim to enforce as EXPERIENCE's is.
+
+    Returns:
+        (data, errors) -- errors describes any invented EXPERIENCE entry
+        that was rejected, meant to be fed back as a retry note the same
+        way _resolve_fact_bullets' errors are.
     """
     canonical = profile.get("resume_facts", {}).get("canonical_entries") or {}
     if not canonical:
-        return data
+        return data, []
 
+    errors: list[str] = []
     result = dict(data)
-    for section in ("experience", "projects"):
-        records = canonical.get(section)
-        entries = data.get(section)
-        if not records or not isinstance(entries, list):
-            continue
-        result[section] = _merge_canonical_section(entries, records)
-    return result
+
+    exp_records = canonical.get("experience")
+    exp_entries = data.get("experience")
+    if exp_records and isinstance(exp_entries, list):
+        merged, invented = _merge_canonical_section(exp_entries, exp_records)
+        result["experience"] = merged
+        if invented:
+            real_employers = "; ".join(r["header"] for r in exp_records)
+            for entry in invented:
+                header = entry.get("header", "?") if isinstance(entry, dict) else "?"
+                errors.append(
+                    f"Rejected invented EXPERIENCE entry '{header}' -- it doesn't match any real "
+                    f"employer. The candidate's ONLY real jobs are: {real_employers}. A degree, a "
+                    f"project, or an award is never an EXPERIENCE entry."
+                )
+
+    proj_records = canonical.get("projects")
+    proj_entries = data.get("projects")
+    if proj_records and isinstance(proj_entries, list):
+        merged, leftover = _merge_canonical_section(proj_entries, proj_records)
+        result["projects"] = merged + leftover  # additive: an unmatched project still passes through
+
+    return result, errors
 
 
 _RUT_FILLER_SENTENCE = re.compile(
@@ -1314,7 +1701,7 @@ def tailor_resume(
         # company name or its real dates. Canonicalizing `data` itself here
         # means every downstream branch (normal path, both fallback paths)
         # sees the corrected version from the start.
-        data = _apply_canonical_entries(data, profile)
+        data, canonical_errors = _apply_canonical_entries(data, profile)
         last_good_data = data
 
         # Resolve fact-id bullets to their verbatim pre-written text BEFORE
@@ -1323,6 +1710,7 @@ def tailor_resume(
         # the point where an unknown fact id or a digit-bearing plain bullet
         # gets caught in code (not just flagged by instruction).
         resolved_data, resolution_errors = _resolve_fact_bullets(data, fact_bank)
+        resolution_errors = canonical_errors + resolution_errors
 
         if resolution_errors:
             avoid_notes.extend(resolution_errors)
@@ -1332,6 +1720,40 @@ def tailor_resume(
             report["status"] = "approved_unquantified_fallback"
             report["guard_violation"] = {"errors": resolution_errors}
             return tailored, report
+
+        # Hard assertion: the same bullet must never appear in more than one
+        # section. Everything above (fact-id dedup, the ownership check) is
+        # supposed to make this unreachable -- if it still fires, that's a
+        # real misattribution/duplication slipping through, not a stylistic
+        # nit, so this job's generation fails outright rather than falling
+        # back to a fallback CV that would ship the exact duplicate this
+        # check exists to catch.
+        try:
+            check_no_cross_section_duplicates(resolved_data, fact_bank=fact_bank)
+        except BulletPlacementViolation as e:
+            avoid_notes.extend(e.reasons)
+            if not is_last_attempt:
+                continue
+            report["status"] = "failed_validation"
+            report["validator"] = {"passed": False, "errors": e.reasons, "warnings": []}
+            return "", report
+
+        # Minimum bullet density: a soft check, unlike the two above. An
+        # under-filled entry is a quality problem, not a fabrication or
+        # misattribution risk, so it's worth spending remaining retries on
+        # but not worth refusing to ship over -- on the last attempt this
+        # logs the gap (visible in the run's logs, per-job) and ships anyway
+        # rather than losing an otherwise-good CV to it.
+        min_bullet_violations = find_min_bullet_violations(resolved_data, fact_bank, job_description)
+        if min_bullet_violations:
+            if not is_last_attempt:
+                avoid_notes.extend(min_bullet_violations)
+                continue
+            log.warning(
+                "Shipping '%s' with under-filled entries despite available material: %s",
+                job.get("title", "?"), "; ".join(min_bullet_violations),
+            )
+            report.setdefault("warnings", []).extend(min_bullet_violations)
 
         # Summary rut: prompt instruction + deterministic check + a targeted
         # repair, the same three-part control this module already uses for
@@ -1386,6 +1808,10 @@ def tailor_resume(
         try:
             guard.check(scan_text)
         except NumericGuardViolation as e:
+            log.warning(
+                "NumericGuard rejected '%s' attempt %d: unverified number(s) %s in %d line(s): %s",
+                job.get("title", "?"), attempt + 1, e.numbers, len(e.bullets), "; ".join(e.bullets[:5]),
+            )
             avoid_notes.append(
                 f"Unverified number(s) {e.numbers} in: " + "; ".join(e.bullets[:5])
             )
@@ -1394,6 +1820,33 @@ def tailor_resume(
             tailored = _ship_unquantified_fallback(data, profile, extra_sections, fact_bank, guard, resume_text)
             report["status"] = "approved_unquantified_fallback"
             report["guard_violation"] = {"numbers": e.numbers, "bullets": e.bullets}
+            return tailored, report
+
+        # ToolLeakGuard: same deterministic check the cover letter already
+        # gets, now run over the assembled CV too. The SKILLS section is
+        # code-rendered from the profile now (see _canonical_skills_lines)
+        # so it can't leak a tool on its own, but a bullet or the summary
+        # still can -- confirmed live 2026-08-26: an AI Engineer CV's
+        # summary and skills both picked up "LLM integration, prompt
+        # engineering" and "agentic workflows" straight from that job's
+        # requirements, none of it in the candidate's real skills_boundary.
+        try:
+            ToolLeakGuard(profile).check(job, tailored)
+        except ToolLeakViolation as e:
+            log.warning(
+                "ToolLeakGuard rejected CV for '%s' attempt %d: %s",
+                job.get("title", "?"), attempt + 1, e.tools,
+            )
+            avoid_notes.append(
+                f"Mentions tool(s) not in the candidate's real skills: {', '.join(e.tools)}. "
+                f"Remove them entirely -- do not substitute a related tool either."
+            )
+            if not is_last_attempt:
+                continue
+            resolved_data = _strip_bullets_with_terms(resolved_data, e.tools)
+            tailored = assemble_resume_text(resolved_data, profile, extra_sections, resume_text)
+            report["status"] = "approved_unquantified_fallback"
+            report["guard_violation"] = {"tools": e.tools}
             return tailored, report
 
         # Layer 1.5: Structural/preserved-entity checks against the original
@@ -1409,6 +1862,27 @@ def tailor_resume(
                 continue
             report["status"] = "failed_validation"
             return tailored, report
+
+        # Critic pass: extraction-only questions (never a verdict -- see
+        # critic.py's module docstring), CODE applies the thresholds. Runs
+        # before every success path below, including the lenient-mode
+        # early return, so nothing ships without it having had a chance to
+        # push back at least once. Import deferred to break the module
+        # cycle -- critic.py imports extract_json from this module.
+        from applypilot.scoring.critic import run_cv_critic
+        critic_result = run_cv_critic(
+            client, tailored, job_description,
+            min_bullets_by_header=build_bullet_floor_map(resolved_data, fact_bank, job_description),
+        )
+        report["critic"] = {"score": critic_result.score, "findings": critic_result.findings}
+        if critic_result.findings:
+            if not is_last_attempt:
+                avoid_notes.extend(critic_result.findings)
+                continue
+            log.info(
+                "Shipping '%s' with critic score %.1f/10 despite findings: %s",
+                job.get("title", "?"), critic_result.score, "; ".join(critic_result.findings),
+            )
 
         # Layer 2: LLM judge (catches subtle fabrication) — skipped in lenient mode
         if validation_mode == "lenient":
@@ -1463,7 +1937,7 @@ def _ship_unquantified_fallback(
     """
     fallback_data = _fallback_unquantified(data, fact_bank, profile)
     resolved_fallback, _ = _resolve_fact_bullets(fallback_data, fact_bank)
-    resolved_fallback = _apply_canonical_entries(resolved_fallback, profile)
+    resolved_fallback, _ = _apply_canonical_entries(resolved_fallback, profile)
     try:
         guard.check(_build_guard_scan_text(resolved_fallback))
     except NumericGuardViolation:
@@ -1498,6 +1972,32 @@ def _strip_all_digits_from_fields(data: dict) -> dict:
     return result
 
 
+def _strip_bullets_with_terms(resolved_data: dict, terms: list[str]) -> dict:
+    """Last-resort removal for a leaked tool ToolLeakGuard still finds on
+    the final retry attempt: drop the specific bullet (or blank the
+    summary) that mentions it, rather than trying to edit the name back
+    out. There's no number to blank the way NumericGuard's fallback does --
+    the whole claim built on the fabricated tool has to go with it.
+    """
+    pattern = re.compile(r"\b(?:" + "|".join(re.escape(t) for t in terms) + r")\b", re.IGNORECASE)
+    result = dict(resolved_data)
+
+    def _clean_section(entries):
+        cleaned = []
+        for entry in entries or []:
+            new_entry = dict(entry)
+            new_entry["bullets"] = [b for b in entry.get("bullets", []) if not pattern.search(str(b))]
+            if new_entry["bullets"]:
+                cleaned.append(new_entry)
+        return cleaned
+
+    result["experience"] = _clean_section(resolved_data.get("experience"))
+    result["projects"] = _clean_section(resolved_data.get("projects"))
+    if pattern.search(str(resolved_data.get("summary", ""))):
+        result["summary"] = ""
+    return result
+
+
 # ── Per-job worker (shared by the batch runner and the single-job entry
 # point used by the dashboard's Tailor button) ───────────────────────────
 
@@ -1519,6 +2019,24 @@ def _tailor_one_job(conn, job: dict, resume_text: str, profile: dict,
         Result dict: {"url", "path", "pdf_path", "title", "site", "status",
         "attempts"}.
     """
+    # A gated job (scorer.apply_eligibility_gate capped fit_score to 1 or 5)
+    # never gets a CV, full stop -- not "score too low for this batch's
+    # min_score", an actual eligibility failure. run_tailoring's own
+    # min_score filter already keeps a normal batch from reaching one, but
+    # tailor_one() (the dashboard's on-demand button, and any direct call)
+    # has no score gate at all -- confirmed live 2026-08-26: a job gated to
+    # 1/10 for requiring US work authorization still cost a full 53s
+    # tailoring call when tailor_resume() was invoked on it directly. This
+    # is the one place every entry path funnels through, so it's the right
+    # place to make that impossible regardless of caller.
+    if job.get("gate_reason"):
+        log.info("[GATED] %s -- skipped, no CV generated: %s", job["title"][:40], job["gate_reason"])
+        return {
+            "url": job["url"], "title": job["title"], "site": job["site"],
+            "status": "gated", "attempts": 0, "path": None, "pdf_path": None,
+            "errors": [job["gate_reason"]],
+        }
+
     from applypilot.enrichment.detail import check_listing_still_open
 
     still_open = check_listing_still_open(job["url"], job.get("site", ""))
@@ -1557,9 +2075,13 @@ def _tailor_one_job(conn, job: dict, resume_text: str, profile: dict,
         url_hash = hashlib.sha1(job["url"].encode("utf-8")).hexdigest()[:8]
         prefix = f"{safe_site}_{safe_title}_{url_hash}"
 
-        # Save tailored resume text
+        # Save tailored resume text. An empty `tailored` means tailor_resume
+        # hard-failed generation (e.g. check_no_cross_section_duplicates) and
+        # deliberately returned nothing to ship -- don't write a blank CV
+        # file over whatever might already be there from a previous run.
         txt_path = TAILORED_DIR / f"{prefix}.txt"
-        txt_path.write_text(tailored, encoding="utf-8")
+        if tailored:
+            txt_path.write_text(tailored, encoding="utf-8")
 
         # Save job description for traceability
         job_path = TAILORED_DIR / f"{prefix}_JOB.txt"
@@ -1597,23 +2119,24 @@ def _tailor_one_job(conn, job: dict, resume_text: str, profile: dict,
             "status": report["status"],
             "attempts": report["attempts"],
             "errors": (report.get("validator") or {}).get("errors", []),
+            "critic_score": (report.get("critic") or {}).get("score"),
         }
     except Exception as e:
         result = {
             "url": job["url"], "title": job["title"], "site": job["site"],
             "status": "error", "attempts": 0, "path": None, "pdf_path": None,
-            "errors": [str(e)],
+            "errors": [str(e)], "critic_score": None,
         }
         log.error("[ERROR] %s -- %s", job["title"][:40], e)
 
     now = datetime.now(timezone.utc).isoformat()
     if result["status"] in _SUCCESS_STATUSES:
         conn.execute(
-            "UPDATE jobs SET tailored_resume_path=?, tailored_at=?, "
+            "UPDATE jobs SET tailored_resume_path=?, tailored_at=?, critic_score=?, "
             "tailor_attempts=COALESCE(tailor_attempts,0)+1 WHERE url=?",
-            (result["path"], now, result["url"]),
+            (result["path"], now, result["critic_score"], result["url"]),
         )
-    elif result["status"] != "listing_closed":
+    elif result["status"] not in ("listing_closed", "gated"):
         conn.execute(
             "UPDATE jobs SET tailor_attempts=COALESCE(tailor_attempts,0)+1 WHERE url=?",
             (result["url"],),

@@ -186,14 +186,20 @@ def init_db(db_path: Path | str | None = None) -> sqlite3.Connection:
     conn = get_connection(path)
     conn.execute("""
         CREATE TABLE IF NOT EXISTS jobs (
-            -- Discovery stage (smart_extract / job_search)
+            -- Discovery stage (smart_extract / job_search / harvesters)
             url                   TEXT PRIMARY KEY,
             title                 TEXT,
+            company               TEXT,
             salary                TEXT,
             description           TEXT,
             location              TEXT,
             site                  TEXT,
             strategy              TEXT,
+            opportunity_type      TEXT,
+            deadline              TEXT,
+            funding_status        TEXT,
+            cohort_start          TEXT,
+            channel               TEXT,
             discovered_at         TEXT,
 
             -- Enrichment stage (detail_scraper)
@@ -208,6 +214,7 @@ def init_db(db_path: Path | str | None = None) -> sqlite3.Connection:
             scored_at             TEXT,
             company_summary       TEXT,
             company_hook          TEXT,
+            gate_reason           TEXT,
 
             -- Tailoring stage (resume tailor)
             tailored_resume_path  TEXT,
@@ -220,6 +227,15 @@ def init_db(db_path: Path | str | None = None) -> sqlite3.Connection:
             cover_attempts        INTEGER DEFAULT 0,
             cover_letter_passed   INTEGER,
             cover_letter_errors   TEXT,
+
+            -- Critic pass (scoring/critic.py) -- a decimal COMPUTED from
+            -- discrete extraction findings (bullet counts, header-restating
+            -- bullets, JD relevance, duplicate content, unsupported cover
+            -- letter claims), unlike fit_score which the scoring LLM
+            -- assigns directly as an integer. Set after tailoring (CV-only)
+            -- and updated to the CV/letter average once the cover letter's
+            -- own critic pass also runs -- see critic.combined_critic_score.
+            critic_score          REAL,
 
             -- Application stage
             applied_at            TEXT,
@@ -316,11 +332,17 @@ _ALL_COLUMNS: dict[str, str] = {
     # Discovery
     "url": "TEXT PRIMARY KEY",
     "title": "TEXT",
+    "company": "TEXT",
     "salary": "TEXT",
     "description": "TEXT",
     "location": "TEXT",
     "site": "TEXT",
     "strategy": "TEXT",
+    "opportunity_type": "TEXT",
+    "deadline": "TEXT",
+    "funding_status": "TEXT",
+    "cohort_start": "TEXT",
+    "channel": "TEXT",
     "discovered_at": "TEXT",
     # Enrichment
     "full_description": "TEXT",
@@ -333,6 +355,7 @@ _ALL_COLUMNS: dict[str, str] = {
     "scored_at": "TEXT",
     "company_summary": "TEXT",
     "company_hook": "TEXT",
+    "gate_reason": "TEXT",
     # Tailoring
     "tailored_resume_path": "TEXT",
     "tailored_at": "TEXT",
@@ -343,6 +366,7 @@ _ALL_COLUMNS: dict[str, str] = {
     "cover_attempts": "INTEGER DEFAULT 0",
     "cover_letter_passed": "INTEGER",
     "cover_letter_errors": "TEXT",
+    "critic_score": "REAL",
     # Application
     "applied_at": "TEXT",
     "apply_status": "TEXT",
@@ -712,9 +736,11 @@ def store_jobs(conn: sqlite3.Connection, jobs: list[dict],
 
     Args:
         conn: Database connection.
-        jobs: List of job dicts with keys: url, title, salary, description, location.
-        site: Source site name (e.g. "RemoteOK", "Dice").
-        strategy: Extraction strategy used (e.g. "json_ld", "api_response", "css_selectors").
+        jobs: List of job dicts with keys: url, title, salary, description, location,
+              and optional: company, full_description, application_url, opportunity_type,
+              deadline, funding_status, cohort_start, channel.
+        site: Source site name (e.g. "RemoteOK", "Dice", "Ashby", "Greenhouse").
+        strategy: Extraction strategy used (e.g. "json_ld", "api_response", "direct_ats", "hn_api").
 
     Returns:
         Tuple of (new_count, duplicate_count).
@@ -727,12 +753,35 @@ def store_jobs(conn: sqlite3.Connection, jobs: list[dict],
         url = job.get("url")
         if not url:
             continue
+        
+        full_desc = job.get("full_description")
+        detail_scraped_at = now if (full_desc and len(full_desc) > 200) else None
+
         try:
             conn.execute(
-                "INSERT INTO jobs (url, title, salary, description, location, site, strategy, discovered_at) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-                (url, job.get("title"), job.get("salary"), job.get("description"),
-                 job.get("location"), site, strategy, now),
+                "INSERT INTO jobs (url, title, company, salary, description, location, site, strategy, "
+                "opportunity_type, deadline, funding_status, cohort_start, channel, discovered_at, "
+                "full_description, application_url, detail_scraped_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    url,
+                    job.get("title"),
+                    job.get("company"),
+                    job.get("salary"),
+                    job.get("description"),
+                    job.get("location"),
+                    job.get("site", site),
+                    strategy,
+                    job.get("opportunity_type"),
+                    job.get("deadline"),
+                    job.get("funding_status"),
+                    job.get("cohort_start"),
+                    job.get("channel", strategy),
+                    now,
+                    full_desc,
+                    job.get("application_url"),
+                    detail_scraped_at,
+                ),
             )
             new += 1
         except sqlite3.IntegrityError:
@@ -745,7 +794,10 @@ def store_jobs(conn: sqlite3.Connection, jobs: list[dict],
 def get_jobs_by_stage(conn: sqlite3.Connection | None = None,
                       stage: str = "discovered",
                       min_score: int | None = None,
-                      limit: int = 100) -> list[dict]:
+                      limit: int = 100,
+                      channel: str | None = None,
+                      opp_type: str | None = None,
+                      keywords: str | list[str] | None = None) -> list[dict]:
     """Fetch jobs filtered by pipeline stage.
 
     Args:
@@ -753,6 +805,9 @@ def get_jobs_by_stage(conn: sqlite3.Connection | None = None,
         stage: One of "discovered", "enriched", "scored", "tailored", "applied".
         min_score: Minimum fit_score filter (only relevant for scored+ stages).
         limit: Maximum number of rows to return.
+        channel: Filter to a specific channel (e.g. 'direct_ats', 'hacker_news', 'graduate_schemes').
+        opp_type: Filter to a specific opportunity type (e.g. 'graduate_scheme', 'funded_training').
+        keywords: Optional keyword(s) to match against job title and description (e.g. 'AI, python, signal processing').
 
     Returns:
         List of job dicts.
@@ -791,10 +846,27 @@ def get_jobs_by_stage(conn: sqlite3.Connection | None = None,
     where = conditions.get(stage, "1=1")
     params: list = []
 
-    if "?" in where and min_score is not None:
-        params.append(min_score)
-    elif "?" in where:
-        params.append(7)  # default min_score
+    if stage == "pending_tailor":
+        params.append(min_score if min_score is not None else 7)
+
+    if channel:
+        where += " AND (channel = ? OR strategy = ? OR site LIKE ?)"
+        params.extend([channel, channel, f"%{channel}%"])
+
+    if opp_type:
+        where += " AND opportunity_type = ?"
+        params.append(opp_type)
+
+    if keywords:
+        if isinstance(keywords, str):
+            kw_list = [k.strip() for k in keywords.split(",") if k.strip()]
+        else:
+            kw_list = list(keywords)
+        if kw_list:
+            kw_clauses = " OR ".join(["(title LIKE ? OR full_description LIKE ?)" for _ in kw_list])
+            where += f" AND ({kw_clauses})"
+            for kw in kw_list:
+                params.extend([f"%{kw}%", f"%{kw}%"])
 
     if min_score is not None and "fit_score" not in where and stage in ("scored", "tailored", "applied"):
         where += " AND fit_score >= ?"
@@ -808,6 +880,18 @@ def get_jobs_by_stage(conn: sqlite3.Connection | None = None,
     # a no-op (always 0) when focus is disabled, so ORDER BY including it
     # never changes behavior in that case.
     order_by = "fit_score DESC NULLS LAST, discovered_at DESC"
+    if stage == "pending_score":
+        # Prioritize candidate profile domain keywords (AI, Signal Processing, ML, Python, Graduate/Junior)
+        order_by = """
+            CASE
+                WHEN title LIKE '%graduate%' OR title LIKE '%junior%' OR title LIKE '%early career%' OR title LIKE '%intern%' THEN 1
+                WHEN title LIKE '%signal%' OR title LIKE '%dsp%' OR title LIKE '%audio%' OR title LIKE '%video%' OR title LIKE '%biosignal%' THEN 2
+                WHEN title LIKE '%ai%' OR title LIKE '%machine learning%' OR title LIKE '%ml%' OR title LIKE '%deep learning%' THEN 3
+                WHEN title LIKE '%python%' OR title LIKE '%fastapi%' OR title LIKE '%backend%' OR title LIKE '%back-end%' THEN 4
+                WHEN title LIKE '%fullstack%' OR title LIKE '%full stack%' OR title LIKE '%full-stack%' OR title LIKE '%software%' OR title LIKE '%developer%' OR title LIKE '%engineer%' THEN 5
+                ELSE 6
+            END ASC, """ + order_by
+
     if stage in ("pending_score", "pending_tailor", "pending_apply"):
         focus = load_location_focus()
         tier_count = len((focus or {}).get("priority", []))
@@ -827,6 +911,35 @@ def get_jobs_by_stage(conn: sqlite3.Connection | None = None,
         columns = rows[0].keys()
         return [dict(zip(columns, row)) for row in rows]
     return []
+
+
+def clean_non_tech_jobs(conn: sqlite3.Connection | None = None) -> int:
+    """Mark irrelevant, non-engineering discovered jobs as hidden (hidden = 1) to clean scoring queues.
+
+    Returns:
+        Number of jobs marked as hidden.
+    """
+    from applypilot.discovery.direct_ats import is_relevant_tech_role
+    if conn is None:
+        conn = get_connection()
+
+    unscored_jobs = conn.execute(
+        "SELECT url, title, full_description FROM jobs WHERE fit_score IS NULL AND COALESCE(hidden, 0) = 0"
+    ).fetchall()
+
+    to_hide = []
+    for job in unscored_jobs:
+        url = job[0]
+        title = job[1] or ""
+        desc = job[2] or ""
+        if not is_relevant_tech_role(title, desc):
+            to_hide.append(url)
+
+    if to_hide:
+        conn.executemany("UPDATE jobs SET hidden = 1, hidden_at = datetime('now') WHERE url = ?", [(u,) for u in to_hide])
+        conn.commit()
+
+    return len(to_hide)
 
 
 # ---------------------------------------------------------------------------

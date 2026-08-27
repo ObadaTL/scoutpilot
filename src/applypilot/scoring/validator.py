@@ -54,6 +54,13 @@ LLM_LEAK_PHRASES: list[str] = [
     "per your feedback", "based on your feedback", "as per the instructions",
     "the following resume", "the resume below",
     "the following cover letter", "the letter below",
+    # Meta-references to the source documents -- a cover letter should make
+    # the claim, not narrate where it read the requirement. Confirmed live
+    # 2026-08-26: "the job description mentions ..." opened a paragraph
+    # three separate times across one batch.
+    "the job description mentions", "the job description states",
+    "as mentioned in the job description", "as stated in the job description",
+    "the posting mentions", "the job posting mentions", "the description mentions",
 ]
 
 # Known fabrication markers: completely unrelated tools/languages.
@@ -215,6 +222,19 @@ _DANGLING_OPENER_RE = re.compile(
     r"^\s*(?:This|These|That|Those|It|They|Both|Such|The same)\b", re.IGNORECASE
 )
 
+# Catches "the job description mentions", "Revolut's description mentions",
+# "the posting states", "their listing says", etc. -- the LLM_LEAK_PHRASES
+# literal list only banned the "the job description ..." phrasing; swapping
+# in the company's own possessive ("Revolut's description mentions...")
+# said the identical narrating-instead-of-claiming thing and sailed
+# straight through. This is deliberately not anchored to what precedes
+# "description"/"posting" -- any possessive or article routes to the same
+# meta-reference.
+_META_REFERENCE_RE = re.compile(
+    r"\b(?:job\s+)?(?:description|posting|listing)\s+(?:mentions?|states?|says|notes?)\b",
+    re.IGNORECASE,
+)
+
 
 def has_dangling_reference(text: str) -> bool:
     """True if a body paragraph opens with a back-reference to a sentence
@@ -237,11 +257,27 @@ def has_dangling_reference(text: str) -> bool:
     every case observed live -- all four dangling openers were the first
     body paragraph, because the fallback deletes the number-bearing sentence
     that the prompt asks for in paragraph 1.
+
+    A paragraph starting with "dear" is skipped as the greeting -- but the
+    model doesn't always put a blank line between the salutation and the
+    first real sentence, so `text.split("\n\n")` can hand back "Dear Hiring
+    Manager,\nThis directly solves..." as ONE paragraph. Treating that whole
+    chunk as "just the greeting" (confirmed live 2026-08-26: a real shipped
+    letter opened exactly this way) hid the real first sentence -- and its
+    dangling reference -- from ever being checked. Only the greeting LINE is
+    stripped, not the whole paragraph, so whatever follows it still gets
+    checked even with no blank line separating them.
     """
     for para in (p.strip() for p in text.split("\n\n")):
-        if not para or para.lower().startswith("dear"):
+        if not para:
             continue
-        return bool(_DANGLING_OPENER_RE.match(para))
+        lines = para.split("\n")
+        if lines[0].strip().lower().startswith("dear"):
+            lines = lines[1:]
+        remainder = "\n".join(lines).strip()
+        if not remainder:
+            continue
+        return bool(_DANGLING_OPENER_RE.match(remainder))
     return False
 
 
@@ -520,6 +556,13 @@ _KNOWN_TOOL_NAMES: frozenset[str] = frozenset({
     # misc widely-known tools/SaaS
     "jira", "confluence", "figma", "tableau", "looker", "salesforce",
     "webpack", "babel", "jquery", "bootstrap", "tailwind",
+    # AI/LLM tooling -- single-word camelCase/acronym names (LangChain,
+    # OpenAI, RAG) are already caught by the shape heuristics below; these
+    # are the multi-word or all-lowercase-looking names that would evade
+    # every one of those shapes. Confirmed live 2026-08-26: "Hugging Face"
+    # -- two ordinary title-case English words -- leaked into scoring
+    # REASONING as a claimed skill and was never flagged.
+    "hugging face", "vector database", "prompt engineering",
 })
 
 _TOOL_SHAPE_RE = re.compile(r"[A-Za-z][A-Za-z0-9+#.]*")
@@ -577,13 +620,14 @@ class ToolLeakGuard:
 
         return candidates
 
-    def check(self, job: dict, letter: str) -> None:
-        """Raise ToolLeakViolation if a job-description tool the candidate
-        doesn't have appears as a whole word in the letter.
+    def find_leaks(self, job: dict, text: str) -> list[str]:
+        """Every job-description tool the candidate doesn't have that
+        appears as a whole word in `text` -- letter, CV, or scoring
+        reasoning, this check doesn't care which. Empty list if none leaked.
 
         Args:
             job: Job dict (uses full_description and site).
-            letter: The generated cover letter text.
+            text: The text to scan.
         """
         job_tools = self._extract_job_tools(job.get("full_description") or "")
         company = _company_tokens(job)
@@ -600,15 +644,124 @@ class ToolLeakGuard:
             and not any(t in s or s in t for s in self._allowed)
         }
 
-        letter_lower = letter.lower()
-        leaked = sorted(t for t in remainder if re.search(r"\b" + re.escape(t) + r"\b", letter_lower))
+        text_lower = text.lower()
+        return sorted(t for t in remainder if re.search(r"\b" + re.escape(t) + r"\b", text_lower))
+
+    def check(self, job: dict, letter: str) -> None:
+        """Raise ToolLeakViolation if a job-description tool the candidate
+        doesn't have appears as a whole word in the letter.
+
+        Args:
+            job: Job dict (uses full_description and site).
+            letter: The generated cover letter text.
+        """
+        leaked = self.find_leaks(job, letter)
         if leaked:
             raise ToolLeakViolation(leaked)
 
 
 # ── Cover Letter Validation ──────────────────────────────────────────────
 
-def validate_cover_letter(text: str, mode: str = "normal") -> dict:
+_PHRASE_REPEAT_MIN_WORDS = 5
+_JD_LIFT_MIN_WORDS = 6
+_NGRAM_STOPWORDS = {
+    "a", "an", "the", "and", "or", "of", "in", "on", "at", "to", "for",
+    "with", "from", "by", "into", "across", "using", "via", "is", "are",
+    "was", "were", "that", "this", "your", "you", "i", "my", "it", "as",
+}
+
+
+def _words(text: str) -> list[str]:
+    return re.findall(r"[a-z0-9']+", text.lower())
+
+
+def _is_mostly_filler(ngram: tuple[str, ...]) -> bool:
+    """True if an n-gram is mostly stopwords/connective filler ('in order
+    to be able to') -- excluded from both repetition checks below so
+    ordinary English doesn't get flagged, only real duplicated content."""
+    content_words = [w for w in ngram if w not in _NGRAM_STOPWORDS]
+    return len(content_words) < (len(ngram) // 2 + 1)
+
+
+def has_repeated_phrase(text: str, min_words: int = _PHRASE_REPEAT_MIN_WORDS) -> str | None:
+    """Return the first phrase of `min_words` or more that appears more than
+    once in the letter (case-insensitive, non-overlapping occurrences), or
+    None if there isn't one.
+
+    Confirmed live 2026-08-26: a shipped letter used "build scalable systems
+    and data pipelines" verbatim in both its opening paragraph and its
+    second paragraph -- grammatical each time, in-voice, no banned words, so
+    nothing else here caught it. A real cover letter restates an idea in
+    different words across paragraphs; it never needs the identical phrase
+    twice.
+    """
+    words = _words(text)
+    seen: dict[tuple[str, ...], int] = {}
+    for i in range(len(words) - min_words + 1):
+        ngram = tuple(words[i:i + min_words])
+        if _is_mostly_filler(ngram):
+            continue
+        if ngram in seen and i - seen[ngram] >= min_words:
+            return " ".join(ngram)
+        seen.setdefault(ngram, i)
+    return None
+
+
+def has_lifted_jd_span(text: str, job_description: str, min_words: int = _JD_LIFT_MIN_WORDS) -> str | None:
+    """Return the first span of `min_words` or more words in the letter that
+    was copied verbatim out of the job description, or None.
+
+    A cover letter is supposed to be the candidate's own sentences about
+    their own work -- reciting the posting's own marketing copy back at it
+    ("Revolut is building a global financial super app, offering services
+    such as...", lifted near-verbatim from the JD in a real shipped letter)
+    reads as filler, not personalization, however true it is.
+    """
+    if not job_description:
+        return None
+    jd_ngrams = {
+        tuple(jd_words[i:i + min_words])
+        for jd_words in [_words(job_description)]
+        for i in range(len(jd_words) - min_words + 1)
+    }
+    if not jd_ngrams:
+        return None
+    letter_words = _words(text)
+    for i in range(len(letter_words) - min_words + 1):
+        ngram = tuple(letter_words[i:i + min_words])
+        if _is_mostly_filler(ngram):
+            continue
+        if ngram in jd_ngrams:
+            return " ".join(ngram)
+    return None
+
+
+def has_bad_signoff(text: str, sign_off_name: str) -> str | None:
+    """Return a description of what's wrong with the sign-off, or None.
+
+    The prompt asks for exactly "Sincerely," then the candidate's name, each
+    on its own line (see cover_letter.py's prompt). This checks that
+    contract holds: the line after "Sincerely," must be the name and
+    nothing else -- not the name plus a trailing note, not a second
+    "Sincerely," repeated, not anything the model tacked on past the point
+    it was told to stop.
+    """
+    if not sign_off_name:
+        return None
+    match = re.search(r"^[ \t]*Sincerely,?[ \t]*$", text, re.IGNORECASE | re.MULTILINE)
+    if not match:
+        return None  # "Must start with 'Dear...'" etc. catch a missing sign-off; not this check's job
+    after = text[match.end():].strip()
+    if not after:
+        return "Sign-off has 'Sincerely,' but no name after it."
+    if after.strip().lower() != sign_off_name.strip().lower():
+        return f"Sign-off contains more than just the name: {after[:80]!r}"
+    return None
+
+
+def validate_cover_letter(
+    text: str, mode: str = "normal", job_description: str = "", sign_off_name: str = "",
+) -> dict:
     """Programmatic validation of a cover letter.
 
     Args:
@@ -617,6 +770,10 @@ def validate_cover_letter(text: str, mode: str = "normal") -> dict:
               strict  → banned words are errors (trigger retries); word limit enforced
               normal  → banned words are warnings; word limit is soft (+25 words)
               lenient → banned words ignored; word count not checked
+        job_description: The target job's posting text, for has_lifted_jd_span.
+            Skipped (no error) if not given.
+        sign_off_name: The candidate's expected sign-off name, for
+            has_bad_signoff. Skipped (no error) if not given.
 
     Returns:
         {"passed": bool, "errors": list[str], "warnings": list[str]}
@@ -704,5 +861,20 @@ def validate_cover_letter(text: str, mode: str = "normal") -> dict:
             "A paragraph opens with a back-reference ('This ...', 'These ...') "
             "whose antecedent is missing. Open the paragraph with the claim itself."
         )
+    repeated = has_repeated_phrase(text)
+    if repeated:
+        errors.append(f"Repeats the phrase {repeated!r} -- say it once, differently the second time or not at all.")
+    lifted = has_lifted_jd_span(text, job_description)
+    if lifted:
+        errors.append(f"Copies {lifted!r} near-verbatim from the job description -- write it in your own words.")
+    meta_ref = _META_REFERENCE_RE.search(text)
+    if meta_ref:
+        errors.append(
+            f"Narrates the source instead of making the claim ({meta_ref.group()!r}) -- "
+            f"state the fact directly, don't say where you read it."
+        )
+    signoff_error = has_bad_signoff(text, sign_off_name)
+    if signoff_error:
+        errors.append(signoff_error)
 
     return {"passed": len(errors) == 0, "errors": errors, "warnings": warnings}

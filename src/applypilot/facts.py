@@ -131,6 +131,17 @@ class NumericGuardViolation(FactBankError):
         )
 
 
+class BulletPlacementViolation(FactBankError):
+    """Raised when a resolved bullet is rendered under an entry other than
+    its verified fact's real owner (e.g. an "emg" fact under the VIOFEEL
+    experience entry), or when the identical bullet text appears in more
+    than one section of the assembled CV."""
+
+    def __init__(self, reasons: list[str]):
+        self.reasons = reasons
+        super().__init__("; ".join(reasons))
+
+
 @dataclass(frozen=True)
 class Fact:
     """One verifiable, pre-written claim the LLM may select for a bullet."""
@@ -141,6 +152,14 @@ class Fact:
     variants: dict[str, str]
     evidence: str
     use_when: str | None = None
+    # The facts.yaml top-level group this fact was parsed from (e.g.
+    # "kraydel", "emg", "viofeel"). This is the fact's real-world owner --
+    # the employer or project it actually describes -- and is the binding
+    # tailor.py's bullet-placement check uses to catch a fact resolved under
+    # the wrong entry (e.g. an "emg" fact rendered under the VIOFEEL
+    # experience entry). Defaults to "" for Facts built directly in tests,
+    # where no ownership check is exercised.
+    source: str = ""
 
 
 @dataclass(frozen=True)
@@ -282,7 +301,7 @@ class FactBank:
 
         fact = Fact(
             id=fact_id, tier=tier, numbers=numbers, variants=variants,
-            evidence=evidence, use_when=use_when,
+            evidence=evidence, use_when=use_when, source=section,
         )
         return fact, errors
 

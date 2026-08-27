@@ -1,0 +1,116 @@
+# Graduate Schemes & Funded Training Programs Registry
+# Curated discovery sources for Graduate Technology Schemes, Apprenticeships,
+# Skills Bootcamps (UK DfE), and funded tech cohorts.
+
+schemes:
+  # ── Major UK & Northern Ireland Graduate Employers & Schemes ──────────
+  graduate_schemes:
+    - name: "Kainos Earn as you Learn & Graduate Tech"
+      company: "Kainos"
+      location: "Belfast, Northern Ireland / UK Remote"
+      url: "https://www.kainos.com/careers/early-careers"
+      opportunity_type: "graduate_scheme"
+      funding_status: "standard_salary"
+      description: "Graduate software engineering and tech consulting academy based in Belfast and across the UK."
+    
+    - name: "Allstate Northern Ireland Early Careers"
+      company: "Allstate Northern Ireland"
+      location: "Belfast / Derry, Northern Ireland"
+      url: "https://www.allstate.com/careers/northern-ireland"
+      opportunity_type: "graduate_scheme"
+      funding_status: "standard_salary"
+      description: "Early career software development, cybersecurity, and cloud infrastructure roles in Belfast."
+
+    - name: "Citi Belfast Technology Graduate Programme"
+      company: "Citi"
+      location: "Belfast, Northern Ireland"
+      url: "https://jobs.citi.com/belfast"
+      opportunity_type: "graduate_scheme"
+      funding_status: "standard_salary"
+      description: "Technology analyst and software development rotational graduate program at Citi's Belfast Technology Centre."
+
+    - name: "Liberty IT Graduate Software Engineer"
+      company: "Liberty IT"
+      location: "Belfast, Northern Ireland"
+      url: "https://www.liberty-it.co.uk/careers"
+      opportunity_type: "graduate_scheme"
+      funding_status: "standard_salary"
+      description: "Graduate software development and engineering program in Belfast creating enterprise cloud platforms."
+
+    - name: "BBC Technology & Software Engineering Scheme"
+      company: "BBC"
+      location: "Belfast / London / Salford / Remote"
+      url: "https://www.bbc.co.uk/careers/trainee-schemes-and-apprenticeships"
+      opportunity_type: "graduate_scheme"
+      funding_status: "standard_salary"
+      description: "BBC Software Engineering and Digital Media Graduate and Apprenticeship schemes."
+
+    - name: "Civil Service Fast Stream - Digital, Data & Technology"
+      company: "UK Civil Service"
+      location: "Belfast / UK Wide / Hybrid"
+      url: "https://www.faststream.gov.uk/digital-data-technology"
+      opportunity_type: "graduate_scheme"
+      funding_status: "standard_salary"
+      description: "UK Civil Service leadership and technical graduate scheme in digital, data, and technology."
+
+    - name: "BT & EE Digital Technology Graduate"
+      company: "BT Group"
+      location: "Belfast / London / Bristol / Hybrid"
+      url: "https://www.bt.com/careers/early-careers/graduates"
+      opportunity_type: "graduate_scheme"
+      funding_status: "standard_salary"
+      description: "Software engineering, cloud, networks, and data analytics graduate programmes."
+
+  # ── Government-Funded Training, Reskilling & Tech Bootcamps ───────────
+  funded_training:
+    - name: "UK DfE Skills Bootcamps in Software Development"
+      company: "Department for Education (DfE)"
+      location: "UK / Remote"
+      url: "https://www.gov.uk/guidance/find-a-skills-bootcamp"
+      opportunity_type: "funded_training"
+      funding_status: "fully_funded"
+      description: "Free, flexible courses of up to 16 weeks for adults, giving people the opportunity to build up sector-specific tech skills with guaranteed job interviews."
+
+    - name: "AWS re/Start Cloud Training Program"
+      company: "Amazon Web Services (AWS)"
+      location: "UK / Belfast / Remote"
+      url: "https://aws.amazon.com/training/restart/"
+      opportunity_type: "funded_training"
+      funding_status: "fully_funded"
+      description: "Full-time, 12-week skills development program that prepares individuals for careers in the cloud and connects them to potential employers."
+
+    - name: "Generation UK Tech Programmes"
+      company: "Generation UK & Ireland"
+      location: "UK / Remote"
+      url: "https://uk.generation.org/programmes/"
+      opportunity_type: "funded_training"
+      funding_status: "fully_funded"
+      description: "Free, cohort-based tech training in Software Engineering, Data Analytics, and Cloud Engineering with direct employer interviews."
+
+    - name: "Northcoders Fully Funded Coding Bootcamps"
+      company: "Northcoders"
+      location: "UK / Remote"
+      url: "https://northcoders.com/our-courses/coding-bootcamp"
+      opportunity_type: "funded_training"
+      funding_status: "fully_funded"
+      description: "Department for Education funded 13-week coding bootcamp covering full-stack software development with dedicated career support."
+
+    - name: "Ada National College for Digital Skills - Apprenticeships"
+      company: "Ada College"
+      location: "UK / Hybrid"
+      url: "https://www.ada.ac.uk/apprenticeships/"
+      opportunity_type: "apprenticeship"
+      funding_status: "paid_stipend"
+      description: "Higher and Degree apprenticeships in Software Engineering and Data Analytics with leading tech employers."
+
+  # ── Curated Community Feeds & Repositories ────────────────────────────
+  curated_feeds:
+    - name: "SimplifyJobs New Grad SWE"
+      url: "https://raw.githubusercontent.com/SimplifyJobs/New-Grad-Positions/dev/README.md"
+      type: "markdown_table"
+      opportunity_type: "graduate_scheme"
+
+    - name: "UK Tech Graduate Schemes Index"
+      url: "https://raw.githubusercontent.com/search?q=uk+tech+graduate+schemes"
+      type: "curated_list"
+      opportunity_type: "graduate_scheme"

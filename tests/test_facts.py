@@ -346,8 +346,11 @@ class TestRewordedFactBullets:
 # ── Cross-section dedup ────────────────────────────────────────────────
 
 class TestCrossSectionDedup:
-    """A fact is one real thing; it belongs on the CV once. But deduping a
-    section out of existence is worse than the duplicate."""
+    """A fact is one real thing; it belongs on the CV once -- even if that
+    means a section ends up empty and generation has to retry with
+    different content. A duplicate is never silently kept just to avoid
+    that retry (see tailor.py's check_no_cross_section_duplicates, which
+    hard-fails generation if a duplicate ever reaches the assembled text)."""
 
     def _data_and_bank(self, dup: bool):
         from applypilot.facts import Fact, FactBank
@@ -393,12 +396,215 @@ class TestCrossSectionDedup:
         resolved, _ = _resolve_fact_bullets(data, bank)
         assert resolved["projects"][0]["bullets"] == ["Built 2 parallel ML pipelines on EMG signals"]
 
-    def test_a_section_is_never_emptied_by_dedup_alone(self):
-        """If dedup would leave PROJECTS with no entries at all, the section
-        falls back to per-section dedup: validate_json_fields requires the
-        field, so emptying it costs the whole document a retry."""
+    def test_a_duplicate_section_ends_up_empty_with_an_actionable_error(self):
+        """If dedup would leave PROJECTS with no entries at all, it stays
+        empty -- validate_json_fields will require a retry for it, but the
+        retry note explains why (write new bullets, don't repeat
+        experience) instead of the run silently shipping the fact twice."""
         from applypilot.scoring.tailor import _resolve_fact_bullets
         data, bank = self._data_and_bank(dup=True)
-        resolved, _ = _resolve_fact_bullets(data, bank)
-        assert len(resolved["projects"]) == 1
-        assert resolved["projects"][0]["bullets"]
+        resolved, errors = _resolve_fact_bullets(data, bank)
+        assert resolved["projects"] == []
+        assert any("PROJECTS ended up empty" in e for e in errors)
+
+
+class TestBulletOwnership:
+    """A fact bound to one real employer/project (Fact.source, set from its
+    facts.yaml group) must never be rendered under a different entry -- the
+    exact VIOFEEL/EMG misattribution seen live 2026-08-26."""
+
+    def _bank(self):
+        from applypilot.facts import Fact, FactBank
+        return FactBank(
+            [
+                Fact(id="emg.dual", tier="verified", numbers=[2], source="emg",
+                     variants={"short": "Built 2 parallel ML pipelines on EMG signals"},
+                     evidence="resume: 2 pipelines"),
+                Fact(id="viofeel.dragons_den", tier="verified", numbers=[1, 2024], source="viofeel",
+                     variants={"short": "1st place, QUB Dragon's Den 2024"},
+                     evidence="resume: 1st place 2024"),
+            ],
+            unfilled=[], forbidden=[],
+        )
+
+    def test_fact_under_the_wrong_entry_is_dropped_not_moved(self):
+        from applypilot.scoring.tailor import _resolve_fact_bullets
+        data = {
+            "experience": [
+                {"header": "Co-Founder & Shareholder | VIOFEEL Ltd", "bullets": [
+                    {"fact": "viofeel.dragons_den", "form": "short"},
+                    {"fact": "emg.dual", "form": "short"},  # misplaced: belongs to the EMG project
+                ]},
+            ],
+            "projects": [
+                {"header": "Surface EMG-Based Gesture Recognition", "bullets": [
+                    {"fact": "emg.dual", "form": "short"},
+                ]},
+            ],
+        }
+        resolved, errors = _resolve_fact_bullets(data, self._bank())
+        assert resolved["experience"][0]["bullets"] == ["1st place, QUB Dragon's Den 2024"]
+        assert resolved["projects"][0]["bullets"] == ["Built 2 parallel ML pipelines on EMG signals"]
+        assert any("emg.dual" in e and "VIOFEEL" in e for e in errors)
+
+    def test_fact_under_an_uncanonicalized_entry_is_allowed(self):
+        """No canonical record matched this entry -- there's no ground
+        truth to check it against, so it passes through untouched."""
+        from applypilot.scoring.tailor import _resolve_fact_bullets
+        data = {
+            "experience": [{"header": "Freelance Consulting", "bullets": [{"fact": "emg.dual", "form": "short"}]}],
+            "projects": [],
+        }
+        resolved, errors = _resolve_fact_bullets(data, self._bank())
+        assert resolved["experience"][0]["bullets"] == ["Built 2 parallel ML pipelines on EMG signals"]
+        assert errors == []
+
+
+class TestCrossSectionDuplicateAssertion:
+    """check_no_cross_section_duplicates is the hard backstop: even if
+    ownership/dedup somehow let a duplicate through, the assembled CV must
+    never actually ship with the same bullet under two headings."""
+
+    def test_raises_on_identical_bullet_in_both_sections(self):
+        from applypilot.facts import BulletPlacementViolation
+        from applypilot.scoring.tailor import check_no_cross_section_duplicates
+        data = {
+            "experience": [{"header": "VIOFEEL", "bullets": ["Built two parallel ML pipelines on EMG signals."]}],
+            "projects": [{"header": "EMG Project", "bullets": ["Built two parallel ML pipelines on EMG signals."]}],
+        }
+        try:
+            check_no_cross_section_duplicates(data)
+            assert False, "expected BulletPlacementViolation"
+        except BulletPlacementViolation as e:
+            assert "VIOFEEL" in e.reasons[0] and "EMG Project" in e.reasons[0]
+
+    def test_passes_on_distinct_bullets(self):
+        from applypilot.scoring.tailor import check_no_cross_section_duplicates
+        data = {
+            "experience": [{"header": "VIOFEEL", "bullets": ["1st place, QUB Dragon's Den 2024"]}],
+            "projects": [{"header": "EMG Project", "bullets": ["Built two parallel ML pipelines on EMG signals."]}],
+        }
+        check_no_cross_section_duplicates(data)  # must not raise
+
+    def test_catches_a_paraphrased_duplicate_by_fact_id(self):
+        """Exact-text matching alone missed this live 2026-08-26: the same
+        fact, worded differently in each section, with too little word
+        overlap for _bullets_similar and too little for match_similar to
+        assign a shared fact id during resolution either."""
+        from applypilot.facts import BulletPlacementViolation, Fact, FactBank
+        from applypilot.scoring.tailor import check_no_cross_section_duplicates
+
+        bank = FactBank(
+            [
+                Fact(id="emg.dual", tier="verified", numbers=[2], source="emg",
+                     variants={"short": "Built 2 parallel ML pipelines on surface-EMG signals in Python/scikit-learn"},
+                     evidence="resume: 2 pipelines"),
+            ],
+            unfilled=[], forbidden=[],
+        )
+        data = {
+            "experience": [{"header": "VIOFEEL", "bullets": [
+                "Built two parallel machine-learning pipelines for surface-EMG signal processing in Python",
+            ]}],
+            "projects": [{"header": "EMG Project", "bullets": [
+                "Built dual ML pipelines in Python and scikit-learn for hand-gesture classification from surface-EMG signals",
+            ]}],
+        }
+        try:
+            check_no_cross_section_duplicates(data, fact_bank=bank)
+            assert False, "expected BulletPlacementViolation"
+        except BulletPlacementViolation as e:
+            assert "emg.dual" in e.reasons[0]
+
+    def test_no_fact_bank_falls_back_to_exact_text_only(self):
+        """Backward compatible: omitting fact_bank still catches exact
+        duplicates, just not paraphrased ones."""
+        from applypilot.scoring.tailor import check_no_cross_section_duplicates
+        data = {
+            "experience": [{"header": "VIOFEEL", "bullets": ["A genuinely different bullet entirely"]}],
+            "projects": [{"header": "EMG Project", "bullets": ["Built two parallel ML pipelines on EMG signals."]}],
+        }
+        check_no_cross_section_duplicates(data)  # must not raise -- no shared text
+
+
+class TestCanonicalExperienceRejection:
+    """Once canonical_entries.experience is configured, it's exhaustive:
+    an EXPERIENCE entry matching no real employer is rejected outright, not
+    passed through untouched the way an unmatched PROJECTS entry still is."""
+
+    def _profile(self):
+        return {
+            "resume_facts": {
+                "canonical_entries": {
+                    "experience": [
+                        {"match": ["Kraydel"], "header": "Software Engineering Intern | Kraydel LTD", "subtitle": "Jul 2022 - May 2023"},
+                    ],
+                }
+            }
+        }
+
+    def test_invented_experience_entry_is_dropped(self):
+        """The exact incident: the model filed the candidate's own degree
+        as a job once EMG bullets could no longer land on VIOFEEL."""
+        from applypilot.scoring.tailor import _apply_canonical_entries
+        data = {
+            "experience": [
+                {"header": "Software Engineering Intern | Kraydel LTD", "bullets": ["Shipped an audit-event system"]},
+                {"header": "MEng Software and Electronic Systems Engineering | Queen's University Belfast", "bullets": ["Built ML pipelines"]},
+            ],
+        }
+        result, errors = _apply_canonical_entries(data, self._profile())
+        headers = [e["header"] for e in result["experience"]]
+        assert "Software Engineering Intern | Kraydel LTD" in headers
+        assert not any("Queen's University Belfast" in h for h in headers)
+        assert any("Rejected invented EXPERIENCE entry" in e for e in errors)
+
+    def test_projects_stay_additive_when_unmatched(self):
+        """The same unmatched-entry situation in PROJECTS is kept, not
+        rejected -- a profile can have real projects not yet registered."""
+        from applypilot.scoring.tailor import _apply_canonical_entries
+        profile = self._profile()
+        profile["resume_facts"]["canonical_entries"]["projects"] = [
+            {"match": ["EMG"], "header": "EMG Project", "subtitle": "2020 - 2025"},
+        ]
+        data = {
+            "experience": [{"header": "Software Engineering Intern | Kraydel LTD", "bullets": ["Shipped it"]}],
+            "projects": [
+                {"header": "EMG stuff", "bullets": ["Built pipelines"]},
+                {"header": "An unrelated personal project", "bullets": ["Did a thing"]},
+            ],
+        }
+        result, _ = _apply_canonical_entries(data, profile)
+        headers = [e["header"] for e in result["projects"]]
+        assert "EMG Project" in headers  # canonicalized
+        assert "An unrelated personal project" in headers  # kept, not rejected
+
+
+class TestCanonicalSkillsLines:
+    """TECHNICAL SKILLS renders only what the profile actually declares --
+    the LLM's own skills text is used purely to choose display order."""
+
+    def _profile(self):
+        return {"skills_boundary": {"programming_languages": ["Python", "Java", "Kotlin"]}}
+
+    def test_llm_cannot_add_a_skill(self):
+        """The exact incident: the model added 'LangChain (agent frameworks)'
+        and 'Kubernetes' to categories that never listed them, lifted
+        straight from the job's own requirements."""
+        from applypilot.scoring.tailor import _canonical_skills_lines
+        data = {"skills": {"Programming Languages": "Python (LLM integration, LangChain), Java, Kubernetes"}}
+        lines = _canonical_skills_lines(data, self._profile())
+        assert len(lines) == 1
+        assert "LangChain" not in lines[0]
+        assert "Kubernetes" not in lines[0]
+        assert "Python" in lines[0] and "Java" in lines[0] and "Kotlin" in lines[0]
+
+    def test_llm_text_only_reorders(self):
+        from applypilot.scoring.tailor import _canonical_skills_lines
+        data = {"skills": {"Programming Languages": "Kotlin is the main one, then Java, then Python."}}
+        lines = _canonical_skills_lines(data, self._profile())
+        assert lines[0] == "Programming Languages: Kotlin, Java, Python"
+
+    def test_no_skills_boundary_returns_empty(self):
+        from applypilot.scoring.tailor import _canonical_skills_lines
+        assert _canonical_skills_lines({"skills": {}}, {}) == []

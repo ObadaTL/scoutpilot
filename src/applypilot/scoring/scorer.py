@@ -14,8 +14,35 @@ from datetime import datetime, timezone
 from applypilot.config import RESUME_PATH, load_profile
 from applypilot.database import get_connection, get_jobs_by_stage
 from applypilot.llm import get_client
+from applypilot.scoring.validator import ToolLeakGuard
 
 log = logging.getLogger(__name__)
+
+_SENTENCE_SPLIT_RE = re.compile(r"(?<=[.!?])\s+")
+
+
+def _strip_fabricated_skill_sentences(reasoning: str, job: dict, profile: dict) -> str:
+    """Deterministic removal of any REASONING sentence that credits the
+    candidate with a job-description tool/tech they don't actually have
+    (see ToolLeakGuard).
+
+    Confirmed live 2026-08-26: REASONING claimed "experience with LLM APIs
+    (via Hugging Face)" for a candidate whose real resume never mentions
+    Hugging Face, purely because the job posting asked for it. There's no
+    retry budget in scoring to ask the model to redo this (score_job makes
+    exactly one call), so this is sentence-level surgery -- the same
+    failure mode cover_letter.py's retry-exhaustion fallback already
+    handles for letters, applied here since scoring has no fallback path
+    of its own to reuse.
+    """
+    if not reasoning:
+        return reasoning
+    guard = ToolLeakGuard(profile or {})
+    sentences = _SENTENCE_SPLIT_RE.split(reasoning)
+    kept = [s for s in sentences if not guard.find_leaks(job, s)]
+    if not kept:
+        return "Reasoning omitted after removing unverified skill claims."
+    return " ".join(kept).strip()
 
 
 # ── Scoring Prompt ────────────────────────────────────────────────────────
@@ -33,6 +60,8 @@ STEP 2 -- Score using these criteria:
 
 HARD RULE: A candidate with under 2 years of professional experience applying to a role titled or scoped as Senior/Staff/Lead/Principal/Architect (owns architecture, mentors others, X+ years explicitly required) should score 4 or below UNLESS the posting explicitly says junior/graduate candidates are welcome or experience requirements are flexible.
 
+HARD RULE ON GRADUATE/ENTRY-LEVEL ROLES: Having SOME prior placement, internship, or industry experience is NEVER a penalty for a graduate/entry-level/junior posting -- it is a genuine advantage over a candidate with none, and REASONING must never describe it as excessive, a mismatch, or "slightly below" what the role wants. A candidate is only overqualified for a graduate role if their experience is at Senior level or above; a single placement/internship is not that, regardless of how many months it lasted.
+
 IMPORTANT FACTORS:
 - Weight technical skills heavily (programming languages, frameworks, tools)
 - Consider transferable experience (automation, scripting, API work)
@@ -45,12 +74,38 @@ know about this company from training. If the description doesn't say what
 the company does or build, output NULL for both -- a guess is worse than
 nothing.
 
+HARD RULE ON REASONING: REASONING may only credit the candidate with a skill, tool, or technology that is LITERALLY present in the RESUME text below. Never write that the candidate has experience with something only because the JOB POSTING mentions it -- if the resume doesn't name it, it is not one of their skills, no matter how close the job's stack is to what they do have.
+
+STEP 3 -- ELIGIBILITY EXTRACTION (separate from the score above; a deterministic
+check applies these afterward, you are only extracting what the posting itself
+says). Read the FULL posting body, not just a location tag -- a board can mislabel
+location while the body states the real requirement (e.g. tagged "Remote GB" while
+the body says "must be authorised to work in the USA").
+- REQUIRED_COUNTRY: the single country/region this role legally requires the
+  candidate to already be authorised to work in, if the posting states one
+  explicitly (e.g. "USA", "United Kingdom", "must be an EU citizen"). A
+  "Remote" tag does NOT by itself mean NULL here -- a role can be fully remote
+  and still require the candidate to already live in and hold work
+  authorisation for one specific country (e.g. "Remote (must be authorised to
+  work in the USA)" is a real US requirement despite the word "Remote"). NULL
+  only if the posting doesn't name a required country at all, is explicitly
+  open to candidates anywhere, or explicitly offers visa sponsorship/relocation.
+- REQUIRED_WORK_AUTH: the specific authorisation/visa status explicitly required
+  or explicitly listed as acceptable (e.g. "US citizenship", "STEM OPT/F1",
+  "UK right to work", "EU work permit"). NULL if not stated.
+- MIN_YEARS_COMMERCIAL: the minimum years of commercial/professional (not
+  academic/project) experience explicitly required, as a plain integer. NULL if
+  the posting doesn't state a specific number.
+
 RESPOND IN EXACTLY THIS FORMAT (no other text):
 SCORE: [1-10]
 KEYWORDS: [comma-separated ATS keywords from the job description that match or could match the candidate]
 REASONING: [2-3 sentences explaining the score, EXPLICITLY addressing seniority fit]
 COMPANY_SUMMARY: [2 sentences: what the company does, what the team builds. NULL if the description doesn't say.]
-COMPANY_HOOK: [one concrete, specific thing worth mentioning in a cover letter -- a product, a technical problem, a domain. NULL if there's nothing specific enough.]"""
+COMPANY_HOOK: [one concrete, specific thing worth mentioning in a cover letter -- a product, a technical problem, a domain. NULL if there's nothing specific enough.]
+REQUIRED_COUNTRY: [see STEP 3. NULL if none stated.]
+REQUIRED_WORK_AUTH: [see STEP 3. NULL if none stated.]
+MIN_YEARS_COMMERCIAL: [see STEP 3. NULL if none stated.]"""
 
 
 def _build_candidate_level(profile: dict) -> str:
@@ -69,7 +124,10 @@ def _build_candidate_level(profile: dict) -> str:
 
     lines = ["CANDIDATE LEVEL:"]
     if years:
-        lines.append(f"- Years of professional experience: {years}")
+        lines.append(
+            f"- Years of professional experience: {years} "
+            f"-- state this precisely in REASONING, do not round up to the next whole year"
+        )
     if target:
         lines.append(f"- Target role: {target}")
     if education:
@@ -160,10 +218,122 @@ def _parse_score_response(response: str) -> dict:
     hook_match = re.search(rf"\bCOMPANY_HOOK\b{_LABEL_SEP}([^\n]+)", response, re.IGNORECASE)
     company_hook = _clean_optional_field(hook_match.group(1) if hook_match else None)
 
+    country_match = re.search(rf"\bREQUIRED_COUNTRY\b{_LABEL_SEP}([^\n]+)", response, re.IGNORECASE)
+    required_country = _clean_optional_field(country_match.group(1) if country_match else None)
+
+    auth_match = re.search(rf"\bREQUIRED_WORK_AUTH\b{_LABEL_SEP}([^\n]+)", response, re.IGNORECASE)
+    required_work_auth = _clean_optional_field(auth_match.group(1) if auth_match else None)
+
+    years_match = re.search(rf"\bMIN_YEARS_COMMERCIAL\b{_LABEL_SEP}([^\n]+)", response, re.IGNORECASE)
+    years_raw = _clean_optional_field(years_match.group(1) if years_match else None)
+    min_years_commercial = None
+    if years_raw:
+        digits = re.search(r"\d+", years_raw)
+        if digits:
+            min_years_commercial = int(digits.group())
+
     return {
         "score": score, "keywords": keywords, "reasoning": reasoning,
         "company_summary": company_summary, "company_hook": company_hook,
+        "required_country": required_country, "required_work_auth": required_work_auth,
+        "min_years_commercial": min_years_commercial,
     }
+
+
+# A country name/adjective the posting used -> its normalized canonical form,
+# for comparing REQUIRED_COUNTRY (LLM-extracted, from the posting's own text)
+# against the candidate's profile.personal.country. Deliberately covers only
+# the handful of names likely to show up as an explicit eligibility
+# requirement -- an unrecognized name still compares as itself, so a country
+# missing from this map degrades to "no match" (gate fires) rather than
+# "silently ignored", which is the safer failure direction for a hard gate.
+_COUNTRY_ALIASES: dict[str, str] = {
+    "usa": "united states", "us": "united states", "u.s.": "united states",
+    "u.s.a.": "united states", "america": "united states",
+    "united states of america": "united states",
+    "uk": "united kingdom", "u.k.": "united kingdom", "great britain": "united kingdom",
+    "britain": "united kingdom", "england": "united kingdom", "scotland": "united kingdom",
+    "wales": "united kingdom", "northern ireland": "united kingdom",
+}
+
+
+def _normalize_country(name: str | None) -> str | None:
+    if not name:
+        return None
+    cleaned = re.sub(r"[^a-z\s.]", "", name.lower()).strip()
+    if not cleaned:
+        return None
+    return _COUNTRY_ALIASES.get(cleaned, cleaned)
+
+
+def apply_eligibility_gate(parsed: dict, profile: dict | None) -> dict:
+    """Deterministic hard-eligibility check, run after the LLM's own score
+    and before it's stored.
+
+    The LLM only extracts what the posting itself says (REQUIRED_COUNTRY /
+    REQUIRED_WORK_AUTH / MIN_YEARS_COMMERCIAL, read from the full body --
+    see SCORE_PROMPT's STEP 3, deliberately NOT the job board's `location`
+    column, which can disagree with the posting's own text, e.g. tagged
+    "Remote GB" while the body requires US work authorization). The
+    comparison against the candidate's actual profile happens here in code,
+    not in the LLM's own judgement -- the same separation NumericGuard uses
+    for numbers: the model reads and extracts, code enforces the hard rule.
+
+    A posting requiring work authorization/location the candidate doesn't
+    hold caps the score at 1 -- nothing else about the fit matters if
+    they're not eligible to be hired. A posting requiring more commercial
+    experience than the profile shows caps at 5. Both can fire together
+    (the lower cap wins); neither fires if the LLM didn't extract a
+    requirement, so a posting silent on eligibility is never gated.
+
+    Returns:
+        `parsed` with "score" capped if gated, plus a new "gate_reason" key
+        (a human-readable string, or None if nothing was gated).
+    """
+    result = dict(parsed)
+    profile = profile or {}
+    reasons: list[str] = []
+    caps: list[int] = []
+
+    personal = profile.get("personal", {}) or {}
+    work_auth = profile.get("work_authorization", {}) or {}
+    candidate_country = _normalize_country(personal.get("country"))
+    required_country = _normalize_country(parsed.get("required_country"))
+    if required_country and candidate_country and required_country != candidate_country:
+        caps.append(1)
+        reasons.append(
+            f"Requires work authorisation/location in {parsed.get('required_country')}; "
+            f"profile is based in {personal.get('country') or 'unknown'}."
+        )
+
+    required_auth = str(parsed.get("required_work_auth") or "").strip().lower()
+    candidate_permit = str(work_auth.get("work_permit_type") or "").strip().lower()
+    if required_auth and required_auth not in candidate_permit and candidate_permit not in required_auth:
+        caps.append(1)
+        reasons.append(
+            f"Requires '{parsed.get('required_work_auth')}'; profile's work authorisation is "
+            f"'{work_auth.get('work_permit_type') or 'not specified'}'."
+        )
+
+    min_years = parsed.get("min_years_commercial")
+    if min_years is not None:
+        try:
+            candidate_years = float((profile.get("experience", {}) or {}).get("years_of_experience_total") or 0)
+        except (TypeError, ValueError):
+            candidate_years = 0.0
+        if min_years > candidate_years:
+            caps.append(5)
+            reasons.append(
+                f"Requires {min_years}+ years commercial experience; profile shows {candidate_years:g}."
+            )
+
+    if reasons:
+        result["gate_reason"] = " ".join(reasons)
+        original_score = result.get("score") or 0
+        result["score"] = min([original_score] + caps) if original_score else min(caps)
+    else:
+        result["gate_reason"] = None
+    return result
 
 
 def score_job(resume_text: str, job: dict, profile: dict | None = None) -> dict:
@@ -173,12 +343,15 @@ def score_job(resume_text: str, job: dict, profile: dict | None = None) -> dict:
         resume_text: The candidate's full resume text.
         job: Job dict with keys: title, site, location, full_description.
         profile: User profile dict -- used to make the candidate's actual
-            experience level explicit (see _build_candidate_level). Optional
-            only so score_job stays callable in isolation/tests.
+            experience level explicit (see _build_candidate_level), and to
+            apply the eligibility gate (see apply_eligibility_gate). Optional
+            only so score_job stays callable in isolation/tests -- with no
+            profile, the gate has nothing to compare against and never fires.
 
     Returns:
         {"score": int, "keywords": str, "reasoning": str,
-         "company_summary": str | None, "company_hook": str | None}
+         "company_summary": str | None, "company_hook": str | None,
+         "gate_reason": str | None}
     """
     job_text = (
         f"TITLE: {job['title']}\n"
@@ -197,21 +370,33 @@ def score_job(resume_text: str, job: dict, profile: dict | None = None) -> dict:
     try:
         client = get_client()
         response = client.chat(messages, max_tokens=1024, temperature=0.2)
-        return _parse_score_response(response)
+        parsed = _parse_score_response(response)
+        if profile is not None:
+            parsed["reasoning"] = _strip_fabricated_skill_sentences(parsed["reasoning"], job, profile)
+        return apply_eligibility_gate(parsed, profile)
     except Exception as e:
         log.error("LLM error scoring job '%s': %s", job.get("title", "?"), e)
         return {
             "score": 0, "keywords": "", "reasoning": f"LLM error: {e}",
-            "company_summary": None, "company_hook": None,
+            "company_summary": None, "company_hook": None, "gate_reason": None,
         }
 
 
-def run_scoring(limit: int = 0, rescore: bool = False) -> dict:
+def run_scoring(
+    limit: int = 0,
+    rescore: bool = False,
+    channel: str | None = None,
+    opp_type: str | None = None,
+    keywords: str | list[str] | None = None,
+) -> dict:
     """Score unscored jobs that have full descriptions.
 
     Args:
-        limit: Maximum number of jobs to score in this run.
+        limit: Maximum number of jobs to score in this run (0 = all available).
         rescore: If True, re-score all jobs (not just unscored ones).
+        channel: Optional channel filter (e.g. 'direct_ats', 'hacker_news', 'graduate_schemes').
+        opp_type: Optional opportunity type filter (e.g. 'graduate_scheme', 'funded_training').
+        keywords: Optional keyword filter (e.g. 'AI, python, signal processing, machine learning').
 
     Returns:
         {"scored": int, "errors": int, "elapsed": float, "distribution": list}
@@ -226,7 +411,14 @@ def run_scoring(limit: int = 0, rescore: bool = False) -> dict:
             query += f" LIMIT {limit}"
         jobs = conn.execute(query).fetchall()
     else:
-        jobs = get_jobs_by_stage(conn=conn, stage="pending_score", limit=limit)
+        jobs = get_jobs_by_stage(
+            conn=conn,
+            stage="pending_score",
+            limit=limit,
+            channel=channel,
+            opp_type=opp_type,
+            keywords=keywords,
+        )
 
     if not jobs:
         log.info("No unscored jobs with descriptions found.")
@@ -258,10 +450,11 @@ def run_scoring(limit: int = 0, rescore: bool = False) -> dict:
 
         conn.execute(
             "UPDATE jobs SET fit_score = ?, score_reasoning = ?, scored_at = ?, "
-            "company_summary = ?, company_hook = ? WHERE url = ?",
+            "company_summary = ?, company_hook = ?, gate_reason = ? WHERE url = ?",
             (result["score"], f"{result['keywords']}\n{result['reasoning']}",
              datetime.now(timezone.utc).isoformat(),
-             result.get("company_summary"), result.get("company_hook"), job["url"]),
+             result.get("company_summary"), result.get("company_hook"),
+             result.get("gate_reason"), job["url"]),
         )
         conn.commit()
 

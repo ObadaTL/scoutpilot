@@ -141,10 +141,20 @@ def _build_cover_letter_prompt(profile: dict, job: dict, fact_bank: FactBank) ->
 
     company_hook = job.get("company_hook")
     if company_hook:
+        # Deliberately NOT phrased as a sentence template. This used to read
+        # "...is somewhere you actually want to be" -- a small local model
+        # doesn't paraphrase an instruction shaped like the sentence it
+        # wants, it echoes it back with the pronoun flipped. Confirmed live
+        # 2026-08-26: a shipped letter closed on "This is somewhere I
+        # actually want to be", word-for-word the instruction minus "you"/"I".
+        # Describing the required CONTENT in the abstract, with an explicit
+        # instruction not to reuse this wording, keeps the model generating
+        # its own sentence instead of copying this one.
         hook_instruction = (
-            f'State why the specific work described here -- {company_hook} -- '
-            f'is somewhere you actually want to be. Not a compliment about the '
-            f'company in general, this exact thing.'
+            f'Name this specific detail from the posting: {company_hook}. In your own words -- '
+            f'not a compliment about the company in general, this exact thing -- explain the '
+            f'concrete reason it matters to the work you want next. Do not reuse any wording from '
+            f'this instruction itself; write a sentence that does not exist anywhere above.'
         )
     else:
         # No scraped company fact for this job (true for well over half of
@@ -160,9 +170,11 @@ def _build_cover_letter_prompt(profile: dict, job: dict, fact_bank: FactBank) ->
         hook_instruction = (
             "You have no company background for this one, so use the posting "
             "itself: name ONE concrete requirement, system, or problem from "
-            "the job description above and say why that is work you want. "
-            "Quote their own terminology. Do not praise the company in "
-            "general terms and do not invent anything about them."
+            "the job description above, then write a fresh sentence -- your own "
+            "words, not a restatement of this instruction -- explaining your own "
+            "reason for wanting to work on that specific thing. Quote their own "
+            "terminology for the requirement/system/problem itself. Do not praise "
+            "the company in general terms and do not invent anything about them."
         )
 
     return f"""Write a cover letter for {sign_off_name}. The goal is to get an interview.
@@ -445,7 +457,10 @@ def generate_cover_letter(
     sign_off_name = personal.get("preferred_name") or personal.get("full_name", "")
 
     def _full_validate(candidate: str) -> dict:
-        base = validate_cover_letter(candidate, mode=validation_mode)
+        base = validate_cover_letter(
+            candidate, mode=validation_mode,
+            job_description=job.get("full_description") or "", sign_off_name=sign_off_name,
+        )
         errors = list(base["errors"])
         try:
             numeric_guard.check(candidate)
@@ -516,6 +531,30 @@ def generate_cover_letter(
         validation = _full_validate(letter)
 
         if validation["passed"]:
+            # Critic pass: extraction-only questions, CODE applies the
+            # thresholds (see critic.py's module docstring). Only spent
+            # once the letter has already cleared every harder check --
+            # `resume_text` here is the candidate's tailored CV, the
+            # source of truth the critic checks claims against. Import
+            # deferred to break the module cycle (critic.py imports
+            # extract_json from tailor.py).
+            from applypilot.scoring.critic import run_letter_critic
+            critic_result = run_letter_critic(client, letter, resume_text)
+            validation["critic_score"] = critic_result.score
+            validation["critic_findings"] = critic_result.findings
+            if not critic_result.findings:
+                return letter, validation
+            if attempt != max_retries:
+                avoid_notes.extend(critic_result.findings)
+                log.debug(
+                    "Cover letter attempt %d/%d passed validation but critic flagged: %s",
+                    attempt + 1, max_retries + 1, critic_result.findings,
+                )
+                continue
+            log.info(
+                "Shipping cover letter with critic score %.1f/10 despite findings: %s",
+                critic_result.score, "; ".join(critic_result.findings),
+            )
             return letter, validation
 
         avoid_notes.extend(validation["errors"])
@@ -637,11 +676,24 @@ def _generate_one_cover_letter(conn, job: dict, base_resume_text: str, profile: 
 
     Returns:
         {"url", "title", "site", "status": one of "generated"/"pdf_failed"/
-        "failed_validation"/"error", "fallback_to_base": bool, "path",
-        "pdf_path", "errors": list[str]}.
+        "failed_validation"/"gated"/"error", "fallback_to_base": bool,
+        "path", "pdf_path", "errors": list[str]}.
     """
     now = datetime.now(timezone.utc).isoformat()
     fallback_to_base = False
+
+    # Mirrors tailor.py's _tailor_one_job gate check: a gated job never gets
+    # a cover letter either. In practice this rarely fires -- a gated job's
+    # tailor_attempts never produces a tailored_resume_path, and every
+    # caller here requires one -- but it's a cheap, correct short-circuit
+    # rather than relying on that as an accident of ordering.
+    if job.get("gate_reason"):
+        log.info("[GATED] %s -- skipped, no cover letter generated: %s", job["title"][:40], job["gate_reason"])
+        return {
+            "url": job["url"], "title": job["title"], "site": job["site"],
+            "status": "gated", "fallback_to_base": False,
+            "path": None, "pdf_path": None, "errors": [job["gate_reason"]],
+        }
 
     try:
         # Use THIS job's tailored resume, not the base one -- the caller's
@@ -700,11 +752,13 @@ def _generate_one_cover_letter(conn, job: dict, base_resume_text: str, profile: 
         success = validation["passed"] and pdf_path is not None
 
         if success:
+            from applypilot.scoring.critic import combined_critic_score
+            new_critic_score = combined_critic_score(job.get("critic_score"), validation.get("critic_score"))
             conn.execute(
                 "UPDATE jobs SET cover_letter_path=?, cover_letter_at=?, "
-                "cover_letter_passed=1, cover_letter_errors=NULL, "
+                "cover_letter_passed=1, cover_letter_errors=NULL, critic_score=?, "
                 "cover_attempts=COALESCE(cover_attempts,0)+1 WHERE url=?",
-                (str(cl_path), now, job["url"]),
+                (str(cl_path), now, new_critic_score, job["url"]),
             )
             status = "generated"
             log.info("[OK] %s | %s", job["title"][:40], job["site"])

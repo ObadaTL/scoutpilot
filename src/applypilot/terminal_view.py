@@ -52,8 +52,8 @@ def list_jobs(min_fit: int = 0, limit: int = 20, site: str | None = None,
 
     query = f"""
         SELECT url, title, site, location, fit_score, company_summary, company_hook,
-               tailored_resume_path, cover_letter_path, apply_status, applied_at,
-               apply_error, application_url
+               gate_reason, critic_score, tailored_resume_path, cover_letter_path, apply_status,
+               applied_at, apply_error, application_url
         FROM jobs
         WHERE {' AND '.join(where_clauses)}
         ORDER BY fit_score DESC NULLS LAST, title
@@ -100,7 +100,16 @@ def render_jobs(jobs: list[dict], console: Console | None = None) -> None:
         else:
             status_tag = "[dim]NOT APPLIED[/dim]"
 
-        lines = [f"Fit: {fit_str}  |  Status: {status_tag}"]
+        critic = job.get("critic_score")
+        # "Critic" label, not "fit"-style styling -- this is a computed
+        # value from discrete findings, not an LLM-assigned score.
+        critic_str = f"  |  Critic: [dim]{critic:.1f}/10 (computed)[/dim]" if critic is not None else ""
+
+        lines = [f"Fit: {fit_str}  |  Status: {status_tag}{critic_str}"]
+
+        if job.get("gate_reason"):
+            lines.append("")
+            lines.append(f"[bold red]⛔ Eligibility gate:[/bold red] {job['gate_reason']}")
 
         if job.get("company_summary"):
             lines.append("")

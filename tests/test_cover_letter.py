@@ -302,9 +302,17 @@ class _CleanClient:
     names the company (required by _check_company_mentioned), and produces a
     letter of real length and shape -- validate_cover_letter now rejects a
     stub in every mode, so a two-line fixture would fail for reasons that
-    have nothing to do with what these integration tests are checking."""
+    have nothing to do with what these integration tests are checking.
 
-    def chat(self, messages, max_tokens=1024, temperature=0.7):
+    Also stands in for the critic pass's extraction call (json_schema set):
+    a letter this clean has no unsupported claims to report, so these
+    integration tests -- about PDF failure and retry-budget accounting, not
+    about the critic -- see it pass straight through.
+    """
+
+    def chat(self, messages, max_tokens=1024, temperature=0.7, json_schema=None):
+        if json_schema is not None:
+            return '{"unsupported_claims": []}'
         return (
             "Dear Hiring Manager,\n\n"
             "I built a reporting workflow that removed a manual end-of-month "
@@ -407,3 +415,88 @@ class TestStructuralValidation:
         )
         assert "%" not in stripped
         assert stripped == "Owned the service end to end."
+
+    def test_dangling_opener_glued_to_salutation_is_still_caught(self):
+        """The real bug: no blank line between "Dear Hiring Manager," and the
+        dangling first sentence used to hide the whole paragraph from the
+        check (it starts with "dear", so it looked like pure greeting)."""
+        from applypilot.scoring.validator import has_dangling_reference
+
+        letter = (
+            "Dear Hiring Manager,\n"
+            "This directly solves the same data challenges your team faces when "
+            "building scalable systems and data pipelines.\n\n"
+            "At Acme I designed and shipped an audit-event system across the "
+            "backend and the datastore, keeping data integrity intact under load."
+        )
+        assert has_dangling_reference(letter) is True
+
+    def test_repeated_phrase_is_rejected(self):
+        """The same 5+ word claim showing up twice reads as padding, not two
+        different pieces of evidence."""
+        from applypilot.scoring.validator import validate_cover_letter
+
+        letter = self._wrap(
+            "I want to build scalable systems and data pipelines for teams that "
+            "need reliable infrastructure they can depend on every day.\n\n"
+            "At Acme I designed and shipped an audit-event system, which is the "
+            "same rigorous approach your team needs to build scalable systems "
+            "and data pipelines that hold up under real production load."
+        )
+        result = validate_cover_letter(letter, mode="lenient")
+        assert result["passed"] is False
+        assert any("Repeats the phrase" in e for e in result["errors"])
+
+    def test_lifted_jd_span_is_rejected(self):
+        """Reciting the posting's own marketing copy back at it isn't
+        personalization."""
+        from applypilot.scoring.validator import validate_cover_letter
+
+        jd = (
+            "Acme is building a global financial super app, offering services "
+            "such as spending, saving, investing, exchanging, and traveling."
+        )
+        letter = self._wrap(
+            "I built a reporting pipeline that removed a manual end-of-month "
+            "process for the finance team, cutting a two-day close down to an "
+            "afternoon.\n\n"
+            "Acme is building a global financial super app, offering services "
+            "such as spending, saving, investing, exchanging, and traveling, "
+            "and that is exactly where I want to spend my time next."
+        )
+        result = validate_cover_letter(letter, mode="lenient", job_description=jd)
+        assert result["passed"] is False
+        assert any("near-verbatim from the job description" in e for e in result["errors"])
+
+    def test_meta_reference_with_company_name_swapped_in_is_still_caught(self):
+        """LLM_LEAK_PHRASES only banned the literal 'the job description
+        mentions ...' -- swapping in the company's own possessive
+        ('Revolut's description mentions ...') said the identical
+        narrating-instead-of-claiming thing and passed. Confirmed live
+        2026-08-26."""
+        from applypilot.scoring.validator import validate_cover_letter
+
+        letter = self._wrap(
+            "I built a reporting pipeline that removed a manual end-of-month "
+            "process, cutting a two-day close down to an afternoon for the "
+            "whole finance team every single month.\n\n"
+            "Acme's description mentions building data pipelines to support "
+            "reporting and analytics, and that is exactly the kind of work I "
+            "want to keep doing next in my career."
+        )
+        result = validate_cover_letter(letter, mode="lenient")
+        assert result["passed"] is False
+        assert any("Narrates the source" in e for e in result["errors"])
+
+    def test_clean_signoff_is_not_flagged(self):
+        from applypilot.scoring.validator import has_bad_signoff
+        assert has_bad_signoff("Sincerely,\n\nJordan", "Jordan") is None
+
+    def test_signoff_with_trailing_text_is_rejected(self):
+        """The prompt asks for 'Sincerely,' then the name and nothing else --
+        a trailing note past that point is the model not stopping where told."""
+        from applypilot.scoring.validator import has_bad_signoff
+
+        error = has_bad_signoff("Sincerely,\n\nJordan\nP.S. I would love to chat!", "Jordan")
+        assert error is not None
+        assert "more than just the name" in error

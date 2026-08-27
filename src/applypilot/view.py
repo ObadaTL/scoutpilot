@@ -204,11 +204,11 @@ def generate_dashboard(output_path: str | None = None, serve_base_url: str | Non
     jobs = conn.execute("""
         SELECT url, title, salary, description, location, site, strategy,
                full_description, application_url, detail_error,
-               fit_score, score_reasoning, company_summary, company_hook,
+               fit_score, score_reasoning, company_summary, company_hook, gate_reason, critic_score,
                tailored_resume_path, tailored_at, tailor_attempts,
                cover_letter_path, cover_letter_at, cover_attempts,
                applied_at, apply_status, apply_error, apply_attempts,
-               last_attempted_at, verification_confidence, hidden
+               last_attempted_at, verification_confidence, hidden, discovered_at
         FROM jobs
         WHERE fit_score IS NOT NULL OR tailored_resume_path IS NOT NULL
         ORDER BY fit_score DESC, site, title
@@ -281,7 +281,7 @@ def generate_dashboard(output_path: str | None = None, serve_base_url: str | Non
     # Job cards grouped by score
     job_sections = ""
     current_score = None
-    for j in jobs:
+    for card_order, j in enumerate(jobs):
         score = j["fit_score"] or 0
         if score != current_score:
             if current_score is not None:
@@ -365,6 +365,17 @@ def generate_dashboard(output_path: str | None = None, serve_base_url: str | Non
             else:
                 uri = escape(target.as_uri())
             preview_title = escape(f"{label} ({kind}) — {j['title'] or ''}")
+            # The most common reason to click Open Folder turned out to be
+            # "get the filename so I can paste it into an upload dialog" --
+            # give that its own one-click button instead of routing through
+            # the file manager every time. Works on a static file:// export
+            # too, unlike Open Folder/Preview, since it's pure client-side
+            # clipboard access with no server involved.
+            copy_btn = (
+                f'<button type="button" class="asset-btn copy-btn" '
+                f'data-filename="{escape(target.name)}" onclick="copyFilename(this)">'
+                f'\U0001f4cb Copy Filename</button>'
+            )
             # Open Folder needs the local server to actually run a process on
             # this machine -- only wire it up when one is behind the page (a
             # static file:// snapshot has nothing listening to ask).
@@ -377,6 +388,7 @@ def generate_dashboard(output_path: str | None = None, serve_base_url: str | Non
                 )
             return (
                 f'<a href="{uri}" class="asset-btn {css_class}" target="_blank">{icon} {label} ({kind})</a>'
+                f'{copy_btn}'
                 f'<button type="button" class="asset-btn preview-btn" '
                 f"onclick=\"openPreview('{uri}', '{preview_title}')\">"
                 f"\U0001f441️ Preview</button>"
@@ -469,6 +481,8 @@ def generate_dashboard(output_path: str | None = None, serve_base_url: str | Non
 
         company_summary = escape(j["company_summary"] or "")
         company_hook = escape(j["company_hook"] or "")
+        gate_reason = escape(j["gate_reason"] or "")
+        critic_score = j["critic_score"]
 
         meta_parts = [
             f'<span class="meta-tag site-tag" style="background:{site_color}33;color:{site_color}">{site}</span>'
@@ -489,16 +503,22 @@ def generate_dashboard(output_path: str | None = None, serve_base_url: str | Non
         actions_html = f'<div class="card-actions">{" ".join(action_buttons)}</div>'
 
         job_sections += f"""
-        <div class="job-card" data-url="{url}" data-score="{score}" data-site="{escape(j['site'] or '')}" data-status="{data_status}" data-hidden="{1 if is_hidden else 0}" data-place="{escape(place_labels[j['url']])}" data-has-cv="{1 if tailored_cv else 0}" data-has-cl="{1 if cover_letter else 0}">
+        <div class="job-card" data-url="{url}" data-score="{score}" data-site="{escape(j['site'] or '')}" data-status="{data_status}" data-hidden="{1 if is_hidden else 0}" data-place="{escape(place_labels[j['url']])}" data-has-cv="{1 if tailored_cv else 0}" data-has-cl="{1 if cover_letter else 0}" data-order="{card_order}" data-discovered="{escape(j['discovered_at'] or '')}" data-tailored="{escape(j['tailored_at'] or '')}" data-applied="{escape(applied_at or '')}" data-gated="{1 if gate_reason else 0}">
           <div class="card-header">
             <div class="card-title-group">
               <span class="score-pill" style="background:{'#10b981' if score >= 7 else ('#f59e0b' if score >= 5 else '#ef4444')}">{score}</span>
+              {f'<span class="critic-pill" title="Critic score: computed from discrete findings (bullet density, header restatement, JD relevance, duplicate content), not model-assigned like the fit score.">&#128269; {critic_score:.1f}</span>' if critic_score is not None else ''}
               <a href="{url}" class="job-title" target="_blank">{title}</a>
             </div>
             {status_pill}
           </div>
 
+          {f'''<div class="gate-box">
+            <strong>&#9940; Eligibility gate:</strong> {gate_reason}
+          </div>''' if gate_reason else ''}
+
           <div class="meta-row">{meta_html}</div>
+          <button type="button" class="card-compact-toggle" onclick="toggleCardExpand(this)">&#9662; Details</button>
 
           {f'''<div class="company-box">
             <div class="company-summary"><strong>🏢 Company Context:</strong> {company_summary}</div>
@@ -577,8 +597,23 @@ def generate_dashboard(output_path: str | None = None, serve_base_url: str | Non
   .search-input {{ background: #1e293b; border: 1px solid #334155; color: #f8fafc; padding: 0.45rem 1rem; border-radius: 6px; font-size: 0.85rem; flex: 1; min-width: 250px; outline: none; }}
   .search-input:focus {{ border-color: #3b82f6; }}
 
+  .sort-select {{ background: #1e293b; border: 1px solid #334155; color: #f8fafc; padding: 0.35rem 0.7rem; border-radius: 6px; font-size: 0.8rem; cursor: pointer; outline: none; }}
+  .sort-select:focus {{ border-color: #3b82f6; }}
+
   .hide-toggle {{ display: flex; align-items: center; gap: 0.5rem; color: #cbd5e1; font-size: 0.85rem; font-weight: 600; cursor: pointer; user-select: none; }}
   .hide-toggle input {{ width: 1rem; height: 1rem; cursor: pointer; accent-color: #3b82f6; }}
+
+  /* Compact view -- collapses the heavier per-card detail blocks so more
+     cards fit on screen at once; a card the user expands individually
+     stays expanded (.expanded) even while compact mode is on. */
+  .card-compact-toggle {{ display: none; align-self: flex-start; background: none; border: none; color: #60a5fa; font-size: 0.78rem; font-weight: 600; cursor: pointer; padding: 0 0 0.6rem; font-family: inherit; }}
+  .card-compact-toggle:hover {{ color: #93c5fd; text-decoration: underline; }}
+  body.compact-mode .card-compact-toggle {{ display: inline-flex; }}
+  body.compact-mode .job-card:not(.expanded) .company-box,
+  body.compact-mode .job-card:not(.expanded) .analysis-box,
+  body.compact-mode .job-card:not(.expanded) .keywords-box,
+  body.compact-mode .job-card:not(.expanded) .desc-preview,
+  body.compact-mode .job-card:not(.expanded) .full-desc-details {{ display: none; }}
 
   /* Score & Site Visualizations */
   .analytics-grid {{ display: grid; grid-template-columns: 1fr 1fr; gap: 1.5rem; margin-bottom: 2.5rem; }}
@@ -618,6 +653,10 @@ def generate_dashboard(output_path: str | None = None, serve_base_url: str | Non
   .card-title-group {{ display: flex; align-items: center; gap: 0.6rem; flex: 1; }}
 
   .score-pill {{ display: inline-flex; align-items: center; justify-content: center; min-width: 1.85rem; height: 1.85rem; border-radius: 6px; color: #0b0f19; font-weight: 800; font-size: 0.9rem; flex-shrink: 0; }}
+  /* Dashed border, not a solid fill like score-pill -- visually marks this
+     as a COMPUTED value (critic findings run through fixed weights), not
+     an LLM-assigned score the way fit_score is. */
+  .critic-pill {{ display: inline-flex; align-items: center; gap: 0.2rem; height: 1.6rem; padding: 0 0.5rem; border-radius: 6px; border: 1px dashed #7c8aa5; color: #c7d0e0; font-weight: 700; font-size: 0.78rem; flex-shrink: 0; cursor: help; }}
   .job-title {{ color: #f1f5f9; text-decoration: none; font-weight: 700; font-size: 1.05rem; line-height: 1.3; }}
   .job-title:hover {{ color: #60a5fa; text-decoration: underline; }}
 
@@ -639,6 +678,9 @@ def generate_dashboard(output_path: str | None = None, serve_base_url: str | Non
   .meta-tag.location {{ background: #1e3a5f44; color: #93c5fd; border: 1px solid #1e3a5f; }}
 
   /* Company Box */
+  .gate-box {{ background: #450a0a; color: #fca5a5; padding: 0.6rem 0.9rem; border-radius: 8px; margin-bottom: 0.85rem; border: 1px solid #b91c1c; font-size: 0.8rem; line-height: 1.4; }}
+  .gate-box strong {{ color: #fecaca; }}
+
   .company-box {{ background: #0f1629; padding: 0.75rem 0.9rem; border-radius: 8px; margin-bottom: 0.85rem; border-left: 3px solid #3b82f6; font-size: 0.82rem; }}
   .company-summary {{ color: #cbd5e1; margin-bottom: 0.35rem; line-height: 1.45; }}
   .company-hook {{ color: #93c5fd; line-height: 1.4; }}
@@ -665,6 +707,8 @@ def generate_dashboard(output_path: str | None = None, serve_base_url: str | Non
   .preview-btn:hover {{ background: #075985; color: #ffffff; border-color: #38bdf8; }}
   .folder-btn {{ background: #292524; color: #fcd34d; border: 1px solid #78716c; cursor: pointer; font-family: inherit; }}
   .folder-btn:hover {{ background: #44403c; color: #ffffff; border-color: #d6d3d1; }}
+  .copy-btn {{ background: #0f2e1e; color: #86efac; border: 1px solid #16a34a; cursor: pointer; font-family: inherit; }}
+  .copy-btn:hover {{ background: #14532d; color: #ffffff; border-color: #22c55e; }}
 
   /* Manual status controls */
   .manage-row {{ display: flex; flex-wrap: wrap; gap: 0.5rem; margin-bottom: 0.95rem; }}
@@ -789,6 +833,7 @@ def generate_dashboard(output_path: str | None = None, serve_base_url: str | Non
     <button class="filter-btn" onclick="filterStatus('cl', this)">Has Cover Letter</button>
     <button class="filter-btn" onclick="filterStatus('failed', this)">Needs Review / Failed</button>
     <button class="filter-btn" onclick="filterStatus('unavailable', this)">Unavailable (Closed/Manual)</button>
+    <button class="filter-btn" onclick="filterStatus('gated', this)">⛔ Eligibility gated</button>
     <button class="filter-btn" onclick="filterStatus('hidden', this)">🙈 Hidden by you</button>
   </div>
 
@@ -800,13 +845,28 @@ def generate_dashboard(output_path: str | None = None, serve_base_url: str | Non
 
   <div class="filter-row">
     <span class="filter-label">Search:</span>
-    <input type="text" class="search-input" placeholder="Search by title, company, skills, location..." oninput="filterText(this.value)">
+    <input type="text" id="search-input" class="search-input" placeholder="Search by title, company, skills, location..." oninput="filterText(this.value)">
+  </div>
+
+  <div class="filter-row">
+    <span class="filter-label">Sort:</span>
+    <select id="sort-select" class="sort-select" onchange="applySort(this.value)">
+      <option value="score">Fit Score (default)</option>
+      <option value="discovered-desc">Newest Discovered</option>
+      <option value="discovered-asc">Oldest Discovered</option>
+      <option value="tailored-desc">Recently Tailored</option>
+      <option value="applied-desc">Recently Applied</option>
+    </select>
   </div>
 
   <div class="filter-row">
     <label class="hide-toggle">
       <input type="checkbox" id="hide-toggle-input" checked onchange="toggleHideAppliedUnavailable(this.checked)">
       Hide Applied, Unavailable &amp; Hidden jobs by default (a Status filter above still shows them)
+    </label>
+    <label class="hide-toggle">
+      <input type="checkbox" id="compact-toggle-input" onchange="toggleCompactMode(this.checked)">
+      Compact view (collapse card details; expand one via its "Details" link)
     </label>
   </div>
 </div>
@@ -898,6 +958,32 @@ function openFolder(btn) {{
     .catch(err => alert('Failed to open folder: ' + err.message));
 }}
 
+function _fallbackCopy(text) {{
+  const ta = document.createElement('textarea');
+  ta.value = text;
+  ta.style.position = 'fixed';
+  ta.style.opacity = '0';
+  document.body.appendChild(ta);
+  ta.select();
+  try {{ document.execCommand('copy'); }} catch (e) {{}}
+  document.body.removeChild(ta);
+}}
+
+function copyFilename(btn) {{
+  const name = btn.dataset.filename;
+  const original = btn.textContent;
+  const showCopied = () => {{
+    btn.textContent = '✅ Copied!';
+    setTimeout(() => {{ btn.textContent = original; }}, 1400);
+  }};
+  if (navigator.clipboard && navigator.clipboard.writeText) {{
+    navigator.clipboard.writeText(name).then(showCopied).catch(() => {{ _fallbackCopy(name); showCopied(); }});
+  }} else {{
+    _fallbackCopy(name);
+    showCopied();
+  }}
+}}
+
 function hideJob(btn) {{
   apiPost('/api/status', {{url: cardUrl(btn), action: 'hide'}})
     .then(() => location.reload())
@@ -971,16 +1057,54 @@ let activeStatusFilter = 'all';
 let activePlaceFilter = 'all';
 let searchText = '';
 let hideAppliedUnavailable = true;
+let compactMode = false;
+let activeSort = 'score';
 
 function toggleHideAppliedUnavailable(checked) {{
   hideAppliedUnavailable = checked;
+  saveFilterState();
   applyFilters();
+}}
+
+function toggleCompactMode(checked) {{
+  compactMode = checked;
+  document.body.classList.toggle('compact-mode', compactMode);
+  saveFilterState();
+}}
+
+function toggleCardExpand(btn) {{
+  const card = btn.closest('.job-card');
+  const expanded = card.classList.toggle('expanded');
+  btn.innerHTML = expanded ? '&#9652; Hide Details' : '&#9662; Details';
+}}
+
+function applySort(val) {{
+  activeSort = val;
+  saveFilterState();
+  document.querySelectorAll('.job-grid').forEach(grid => {{
+    const cards = Array.from(grid.querySelectorAll('.job-card'));
+    if (val === 'score') {{
+      cards.sort((a, b) => (parseInt(a.dataset.order) || 0) - (parseInt(b.dataset.order) || 0));
+    }} else {{
+      const [key, dir] = val.split('-');
+      cards.sort((a, b) => {{
+        const av = a.dataset[key] || '';
+        const bv = b.dataset[key] || '';
+        if (!av && !bv) return 0;
+        if (!av) return 1;
+        if (!bv) return -1;
+        return dir === 'asc' ? av.localeCompare(bv) : bv.localeCompare(av);
+      }});
+    }}
+    cards.forEach(c => grid.appendChild(c));
+  }});
 }}
 
 function filterScore(val, btn) {{
   activeScoreFilter = val;
   btn.parentElement.querySelectorAll('.filter-btn').forEach(b => b.classList.remove('active'));
   btn.classList.add('active');
+  saveFilterState();
   applyFilters();
 }}
 
@@ -988,6 +1112,7 @@ function filterStatus(val, btn) {{
   activeStatusFilter = val;
   btn.parentElement.querySelectorAll('.filter-btn').forEach(b => b.classList.remove('active'));
   btn.classList.add('active');
+  saveFilterState();
   applyFilters();
 }}
 
@@ -995,12 +1120,78 @@ function filterPlace(val, btn) {{
   activePlaceFilter = val;
   btn.parentElement.querySelectorAll('.filter-btn').forEach(b => b.classList.remove('active'));
   btn.classList.add('active');
+  saveFilterState();
   applyFilters();
 }}
 
 function filterText(text) {{
   searchText = text.toLowerCase();
+  saveFilterState();
   applyFilters();
+}}
+
+// Filters live only as in-memory JS state, so a plain location.reload()
+// (the Refresh button, and the auto-reload after a tailor job finishes)
+// used to snap back to the defaults. Persist the active selections here
+// and re-apply them on load so a refresh keeps showing what you were
+// looking at.
+const FILTER_STORAGE_KEY = 'applypilot_filter_state';
+
+function saveFilterState() {{
+  try {{
+    localStorage.setItem(FILTER_STORAGE_KEY, JSON.stringify({{
+      score: activeScoreFilter,
+      status: activeStatusFilter,
+      place: activePlaceFilter,
+      search: searchText,
+      hideAppliedUnavailable: hideAppliedUnavailable,
+      compactMode: compactMode,
+      sort: activeSort,
+    }}));
+  }} catch (e) {{}}
+}}
+
+function _setActiveFilterButton(selector, val) {{
+  document.querySelectorAll(selector).forEach(btn => {{
+    const onclick = btn.getAttribute('onclick') || '';
+    const start = onclick.indexOf("'") + 1;
+    const end = onclick.indexOf("'", start);
+    const arg = (start > 0 && end > start) ? onclick.slice(start, end) : '';
+    btn.classList.toggle('active', arg === val);
+  }});
+}}
+
+function restoreFilterState() {{
+  let saved;
+  try {{
+    saved = JSON.parse(localStorage.getItem(FILTER_STORAGE_KEY));
+  }} catch (e) {{
+    return;
+  }}
+  if (!saved) return;
+
+  activeScoreFilter = saved.score || 'all';
+  activeStatusFilter = saved.status || 'all';
+  activePlaceFilter = saved.place || 'all';
+  searchText = saved.search || '';
+  hideAppliedUnavailable = saved.hideAppliedUnavailable !== false;
+  compactMode = saved.compactMode === true;
+  activeSort = saved.sort || 'score';
+
+  const searchInput = document.getElementById('search-input');
+  if (searchInput) searchInput.value = saved.search || '';
+  const hideToggle = document.getElementById('hide-toggle-input');
+  if (hideToggle) hideToggle.checked = hideAppliedUnavailable;
+  const compactToggle = document.getElementById('compact-toggle-input');
+  if (compactToggle) compactToggle.checked = compactMode;
+  document.body.classList.toggle('compact-mode', compactMode);
+  const sortSelect = document.getElementById('sort-select');
+  if (sortSelect) sortSelect.value = activeSort;
+  applySort(activeSort);
+
+  _setActiveFilterButton('.filter-btn[onclick^="filterScore("]', activeScoreFilter);
+  _setActiveFilterButton('.filter-btn[onclick^="filterStatus("]', activeStatusFilter);
+  _setActiveFilterButton('.filter-btn[onclick^="filterPlace("]', activePlaceFilter);
 }}
 
 function applyFilters() {{
@@ -1015,6 +1206,7 @@ function applyFilters() {{
     const place = card.dataset.place;
     const hasCV = card.dataset.hasCv === '1';
     const hasCL = card.dataset.hasCl === '1';
+    const isGated = card.dataset.gated === '1';
     const text = card.textContent.toLowerCase();
 
     // Score Filter
@@ -1033,6 +1225,7 @@ function applyFilters() {{
     else if (activeStatusFilter === 'cl') statusMatch = hasCL;
     else if (activeStatusFilter === 'failed') statusMatch = status === 'failed';
     else if (activeStatusFilter === 'unavailable') statusMatch = status === 'closed' || status === 'manual';
+    else if (activeStatusFilter === 'gated') statusMatch = isGated;
     else if (activeStatusFilter === 'hidden') statusMatch = isHidden;
 
     // Place Filter
@@ -1070,6 +1263,7 @@ function applyFilters() {{
   }});
 }}
 
+restoreFilterState();
 applyFilters();
 focusStoredCard();
 </script>

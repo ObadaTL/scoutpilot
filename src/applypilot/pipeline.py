@@ -35,7 +35,7 @@ console = Console()
 STAGE_ORDER = ("discover", "enrich", "score", "tailor", "cover", "pdf")
 
 STAGE_META: dict[str, dict] = {
-    "discover": {"desc": "Job discovery (JobSpy + Workday + smart extract)"},
+    "discover": {"desc": "Multi-channel discovery (JobSpy, Direct ATS, Workday, HN, Schemes, Dorking, SmartExtract)"},
     "enrich":   {"desc": "Detail enrichment (full descriptions + apply URLs)"},
     "score":    {"desc": "LLM scoring (fit 1-10)"},
     "tailor":   {"desc": "Resume tailoring (LLM + validation)"},
@@ -60,13 +60,65 @@ _UPSTREAM: dict[str, str | None] = {
 # ---------------------------------------------------------------------------
 
 def _run_discover(workers: int = 1) -> dict:
-    """Stage: Job discovery — JobSpy, Workday, and smart-extract scrapers."""
+    """Stage: Multi-channel job & opportunity discovery."""
     conn = get_connection()
     run_id = start_run(conn, "discover", {"workers": workers})
-    stats: dict = {"jobspy": None, "workday": None, "smartextract": None}
+    stats: dict = {
+        "jobspy": None,
+        "direct_ats": None,
+        "schemes": None,
+        "hacker_news": None,
+        "dorking": None,
+        "workday": None,
+        "smartextract": None,
+    }
 
-    # JobSpy
-    console.print("  [cyan]JobSpy full crawl...[/cyan]")
+    # 1. Direct ATS (Greenhouse, Ashby, Lever) — fastest, unblocked, direct JSON
+    console.print("  [cyan]Direct ATS Harvester (Greenhouse, Ashby, Lever)...[/cyan]")
+    try:
+        from applypilot.discovery.direct_ats import run_direct_ats_discovery
+        res = run_direct_ats_discovery(workers=max(workers, 4))
+        stats["direct_ats"] = f"ok ({res.get('new', 0)} new, {res.get('total_found', 0)} found)"
+    except Exception as e:
+        log.error("Direct ATS harvester failed: %s", e)
+        console.print(f"  [red]Direct ATS error:[/red] {e}")
+        stats["direct_ats"] = f"error: {e}"
+
+    # 2. Graduate Schemes & Funded Training Programs
+    console.print("  [cyan]Graduate Schemes & Funded Training Programs...[/cyan]")
+    try:
+        from applypilot.discovery.schemes_and_training import run_schemes_discovery
+        res = run_schemes_discovery()
+        stats["schemes"] = f"ok ({res.get('new', 0)} new, {res.get('total_found', 0)} found)"
+    except Exception as e:
+        log.error("Schemes harvester failed: %s", e)
+        console.print(f"  [red]Schemes error:[/red] {e}")
+        stats["schemes"] = f"error: {e}"
+
+    # 3. Hacker News 'Who is Hiring?'
+    console.print("  [cyan]Hacker News Who is Hiring thread...[/cyan]")
+    try:
+        from applypilot.discovery.hacker_news import run_hn_discovery
+        res = run_hn_discovery(workers=max(workers, 4))
+        stats["hacker_news"] = f"ok ({res.get('new', 0)} new, {res.get('total_found', 0)} found)"
+    except Exception as e:
+        log.error("Hacker News harvester failed: %s", e)
+        console.print(f"  [red]Hacker News error:[/red] {e}")
+        stats["hacker_news"] = f"error: {e}"
+
+    # 4. Search Operator ('Google Dorking') ATS Discovery
+    console.print("  [cyan]Search Operator / ATS Dorking Discovery...[/cyan]")
+    try:
+        from applypilot.discovery.dorking import run_dorking_discovery
+        res = run_dorking_discovery()
+        stats["dorking"] = f"ok ({res.get('new', 0)} new, {res.get('total_found', 0)} found)"
+    except Exception as e:
+        log.error("Dorking discovery failed: %s", e)
+        console.print(f"  [red]Dorking error:[/red] {e}")
+        stats["dorking"] = f"error: {e}"
+
+    # 5. JobSpy aggregate boards (Indeed, LinkedIn, Glassdoor, ZipRecruiter)
+    console.print("  [cyan]JobSpy aggregate boards crawl...[/cyan]")
     try:
         from applypilot.discovery.jobspy import run_discovery
         run_discovery()
@@ -76,7 +128,7 @@ def _run_discover(workers: int = 1) -> dict:
         console.print(f"  [red]JobSpy error:[/red] {e}")
         stats["jobspy"] = f"error: {e}"
 
-    # Workday corporate scraper
+    # 6. Workday corporate scraper
     console.print("  [cyan]Workday corporate scraper...[/cyan]")
     try:
         from applypilot.discovery.workday import run_workday_discovery
@@ -87,7 +139,7 @@ def _run_discover(workers: int = 1) -> dict:
         console.print(f"  [red]Workday error:[/red] {e}")
         stats["workday"] = f"error: {e}"
 
-    # Smart extract
+    # 7. Smart extract (AI-powered website scraping)
     console.print("  [cyan]Smart extract (AI-powered scraping)...[/cyan]")
     try:
         from applypilot.discovery.smartextract import run_smart_extract
@@ -118,13 +170,13 @@ def _run_enrich(workers: int = 1) -> dict:
         return {"status": f"error: {e}"}
 
 
-def _run_score() -> dict:
+def _run_score(limit: int = 0) -> dict:
     """Stage: LLM scoring — assign fit scores 1-10."""
     conn = get_connection()
-    run_id = start_run(conn, "score", {})
+    run_id = start_run(conn, "score", {"limit": limit})
     try:
         from applypilot.scoring.scorer import run_scoring
-        result = run_scoring()
+        result = run_scoring(limit=limit)
         end_run(conn, run_id, status="completed", stats=result)
         return {"status": "ok"}
     except Exception as e:

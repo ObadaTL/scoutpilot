@@ -2,6 +2,7 @@
 
 import os
 import platform
+import re
 import shutil
 from pathlib import Path
 
@@ -116,6 +117,62 @@ def load_profile() -> dict:
     return profile
 
 
+def get_profile_keywords(profile: dict | None = None) -> list[str]:
+    """Extract full list of technical skills, domains, and role keywords from candidate profile."""
+    if profile is None:
+        try:
+            profile = load_profile()
+        except Exception:
+            profile = {}
+
+    keywords = set()
+
+    # 1. Skills Boundary
+    skills_b = profile.get("skills_boundary", {})
+    if isinstance(skills_b, dict):
+        for category, items in skills_b.items():
+            if isinstance(items, list):
+                for item in items:
+                    if item and isinstance(item, str):
+                        keywords.add(item.strip())
+            elif isinstance(items, str):
+                keywords.add(items.strip())
+
+    # 2. Target Role & Experience
+    exp = profile.get("experience", {})
+    if isinstance(exp, dict):
+        target = exp.get("target_role", "")
+        if target:
+            # Extract key role phrases
+            for chunk in re.split(r"[,/|;]|\bor\b|\band\b", target, flags=re.IGNORECASE):
+                cleaned = chunk.strip()
+                if cleaned and len(cleaned) > 2:
+                    keywords.add(cleaned)
+
+    # 3. Canonical resume facts tech terms
+    rf = profile.get("resume_facts", {})
+    if isinstance(rf, dict):
+        can = rf.get("canonical_entries", {})
+        if isinstance(can, dict):
+            for section in ("experience", "projects"):
+                for entry in can.get(section, []):
+                    sub = entry.get("subtitle", "")
+                    if "|" in sub:
+                        tech_part = sub.split("|")[0]
+                        for t in tech_part.split(","):
+                            if t.strip():
+                                keywords.add(t.strip())
+
+    # Common canonical variations
+    keywords.update([
+        "Python", "AI", "Machine Learning", "Signal Processing", "DSP",
+        "Software Engineer", "Backend", "Full Stack", "Data", "Cloud", "AWS",
+        "Graduate", "Junior", "Java", "Kotlin", "Embedded", "IoT",
+    ])
+
+    return sorted(list(keywords), key=lambda x: -len(x))
+
+
 # ---------------------------------------------------------------------------
 # Locale-driven CV/resume conventions
 # ---------------------------------------------------------------------------
@@ -163,6 +220,26 @@ def load_sites_config() -> dict:
     if not path.exists():
         return {}
     return yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+
+
+def load_ats_employers() -> dict:
+    """Load Direct ATS employers from config/ats_employers.yaml."""
+    import yaml
+    path = CONFIG_DIR / "ats_employers.yaml"
+    if not path.exists():
+        return {}
+    data = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+    return data.get("employers", {})
+
+
+def load_schemes_config() -> dict:
+    """Load Graduate Schemes & Funded Training config from config/schemes.yaml."""
+    import yaml
+    path = CONFIG_DIR / "schemes.yaml"
+    if not path.exists():
+        return {}
+    data = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+    return data.get("schemes", {})
 
 
 def is_manual_ats(url: str | None) -> bool:

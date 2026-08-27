@@ -268,6 +268,119 @@ def apply(
 
 
 @app.command()
+def discover(
+    ats: bool = typer.Option(False, "--ats", help="Run Direct ATS harvester (Greenhouse, Ashby, Lever)."),
+    hn: bool = typer.Option(False, "--hn", help="Run Hacker News 'Who is Hiring?' harvester."),
+    schemes: bool = typer.Option(False, "--schemes", help="Run Graduate Schemes & Funded Training harvester."),
+    dorking: bool = typer.Option(False, "--dorking", help="Run Search Operator / Dorking discovery."),
+    jobspy: bool = typer.Option(False, "--jobspy", help="Run JobSpy boards crawl."),
+    workday: bool = typer.Option(False, "--workday", help="Run Workday corporate scraper."),
+    all_channels: bool = typer.Option(False, "--all", "-a", help="Run all discovery channels."),
+    workers: int = typer.Option(4, "--workers", "-w", help="Number of worker threads."),
+) -> None:
+    """Run specific or all discovery harvesters to find jobs, graduate schemes, and funded training."""
+    _bootstrap()
+
+    run_all = all_channels or not (ats or hn or schemes or dorking or jobspy or workday)
+
+    console.print("\n[bold blue]Starting Opportunity Discovery[/bold blue]\n")
+
+    if run_all or ats:
+        console.print("[cyan]Running Direct ATS Harvester (Greenhouse, Ashby, Lever)...[/cyan]")
+        from applypilot.discovery.direct_ats import run_direct_ats_discovery
+        res = run_direct_ats_discovery(workers=workers)
+        console.print(f"  [green]ATS Result:[/green] {res.get('new', 0)} new / {res.get('total_found', 0)} found")
+
+    if run_all or schemes:
+        console.print("[cyan]Running Graduate Schemes & Funded Training Harvester...[/cyan]")
+        from applypilot.discovery.schemes_and_training import run_schemes_discovery
+        res = run_schemes_discovery()
+        console.print(f"  [green]Schemes Result:[/green] {res.get('new', 0)} new / {res.get('total_found', 0)} found")
+
+    if run_all or hn:
+        console.print("[cyan]Running Hacker News 'Who is Hiring?' Harvester...[/cyan]")
+        from applypilot.discovery.hacker_news import run_hn_discovery
+        res = run_hn_discovery(workers=workers)
+        console.print(f"  [green]Hacker News Result:[/green] {res.get('new', 0)} new / {res.get('total_found', 0)} found")
+
+    if run_all or dorking:
+        console.print("[cyan]Running Search Operator / ATS Dorking Discovery...[/cyan]")
+        from applypilot.discovery.dorking import run_dorking_discovery
+        res = run_dorking_discovery()
+        console.print(f"  [green]Dorking Result:[/green] {res.get('new', 0)} new / {res.get('total_found', 0)} found")
+
+    if run_all or jobspy:
+        console.print("[cyan]Running JobSpy Aggregate Crawl...[/cyan]")
+        from applypilot.discovery.jobspy import run_discovery
+        res = run_discovery()
+        console.print(f"  [green]JobSpy Result:[/green] {res.get('new', 0)} new")
+
+    if run_all or workday:
+        console.print("[cyan]Running Workday Corporate Scraper...[/cyan]")
+        from applypilot.discovery.workday import run_workday_discovery
+        res = run_workday_discovery(workers=workers)
+        console.print(f"  [green]Workday Result:[/green] {res.get('new', 0)} new")
+
+    console.print("\n[bold green]Discovery complete. Check status with `applypilot status`.[/bold green]\n")
+
+
+@app.command()
+def score(
+    limit: int = typer.Option(50, "--limit", "-l", help="Number of jobs to score in this batch (0 = all)."),
+    channel: Optional[str] = typer.Option(None, "--channel", "-c", help="Filter scoring to one channel (schemes, hn, direct_ats, dorking, workday)."),
+    opp_type: Optional[str] = typer.Option(None, "--type", "-t", help="Filter by opportunity type (graduate_scheme, funded_training, direct_job)."),
+    keywords: Optional[str] = typer.Option(None, "--keywords", "-k", help="Filter scoring to specific keywords (e.g. 'ai, python, signal processing, machine learning')."),
+    rescore: bool = typer.Option(False, "--rescore", help="Re-score already scored jobs."),
+) -> None:
+    """Score unscored jobs with the LLM in prioritized, manageable batches."""
+    _bootstrap()
+
+    from applypilot.config import check_tier
+    check_tier(2, "AI scoring")
+
+    # Map shorthand channel names
+    channel_map = {
+        "schemes": "graduate_schemes",
+        "hn": "hacker_news",
+        "ats": "direct_ats",
+        "dorking": "dorking",
+        "workday": "workday",
+    }
+    actual_channel = channel_map.get(channel, channel) if channel else None
+
+    console.print("\n[bold blue]Starting Batch LLM Scoring[/bold blue]")
+    console.print(f"  Batch limit:   {'All available' if limit == 0 else limit}")
+    if actual_channel:
+        console.print(f"  Channel:       {actual_channel}")
+    if opp_type:
+        console.print(f"  Type:          {opp_type}")
+    if keywords:
+        console.print(f"  Keywords:      {keywords}")
+    console.print()
+
+    from applypilot.scoring.scorer import run_scoring
+    result = run_scoring(
+        limit=limit,
+        rescore=rescore,
+        channel=actual_channel,
+        opp_type=opp_type,
+        keywords=keywords,
+    )
+
+    console.print(f"\n[bold green]Scored {result.get('scored', 0)} jobs in {result.get('elapsed', 0.0):.1f}s ({result.get('errors', 0)} errors).[/bold green]\n")
+
+
+@app.command()
+def clean() -> None:
+    """Clean the queue by hiding irrelevant non-engineering roles (Sales, Marketing, HR, etc.)."""
+    _bootstrap()
+    from applypilot.database import clean_non_tech_jobs
+    console.print("\n[bold blue]Cleaning non-engineering jobs from scoring queue...[/bold blue]")
+    count = clean_non_tech_jobs()
+    console.print(f"[bold green]Hidden {count} irrelevant non-engineering jobs from the queue.[/bold green]\n")
+
+
+@app.command()
 def status() -> None:
     """Show pipeline statistics from the database."""
     _bootstrap()
@@ -525,6 +638,46 @@ def doctor() -> None:
         results.append(("resume.txt", warn_mark, "Only PDF found — plain-text needed for AI stages"))
     else:
         results.append(("resume.txt", fail_mark, "Run 'applypilot init' to add your resume"))
+
+    # Profile URLs -- a typo'd github/linkedin/portfolio link is invisible
+    # until a recruiter actually clicks it, and nothing else in this
+    # pipeline ever fetches these to notice. Only checked when profile.json
+    # exists; each URL gets a real request, so this is the one doctor check
+    # that needs network access and can take a few seconds.
+    if PROFILE_PATH.exists():
+        import urllib.error
+        import urllib.request
+
+        def _check_url_reachable(url: str, timeout: float = 5.0) -> tuple[bool, str]:
+            req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0 (ApplyPilot doctor)"})
+            try:
+                with urllib.request.urlopen(req, timeout=timeout) as resp:
+                    return True, f"HTTP {resp.status}"
+            except urllib.error.HTTPError as e:
+                # A site blocking bots with 403 (LinkedIn does this reliably)
+                # isn't evidence the URL is broken -- only a definite 404/410
+                # is worth failing doctor over.
+                if e.code in (404, 410):
+                    return False, f"HTTP {e.code}"
+                return True, f"HTTP {e.code} (server reachable, may just be blocking bots)"
+            except Exception as e:  # noqa: BLE001 -- report any failure, don't crash doctor over one bad URL
+                return False, str(e)
+
+        try:
+            from applypilot.config import load_profile
+            personal = (load_profile() or {}).get("personal", {}) or {}
+        except Exception:
+            personal = {}
+
+        for field, label in (
+            ("github_url", "GitHub URL"), ("linkedin_url", "LinkedIn URL"),
+            ("portfolio_url", "Portfolio URL"), ("website_url", "Website URL"),
+        ):
+            url = str(personal.get(field) or "").strip()
+            if not url:
+                continue
+            ok, note = _check_url_reachable(url)
+            results.append((label, ok_mark if ok else fail_mark, f"{url} -- {note}"))
 
     # Search config
     if SEARCH_CONFIG_PATH.exists():

@@ -66,7 +66,14 @@
           "header": "Project X - Short Description",
           "subtitle": "Key tech | Start - End dates"
         }
-      ]
+      ],
+      "education": {
+        "_comment": "Optional. When set, this is the EDUCATION line, full stop -- the tailoring LLM never gets a say in it, the same as experience/project headers above. Omit any field you don't have (e.g. no honours yet).",
+        "institution": "Your University",
+        "degree": "Your Degree Title",
+        "honours": "Your Classification (if any)",
+        "dates": "Start - End dates"
+      }
     }
   },
   "eeo_voluntary": {
