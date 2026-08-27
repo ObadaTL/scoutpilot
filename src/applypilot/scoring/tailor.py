@@ -105,7 +105,7 @@ def _build_tailor_prompt(profile: dict, fact_bank: FactBank, job_description: st
     companies_str = ", ".join(companies) if companies else "N/A"
     projects_str = ", ".join(projects) if projects else "N/A"
 
-    facts_block = format_facts_block(fact_bank.relevant_facts(job_description))
+    facts_block = format_facts_block(fact_bank.relevant_facts(job_description), show_owner=True)
 
     # A short, hand-picked steer -- NOT the full enforcement list. This used
     # to dump all ~50 BANNED_WORDS into every call, on the reasoning that the
@@ -174,6 +174,8 @@ Do not copy a fact's `short`/`long` text verbatim unless it genuinely is the bes
 
 ## VERIFIED FACTS (the only source of numbers -- attach the id, write your own sentence):
 {facts_block}
+
+Each fact names the entry it belongs under. Attach it ONLY to a bullet inside the entry whose header or subtitle contains that owner word -- an "emg" fact goes under the EMG project entry, a "kraydel" fact under the Kraydel employer entry, and so on. Put one anywhere else and the bullet is DISCARDED before the CV is assembled; if that empties an entry, the whole document falls back to canned wording and nothing you wrote survives. If a fact's owner has no entry on this CV, leave that fact out.
 
 ## HARD RULES:
 - Do NOT invent work, companies, degrees, certifications, or projects

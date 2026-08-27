@@ -89,20 +89,33 @@ def _accept_reworded(text: str, fact: "Fact") -> bool:
     return numbers <= set(fact.numbers)
 
 
-def format_facts_block(facts: list) -> str:
+def format_facts_block(facts: list, show_owner: bool = False) -> str:
     """Render verified facts as an id-keyed list for a prompt.
 
     Shared by resume tailoring and cover-letter generation. The variants are
     shown as reference wordings the model may reuse or rewrite -- what it
     may NOT do is introduce a number the fact isn't evidenced for (see
     `_accept_reworded`, and NumericGuard for the document-wide check).
+
+    `show_owner` names the entry each fact belongs under. Resume tailoring
+    needs it and cover letters don't (a letter has no entries). Without it
+    the model had no way to know that an "emg" fact may only sit under the
+    EMG project: it guessed, guessed wrong constantly, and
+    tailor._entry_owns_fact dropped the bullet. Measured over 30 postings
+    on 2026-08-27: 182 bullets dropped this way, 158 of them under the
+    VIOFEEL entry, which pushed 27 of 30 CVs onto the unquantified
+    fallback path.
     """
     if not facts:
         return "(none relevant to this job -- do not use any numbers at all)"
     lines = []
     for fact in facts:
         numbers = ", ".join(str(n) for n in fact.numbers) if fact.numbers else "none"
-        lines.append(f'- "{fact.id}"  (the only numbers this fact licenses: {numbers})')
+        source = (getattr(fact, "source", "") or "").lower()
+        owner = ""
+        if show_owner and source and source != "education":
+            owner = f'; belongs ONLY under the entry whose header names "{source}"'
+        lines.append(f'- "{fact.id}"  (the only numbers this fact licenses: {numbers}{owner})')
         for form in ("short", "long"):
             text = fact.variants.get(form)
             if text:
