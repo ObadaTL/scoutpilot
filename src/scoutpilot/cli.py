@@ -404,6 +404,40 @@ def clean() -> None:
     console.print(f"[bold green]Hidden {count} irrelevant non-engineering jobs from the queue.[/bold green]\n")
 
 
+@app.command()
+def add(
+    url: str = typer.Argument(..., help="Job posting URL to add, enrich and score."),
+) -> None:
+    """Manually add one job posting by URL: ingest -> enrich -> score.
+
+    The job then appears on the dashboard like any other. Handy when you
+    find a role the harvesters missed.
+    """
+    _bootstrap()
+    from scoutpilot.config import check_tier
+    check_tier(2, "manual add (scoring)")
+    from scoutpilot.manual import add_and_process_job
+
+    console.print(f"\n[bold blue]Adding[/bold blue] {url}")
+    try:
+        res = add_and_process_job(url)
+    except ValueError as e:
+        console.print(f"[red]{e}[/red]")
+        raise typer.Exit(1)
+
+    console.print(f"  ingest:   {res['added']}")
+    console.print(f"  enrich:   {res['enrich_status']}")
+    if res["fit_score"] is None:
+        console.print(f"  [yellow]score:    -- ({res['reasoning']})[/yellow]")
+        raise typer.Exit(1)
+    colour = "green" if res["fit_score"] >= 7 else ("yellow" if res["fit_score"] >= 5 else "red")
+    console.print(f"  [bold {colour}]score:    {res['fit_score']}/10[/bold {colour}]")
+    if res["gate_reason"]:
+        console.print(f"  [yellow]gate:     {res['gate_reason']}[/yellow]")
+    console.print(f"  reason:   {res['reasoning'][:400]}")
+    console.print("\nOpen the dashboard to see the card: [bold]scoutpilot dashboard[/bold]\n")
+
+
 @app.command(name="archive-discovery")
 def archive_discovery(
     yes: bool = typer.Option(False, "--yes", "-y", help="Skip the confirmation prompt."),
