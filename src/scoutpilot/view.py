@@ -68,6 +68,29 @@ def get_tailor_status(url: str) -> dict:
         return dict(state) if state else {"status": "idle"}
 
 
+# On-demand "add job by URL" -- same background-thread pattern as tailor.
+_add_jobs: dict[str, dict] = {}
+_add_jobs_lock = threading.Lock()
+
+
+def _run_add_job(url: str) -> None:
+    from scoutpilot.manual import add_and_process_job
+    try:
+        res = add_and_process_job(url)
+        with _add_jobs_lock:
+            _add_jobs[url] = {"status": "done", **res}
+    except Exception as exc:  # noqa: BLE001
+        log.exception("Manual add-job failed for %s", url)
+        with _add_jobs_lock:
+            _add_jobs[url] = {"status": "error", "error": str(exc)}
+
+
+def get_add_job_status(url: str) -> dict:
+    with _add_jobs_lock:
+        state = _add_jobs.get(url)
+        return dict(state) if state else {"status": "idle"}
+
+
 def _on_demand_retries() -> int:
     """Retry budget for a single on-demand click.
 
@@ -637,6 +660,7 @@ def generate_dashboard(output_path: str | None = None, serve_base_url: str | Non
         <div class="job-card" data-url="{url}" data-score="{score}" data-site="{escape(j['site'] or '')}" data-status="{data_status}" data-hidden="{1 if is_hidden else 0}" data-place="{escape(place_labels[j['url']])}" data-company="{escape(company_name)}" data-dup="{dup_mark or ''}" data-has-cv="{1 if tailored_cv else 0}" data-has-cl="{1 if cover_letter else 0}" data-order="{card_order}" data-discovered="{escape(j['discovered_at'] or '')}" data-tailored="{escape(j['tailored_at'] or '')}" data-applied="{escape(applied_at or '')}" data-gated="{1 if gate_reason else 0}">
           <div class="card-header">
             <div class="card-title-group">
+              <input type="checkbox" class="card-select" title="Select for bulk actions" onchange="onCardSelect()">
               <span class="score-pill" style="background:{'#10b981' if score >= 7 else ('#f59e0b' if score >= 5 else '#ef4444')}">{score}</span>
               {f'<span class="critic-pill" title="Critic score: computed from discrete findings (bullet density, header restatement, JD relevance, duplicate content), not model-assigned like the fit score.">&#128269; {critic_score:.1f}</span>' if critic_score is not None else ''}
               <a href="{url}" class="job-title" target="_blank">{title}</a>
@@ -916,6 +940,36 @@ def generate_dashboard(output_path: str | None = None, serve_base_url: str | Non
   .full-desc {{ font-size: 0.82rem; color: #cbd5e1; line-height: 1.6; margin-top: 0.5rem; padding: 0.85rem; background: #0b0f19; border: 1px solid #243049; border-radius: 8px; max-height: 400px; overflow-y: auto; white-space: pre-wrap; word-break: break-word; }}
 
   .hidden {{ display: none !important; }}
+
+  /* Multi-select + bulk actions */
+  .card-select {{ width: 16px; height: 16px; margin-right: 2px; cursor: pointer; accent-color: #6366f1; flex: none; }}
+  .job-card.selected {{ outline: 2px solid #6366f1; outline-offset: 2px; }}
+  .bulk-bar {{
+    position: fixed; left: 50%; transform: translateX(-50%); bottom: 18px; z-index: 200;
+    display: none; align-items: center; gap: 12px;
+    background: #1e1b4b; border: 1px solid #6366f1; border-radius: 10px;
+    padding: 10px 16px; box-shadow: 0 12px 40px rgba(0,0,0,0.5);
+  }}
+  .bulk-bar.open {{ display: flex; }}
+  #bulk-count {{ font-weight: 700; color: #e0e7ff; font-size: 0.85rem; }}
+  .bulk-btn {{
+    background: #312e81; color: #e0e7ff; border: 1px solid #4f46e5;
+    border-radius: 6px; padding: 6px 12px; font-size: 0.8rem; cursor: pointer;
+  }}
+  .bulk-btn:hover {{ background: #4338ca; }}
+  .bulk-btn.bulk-hide {{ background: #7c2d12; border-color: #b45309; color: #fed7aa; }}
+  .bulk-btn.bulk-hide:hover {{ background: #9a3412; }}
+
+  /* Add job by URL */
+  #add-job-row input {{ flex: 1; min-width: 320px; }}
+  .add-job-msg {{ font-size: 0.8rem; color: #94a3b8; }}
+  .add-job-msg.ok {{ color: #34d399; }}
+  .add-job-msg.err {{ color: #f87171; }}
+  @keyframes cardFlash {{
+    0%   {{ background: #3730a3; }}
+    100% {{ background: inherit; }}
+  }}
+  .job-card.flash {{ animation: cardFlash 1.8s ease-out; }}
   .job-count-banner {{ color: #94a3b8; font-size: 0.9rem; font-weight: 600; margin-bottom: 1rem; }}
 
   @media (max-width: 850px) {{
@@ -983,6 +1037,13 @@ def generate_dashboard(output_path: str | None = None, serve_base_url: str | Non
     <input type="text" id="search-input" class="search-input" placeholder="Search by title, company, skills, location..." oninput="filterText(this.value)">
   </div>
 
+  <div class="filter-row" id="add-job-row">
+    <span class="filter-label">Add job:</span>
+    <input type="url" id="add-job-url" class="search-input" placeholder="Paste a job posting URL — it gets enriched and scored, then shows up here">
+    <button class="filter-btn" id="add-job-btn" onclick="addJobByUrl()">+ Add &amp; score</button>
+    <span id="add-job-msg" class="add-job-msg"></span>
+  </div>
+
   <div class="filter-row">
     <span class="filter-label">Employer:</span>
     <select id="company-select" class="sort-select" onchange="filterCompany(this.value)">
@@ -1027,6 +1088,12 @@ def generate_dashboard(output_path: str | None = None, serve_base_url: str | Non
 </div>
 
 <div id="job-count-banner" class="job-count-banner"></div>
+
+<div id="bulk-bar" class="bulk-bar">
+  <span id="bulk-count">0 selected</span>
+  <button class="bulk-btn bulk-hide" onclick="bulkHide()">🙈 Hide selected</button>
+  <button class="bulk-btn" onclick="clearSelection()">Clear</button>
+</div>
 
 {job_sections}
 
@@ -1138,6 +1205,90 @@ function unhideJob(btn) {{
   apiPost('/api/status', {{url: cardUrl(btn), action: 'unhide'}})
     .then(() => location.reload())
     .catch(err => alert('Failed to unhide job: ' + err.message));
+}}
+
+// ---- Multi-select + bulk hide ----
+function selectedCards() {{
+  return Array.from(document.querySelectorAll('.card-select:checked'))
+    .map(cb => cb.closest('.job-card'))
+    .filter(Boolean);
+}}
+
+function onCardSelect() {{
+  const cards = selectedCards();
+  cards.forEach(c => c.classList.add('selected'));
+  document.querySelectorAll('.job-card').forEach(c => {{
+    if (!c.querySelector('.card-select:checked')) c.classList.remove('selected');
+  }});
+  const bar = document.getElementById('bulk-bar');
+  document.getElementById('bulk-count').textContent =
+    cards.length + ' selected';
+  bar.classList.toggle('open', cards.length > 0);
+}}
+
+function clearSelection() {{
+  document.querySelectorAll('.card-select:checked').forEach(cb => {{ cb.checked = false; }});
+  onCardSelect();
+}}
+
+function bulkHide() {{
+  const urls = selectedCards().map(c => c.dataset.url);
+  if (!urls.length) return;
+  if (!confirm('Hide ' + urls.length + ' selected job' + (urls.length === 1 ? '' : 's') + '?')) return;
+  const btn = document.querySelector('.bulk-hide');
+  btn.disabled = true; btn.textContent = 'Hiding…';
+  apiPost('/api/status', {{urls: urls, action: 'hide'}})
+    .then(() => location.reload())
+    .catch(err => {{ alert('Bulk hide failed: ' + err.message); btn.disabled = false; btn.textContent = '🙈 Hide selected'; }});
+}}
+
+// ---- Add job by URL ----
+function addJobByUrl() {{
+  const input = document.getElementById('add-job-url');
+  const msg = document.getElementById('add-job-msg');
+  const btn = document.getElementById('add-job-btn');
+  const url = (input.value || '').trim();
+  msg.className = 'add-job-msg';
+  if (!/^https?:\\/\\//i.test(url)) {{ msg.textContent = 'Enter a full http(s) URL.'; msg.className = 'add-job-msg err'; return; }}
+  btn.disabled = true;
+  msg.textContent = 'Fetching and scoring… this takes ~15-30s.';
+  apiPost('/api/add-job', {{url: url}})
+    .then(() => pollAddJob(url, msg, btn))
+    .catch(err => {{ msg.textContent = 'Failed: ' + err.message; msg.className = 'add-job-msg err'; btn.disabled = false; }});
+}}
+
+function pollAddJob(url, msg, btn) {{
+  fetch('/api/job-status?url=' + encodeURIComponent(url))
+    .then(r => r.json())
+    .then(d => {{
+      if (d.status === 'done') {{
+        try {{ sessionStorage.setItem('scoutpilot_added_url', url); }} catch (e) {{}}
+        msg.textContent = 'Added — score ' + (d.fit_score == null ? '—' : d.fit_score) + '/10. Reloading…';
+        msg.className = 'add-job-msg ok';
+        setTimeout(() => location.reload(), 700);
+      }} else if (d.status === 'error') {{
+        msg.textContent = 'Failed: ' + (d.error || 'unknown error');
+        msg.className = 'add-job-msg err';
+        btn.disabled = false;
+      }} else {{
+        setTimeout(() => pollAddJob(url, msg, btn), 2000);
+      }}
+    }})
+    .catch(() => setTimeout(() => pollAddJob(url, msg, btn), 2500));
+}}
+
+// After a reload triggered by add-job, scroll to and flash the new card.
+function focusAddedCard() {{
+  let url = null;
+  try {{ url = sessionStorage.getItem('scoutpilot_added_url'); }} catch (e) {{ return; }}
+  if (!url) return;
+  try {{ sessionStorage.removeItem('scoutpilot_added_url'); }} catch (e) {{}}
+  const card = document.querySelector('.job-card[data-url="' + (window.CSS && CSS.escape ? CSS.escape(url) : url) + '"]');
+  if (!card) return;
+  card.classList.remove('hidden');
+  card.scrollIntoView({{behavior: 'smooth', block: 'center'}});
+  card.classList.add('flash');
+  setTimeout(() => card.classList.remove('flash'), 2000);
 }}
 
 // Descriptions are not in the served page (see full_desc_html in
@@ -1552,6 +1703,7 @@ function applyFilters() {{
 restoreFilterState();
 applyFilters();
 focusStoredCard();
+focusAddedCard();
 resumeCoverPolling();
 </script>
 
@@ -1625,6 +1777,8 @@ def serve_dashboard(output_path: str | None = None, port: int = 8765) -> None:
                 self._handle_search(urllib.parse.parse_qs(parsed.query))
             elif parsed.path == "/api/description":
                 self._handle_description(urllib.parse.parse_qs(parsed.query))
+            elif parsed.path == "/api/job-status":
+                self._handle_job_status(urllib.parse.parse_qs(parsed.query))
             else:
                 self.send_response(404)
                 self.end_headers()
@@ -1647,9 +1801,32 @@ def serve_dashboard(output_path: str | None = None, port: int = 8765) -> None:
                 self._handle_tailor_one(payload)
             elif parsed.path == "/api/cover-letter-one":
                 self._handle_cover_letter_one(payload)
+            elif parsed.path == "/api/add-job":
+                self._handle_add_job(payload)
             else:
                 self.send_response(404)
                 self.end_headers()
+
+        def _handle_add_job(self, payload: dict) -> None:
+            url = str(payload.get("url") or "").strip()
+            if not url.lower().startswith(("http://", "https://")):
+                self._respond_json(400, {"ok": False, "error": "a full http(s) URL is required"})
+                return
+            state = get_add_job_status(url)
+            if state.get("status") == "running":
+                self._respond_json(200, {"ok": True, "status": "already_running"})
+                return
+            with _add_jobs_lock:
+                _add_jobs[url] = {"status": "running"}
+            threading.Thread(target=_run_add_job, args=(url,), daemon=True).start()
+            self._respond_json(200, {"ok": True, "status": "started"})
+
+        def _handle_job_status(self, query: dict[str, list[str]]) -> None:
+            url = (query.get("url") or [""])[0].strip()
+            if not url:
+                self._respond_json(400, {"ok": False, "error": "url is required"})
+                return
+            self._respond_json(200, get_add_job_status(url))
 
         def _handle_tailor_one(self, payload: dict) -> None:
             # Kicks off tailor_one() + cover_letter_one() for exactly one
@@ -1771,23 +1948,36 @@ def serve_dashboard(output_path: str | None = None, port: int = 8765) -> None:
             from scoutpilot.apply.launcher import mark_job, reset_job
             from scoutpilot.database import hide_job, unhide_job
 
-            url = str(payload.get("url") or "").strip()
             action = str(payload.get("action") or "").strip()
             reason = payload.get("reason")
+            # `urls` (list) for bulk actions from the multi-select bar;
+            # `url` (str) for the per-card buttons.
+            raw_urls = payload.get("urls")
+            if isinstance(raw_urls, list):
+                urls = [str(u).strip() for u in raw_urls if str(u).strip()]
+            else:
+                one = str(payload.get("url") or "").strip()
+                urls = [one] if one else []
+
             valid_actions = ("applied", "failed", "reset", "hide", "unhide")
-            if not url or action not in valid_actions:
-                self._respond_json(400, {"ok": False, "error": "url and a valid action are required"})
+            if not urls or action not in valid_actions:
+                self._respond_json(400, {"ok": False, "error": "url(s) and a valid action are required"})
+                return
+            if len(urls) > 1 and action not in ("hide", "unhide"):
+                self._respond_json(400, {"ok": False, "error": "bulk actions support hide/unhide only"})
                 return
             try:
-                if action == "reset":
-                    reset_job(url)
-                elif action == "hide":
-                    hide_job(get_connection(), url)
-                elif action == "unhide":
-                    unhide_job(get_connection(), url)
-                else:
-                    mark_job(url, action, reason=(reason or None) if action == "failed" else None)
-                self._respond_json(200, {"ok": True})
+                conn = get_connection()
+                for url in urls:
+                    if action == "reset":
+                        reset_job(url)
+                    elif action == "hide":
+                        hide_job(conn, url)
+                    elif action == "unhide":
+                        unhide_job(conn, url)
+                    else:
+                        mark_job(url, action, reason=(reason or None) if action == "failed" else None)
+                self._respond_json(200, {"ok": True, "count": len(urls)})
             except Exception as exc:  # noqa: BLE001 -- report the failure to the page, don't crash the server
                 log.exception("Manual status update failed")
                 self._respond_json(500, {"ok": False, "error": str(exc)})
