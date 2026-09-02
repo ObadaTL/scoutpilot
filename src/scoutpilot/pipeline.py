@@ -66,6 +66,7 @@ def _run_discover(workers: int = 1) -> dict:
     stats: dict = {
         "jobspy": None,
         "direct_ats": None,
+        "company_pages": None,
         "schemes": None,
         "hacker_news": None,
         "dorking": None,
@@ -83,6 +84,17 @@ def _run_discover(workers: int = 1) -> dict:
         log.error("Direct ATS harvester failed: %s", e)
         console.print(f"  [red]Direct ATS error:[/red] {e}")
         stats["direct_ats"] = f"error: {e}"
+
+    # 1b. Company-first: employer career pages
+    console.print("  [cyan]Company-First Harvester (employer career pages)...[/cyan]")
+    try:
+        from scoutpilot.discovery.company_pages import run_company_pages_discovery
+        res = run_company_pages_discovery(workers=max(workers, 4))
+        stats["company_pages"] = f"ok ({res.get('new', 0)} new, {res.get('total_found', 0)} found)"
+    except Exception as e:
+        log.error("Company-first harvester failed: %s", e)
+        console.print(f"  [red]Company-first error:[/red] {e}")
+        stats["company_pages"] = f"error: {e}"
 
     # 2. Graduate Schemes & Funded Training Programs
     console.print("  [cyan]Graduate Schemes & Funded Training Programs...[/cyan]")

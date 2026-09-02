@@ -276,6 +276,7 @@ def discover(
     ats: bool = typer.Option(False, "--ats", help="Run Direct ATS harvester (Greenhouse, Ashby, Lever)."),
     hn: bool = typer.Option(False, "--hn", help="Run Hacker News 'Who is Hiring?' harvester."),
     schemes: bool = typer.Option(False, "--schemes", help="Run Graduate Schemes & Funded Training harvester."),
+    companies: bool = typer.Option(False, "--companies", help="Run company-first (employer career page) harvester."),
     dorking: bool = typer.Option(False, "--dorking", help="Run Search Operator / Dorking discovery."),
     jobspy: bool = typer.Option(False, "--jobspy", help="Run JobSpy boards crawl."),
     workday: bool = typer.Option(False, "--workday", help="Run Workday corporate scraper."),
@@ -285,7 +286,7 @@ def discover(
     """Run specific or all discovery harvesters to find jobs, graduate schemes, and funded training."""
     _bootstrap()
 
-    run_all = all_channels or not (ats or hn or schemes or dorking or jobspy or workday)
+    run_all = all_channels or not (ats or hn or schemes or companies or dorking or jobspy or workday)
 
     console.print("\n[bold blue]Starting Opportunity Discovery[/bold blue]\n")
 
@@ -300,6 +301,13 @@ def discover(
         from scoutpilot.discovery.schemes_and_training import run_schemes_discovery
         res = run_schemes_discovery()
         console.print(f"  [green]Schemes Result:[/green] {res.get('new', 0)} new / {res.get('total_found', 0)} found")
+
+    if run_all or companies:
+        console.print("[cyan]Running Company-First Harvester (employer career pages)...[/cyan]")
+        from scoutpilot.discovery.company_pages import run_company_pages_discovery
+        res = run_company_pages_discovery(workers=workers)
+        console.print(f"  [green]Company Pages Result:[/green] {res.get('new', 0)} new / {res.get('total_found', 0)} found "
+                      f"across {res.get('employers', 0)} employers")
 
     if run_all or hn:
         console.print("[cyan]Running Hacker News 'Who is Hiring?' Harvester...[/cyan]")

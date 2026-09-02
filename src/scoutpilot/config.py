@@ -272,6 +272,13 @@ def load_schemes_config() -> dict:
     return data.get("schemes", {})
 
 
+def load_company_pages_config() -> dict:
+    """Load the company-first (employer career page) registry from
+    config/company_pages.yaml."""
+    data = _load_yaml_cached(CONFIG_DIR / "company_pages.yaml") or {}
+    return data.get("company_pages", {})
+
+
 def _deep_merge(base: dict, over: dict) -> dict:
     """Recursively merge `over` onto a copy of `base` (dict values only)."""
     out = dict(base)

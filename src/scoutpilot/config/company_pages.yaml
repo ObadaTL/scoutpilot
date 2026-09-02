@@ -1,0 +1,95 @@
+# Company-first discovery: employer career pages, not job boards.
+#
+# Same shape as schemes.yaml -- a curated registry the harvester
+# (discovery/company_pages.py) turns into job rows. Two kinds of entry:
+#
+#   ats:  {type: greenhouse|ashby|lever, board: "<slug>"}
+#         -> the harvester pulls the employer's *actual* open roles via the
+#            public ATS JSON API (reuses discovery/direct_ats fetchers).
+#   careers_url: "<url>"   (no ats block, or alongside one as a fallback)
+#         -> the harvester stores one pointer row for the careers page, for
+#            the enrichment/scoring stages to pick up.
+#
+# Every ats board below returned live postings on 2026-09-02; every
+# careers_url returned a live 200. Re-verify before adding entries.
+#
+# `known_boards` maps an employer NAME (as it appears in the jobs.company
+# column) to an ATS board, so companies the pipeline has already seen can
+# be re-harvested from source. The harvester reads distinct company names
+# from the DB and harvests any that match here.
+
+company_pages:
+
+  # ── Northern Ireland / Ireland tech employers ───────────────────────
+  northern_ireland:
+    - name: "Rapid7 (Belfast)"
+      location: "Belfast, Northern Ireland"
+      careers_url: "https://careers.rapid7.com/"
+    - name: "Black Duck (Belfast)"
+      location: "Belfast, Northern Ireland"
+      careers_url: "https://www.blackduck.com/company/careers.html"
+    - name: "Expleo (Belfast)"
+      location: "Belfast, Northern Ireland"
+      careers_url: "https://expleo.com/global/en/careers/"
+    - name: "Finastra (Belfast)"
+      location: "Belfast, Northern Ireland"
+      careers_url: "https://www.finastra.com/careers"
+    - name: "Tribal Group"
+      location: "Belfast / UK"
+      careers_url: "https://www.tribalgroup.com/careers"
+
+  # ── UK / global tech employers with a live ATS ─────────────────────
+  uk:
+    - name: "Graphcore"
+      location: "Bristol / London, UK"
+      ats: {type: greenhouse, board: "graphcore"}
+    - name: "ComplyAdvantage"
+      location: "London, UK / Remote"
+      ats: {type: greenhouse, board: "complyadvantage"}
+    - name: "Riverlane"
+      location: "Cambridge, UK"
+      ats: {type: greenhouse, board: "riverlane"}
+    - name: "PolyAI"
+      location: "London, UK"
+      ats: {type: greenhouse, board: "polyai"}
+    - name: "Cleo"
+      location: "London, UK / Remote"
+      ats: {type: greenhouse, board: "cleo"}
+    - name: "Synthesia"
+      location: "London, UK"
+      ats: {type: ashby, board: "synthesia"}
+    - name: "Tractable"
+      location: "London, UK"
+      ats: {type: ashby, board: "tractable"}
+    - name: "Deloitte UK"
+      location: "UK Wide"
+      careers_url: "https://www.deloitte.com/uk/en/careers.html"
+    - name: "Accenture UK"
+      location: "UK Wide"
+      careers_url: "https://www.accenture.com/gb-en/careers"
+    - name: "Sky"
+      location: "UK Wide"
+      careers_url: "https://careers.sky.com"
+    - name: "Capgemini UK"
+      location: "UK Wide"
+      careers_url: "https://www.capgemini.com/gb-en/careers/"
+
+  # ── DB-seed map: jobs.company value -> ATS board ──────────────────
+  # Employers the pipeline has already discovered, re-harvested from source
+  # so a fresh run picks up their current openings without the job board.
+  known_boards:
+    Monzo: {type: greenhouse, board: "monzo"}
+    Wise: {type: greenhouse, board: "wise"}
+    Tide: {type: greenhouse, board: "tide"}
+    GoCardless: {type: greenhouse, board: "gocardless"}
+    Deliveroo: {type: greenhouse, board: "deliveroo"}
+    "Checkout.com": {type: greenhouse, board: "checkout"}
+    Form3: {type: greenhouse, board: "form3"}
+    "Thought Machine": {type: greenhouse, board: "thoughtmachine"}
+    Snyk: {type: greenhouse, board: "snyk"}
+    Wayve: {type: greenhouse, board: "wayve"}
+    Multiverse: {type: greenhouse, board: "multiverse"}
+    Revolut: {type: greenhouse, board: "revolut"}
+    "Starling Bank": {type: greenhouse, board: "starlingbank"}
+    Synthesia: {type: ashby, board: "synthesia"}
+    Kainos: {type: greenhouse, board: "kainos"}
