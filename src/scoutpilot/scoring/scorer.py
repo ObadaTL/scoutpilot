@@ -486,6 +486,7 @@ def run_scoring(
     channel: str | None = None,
     opp_type: str | None = None,
     keywords: str | list[str] | None = None,
+    cohort: str | None = None,
 ) -> dict:
     """Score unscored jobs that have full descriptions.
 
@@ -508,7 +509,7 @@ def run_scoring(
         if limit > 0:
             query += f" LIMIT {limit}"
         jobs = conn.execute(query).fetchall()
-    elif channel or opp_type or keywords:
+    elif channel or opp_type or keywords or cohort:
         # Targeted run: honour the explicit filter, skip the yield-ordered queue.
         jobs = get_jobs_by_stage(
             conn=conn,
@@ -517,6 +518,7 @@ def run_scoring(
             channel=channel,
             opp_type=opp_type,
             keywords=keywords,
+            cohort=cohort,
         )
     else:
         # Default run: order the backlog by each source's live hit rate, so

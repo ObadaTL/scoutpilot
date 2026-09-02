@@ -124,6 +124,7 @@ def store_jobspy_results(conn: sqlite3.Connection, df, source_label: str) -> tup
     existing = 0
 
     from scoutpilot.discovery.prefilter import evaluate_prefilter
+    from scoutpilot.discovery.cohort import infer_cohort_start
     from scoutpilot.config import load_prefilter_config
     pf_cfg = load_prefilter_config()
 
@@ -175,6 +176,7 @@ def store_jobspy_results(conn: sqlite3.Connection, df, source_label: str) -> tup
              "description": description, "full_description": full_description},
             pf_cfg,
         )
+        cohort_start = infer_cohort_start(title, full_description or description)
 
         try:
             # `company` is in this INSERT because it was missing from it
@@ -184,10 +186,11 @@ def store_jobspy_results(conn: sqlite3.Connection, df, source_label: str) -> tup
             # dashboard, which is why nothing could be grouped by employer.
             conn.execute(
                 "INSERT INTO jobs (url, title, company, salary, description, location, site, strategy, "
-                "discovered_at, full_description, application_url, detail_scraped_at, prefilter_reason) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                "discovered_at, full_description, application_url, detail_scraped_at, prefilter_reason, "
+                "cohort_start) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (url, title, company, salary, description, location_str, site_label, strategy, now,
-                 full_description, apply_url, detail_scraped_at, prefilter_reason),
+                 full_description, apply_url, detail_scraped_at, prefilter_reason, cohort_start),
             )
             new += 1
         except sqlite3.IntegrityError:

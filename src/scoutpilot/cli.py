@@ -334,6 +334,7 @@ def score(
     channel: Optional[str] = typer.Option(None, "--channel", "-c", help="Filter scoring to one channel (schemes, hn, direct_ats, dorking, workday)."),
     opp_type: Optional[str] = typer.Option(None, "--type", "-t", help="Filter by opportunity type (graduate_scheme, funded_training, direct_job)."),
     keywords: Optional[str] = typer.Option(None, "--keywords", "-k", help="Filter scoring to specific keywords (e.g. 'ai, python, signal processing, machine learning')."),
+    cohort: Optional[str] = typer.Option(None, "--cohort", help="Filter by start date/cohort: 'immediate', a year like '2026', or 'future'."),
     rescore: bool = typer.Option(False, "--rescore", help="Re-score already scored jobs."),
 ) -> None:
     """Score unscored jobs with the LLM in prioritized, manageable batches."""
@@ -360,6 +361,8 @@ def score(
         console.print(f"  Type:          {opp_type}")
     if keywords:
         console.print(f"  Keywords:      {keywords}")
+    if cohort:
+        console.print(f"  Cohort:        {cohort}")
     console.print()
 
     from scoutpilot.scoring.scorer import run_scoring
@@ -369,6 +372,7 @@ def score(
         channel=actual_channel,
         opp_type=opp_type,
         keywords=keywords,
+        cohort=cohort,
     )
 
     console.print(f"\n[bold green]Scored {result.get('scored', 0)} jobs in {result.get('elapsed', 0.0):.1f}s ({result.get('errors', 0)} errors).[/bold green]\n")
@@ -384,6 +388,52 @@ def clean() -> None:
     console.print(f"[bold green]Hidden {count} irrelevant non-engineering jobs from the queue.[/bold green]\n")
 
 
+@app.command(name="archive-discovery")
+def archive_discovery(
+    yes: bool = typer.Option(False, "--yes", "-y", help="Skip the confirmation prompt."),
+) -> None:
+    """Set aside the current discovery backlog before a fresh search.
+
+    Stamps one timestamp on every discovered row that hasn't been tailored
+    or applied to. Nothing is deleted; applied/tailored history is
+    untouched. Work-acquisition (score/tailor) skips archived rows. The
+    exact undo command is written to ~/.applypilot/last_discovery_archive.txt.
+    """
+    _bootstrap()
+    from scoutpilot.database import get_connection, archive_discovery_results
+
+    conn = get_connection()
+    pending = conn.execute(
+        "SELECT COUNT(*) FROM jobs WHERE archived_at IS NULL "
+        "AND tailored_resume_path IS NULL AND applied_at IS NULL"
+    ).fetchone()[0]
+    if not pending:
+        console.print("[yellow]Nothing to archive.[/yellow]")
+        raise typer.Exit()
+    if not yes:
+        import typer as _t
+        if not _t.confirm(f"Archive {pending} discovery rows (reversible)?"):
+            raise typer.Exit()
+
+    res = archive_discovery_results(conn)
+    console.print(
+        f"[bold green]Archived {res['archived']} rows[/bold green] at {res['timestamp']}.\n"
+        f"Undo instructions: {res['note_path']}"
+    )
+
+
+@app.command(name="restore-discovery")
+def restore_discovery(
+    timestamp: Optional[str] = typer.Option(None, "--timestamp", help="Restore only this archive batch (default: all)."),
+) -> None:
+    """Reverse `archive-discovery` — bring archived discovery rows back."""
+    _bootstrap()
+    from scoutpilot.database import get_connection, unarchive_discovery_results
+
+    n = unarchive_discovery_results(get_connection(), timestamp)
+    console.print(f"[bold green]Restored {n} archived rows.[/bold green]")
+
+
 @app.command()
 def status() -> None:
     """Show pipeline statistics from the database."""
@@ -396,6 +446,9 @@ def status() -> None:
     filtered_at_ingest = conn.execute(
         "SELECT COUNT(*) FROM jobs WHERE prefilter_reason IS NOT NULL"
     ).fetchone()[0]
+    archived = conn.execute(
+        "SELECT COUNT(*) FROM jobs WHERE archived_at IS NOT NULL"
+    ).fetchone()[0]
     hit_rates = source_hit_rates(conn)
 
     console.print("\n[bold]ScoutPilot Pipeline Status[/bold]\n")
@@ -406,6 +459,8 @@ def status() -> None:
     summary.add_column("Count", justify="right")
 
     summary.add_row("Total jobs discovered", str(stats["total"]))
+    if archived:
+        summary.add_row("  archived (set aside)", str(archived))
     summary.add_row("With full description", str(stats["with_description"]))
     summary.add_row("Pending enrichment", str(stats["pending_detail"]))
     summary.add_row("Enrichment errors", str(stats["detail_errors"]))

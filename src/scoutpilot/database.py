@@ -13,7 +13,7 @@ import threading
 from datetime import datetime, timezone
 from pathlib import Path
 
-from scoutpilot.config import DB_PATH, DEFAULTS, load_location_focus
+from scoutpilot.config import APP_DIR, DB_PATH, DEFAULTS, load_location_focus
 
 # Thread-local connection storage — each thread gets its own connection
 # (required for SQLite thread safety with parallel workers)
@@ -422,6 +422,14 @@ def init_db(db_path: Path | str | None = None) -> sqlite3.Connection:
             -- UPDATE jobs SET prefilter_reason = NULL WHERE ...
             prefilter_reason      TEXT,
 
+            -- Discovery-cohort archive (database.archive_discovery_results):
+            -- one ISO timestamp stamped on the whole discovery backlog when
+            -- the search is restarted, so work-acquisition queries skip it
+            -- while every row stays in the DB. Undo = clear this column for
+            -- that timestamp; the exact command is written to
+            -- ~/.applypilot/last_discovery_archive.txt.
+            archived_at           TEXT,
+
             -- Tailoring stage (resume tailor)
             tailored_resume_path  TEXT,
             tailored_at           TEXT,
@@ -564,6 +572,8 @@ _ALL_COLUMNS: dict[str, str] = {
     "gate_reason": "TEXT",
     # Ingest pre-filter reason (discovery/prefilter.py); NULL = passed / predates it
     "prefilter_reason": "TEXT",
+    # Discovery-cohort archive timestamp (database.archive_discovery_results); NULL = live
+    "archived_at": "TEXT",
     # Tailoring
     "tailored_resume_path": "TEXT",
     "tailored_at": "TEXT",
@@ -962,6 +972,7 @@ def store_jobs(conn: sqlite3.Connection, jobs: list[dict],
     # scoring queue skips it. Lazy import to keep database.py free of a
     # discovery-package dependency at module load.
     from scoutpilot.discovery.prefilter import evaluate_prefilter
+    from scoutpilot.discovery.cohort import infer_cohort_start
     from scoutpilot.config import load_prefilter_config
     pf_cfg = load_prefilter_config()
 
@@ -973,6 +984,9 @@ def store_jobs(conn: sqlite3.Connection, jobs: list[dict],
         full_desc = job.get("full_description")
         detail_scraped_at = now if (full_desc and len(full_desc) > 200) else None
         prefilter_reason = evaluate_prefilter(job, pf_cfg)
+        cohort_start = job.get("cohort_start") or infer_cohort_start(
+            job.get("title"), full_desc or job.get("description"), job.get("opportunity_type")
+        )
 
         try:
             conn.execute(
@@ -992,7 +1006,7 @@ def store_jobs(conn: sqlite3.Connection, jobs: list[dict],
                     job.get("opportunity_type"),
                     job.get("deadline"),
                     job.get("funding_status"),
-                    job.get("cohort_start"),
+                    cohort_start,
                     job.get("channel", strategy),
                     now,
                     full_desc,
@@ -1015,7 +1029,8 @@ def get_jobs_by_stage(conn: sqlite3.Connection | None = None,
                       limit: int = 100,
                       channel: str | None = None,
                       opp_type: str | None = None,
-                      keywords: str | list[str] | None = None) -> list[dict]:
+                      keywords: str | list[str] | None = None,
+                      cohort: str | None = None) -> list[dict]:
     """Fetch jobs filtered by pipeline stage.
 
     Args:
@@ -1045,13 +1060,14 @@ def get_jobs_by_stage(conn: sqlite3.Connection | None = None,
         # must never be picked up for scoring/tailoring/apply again.
         "pending_score": (
             "full_description IS NOT NULL AND fit_score IS NULL AND duplicate_of IS NULL "
-            "AND COALESCE(hidden, 0) = 0 AND prefilter_reason IS NULL"
+            "AND COALESCE(hidden, 0) = 0 AND prefilter_reason IS NULL AND archived_at IS NULL"
         ),
         "scored": "fit_score IS NOT NULL",
         "pending_tailor": (
             "fit_score >= ? AND full_description IS NOT NULL "
             "AND tailored_resume_path IS NULL AND duplicate_of IS NULL "
             "AND COALESCE(apply_status, '') != 'listing_closed' AND COALESCE(hidden, 0) = 0 "
+            "AND archived_at IS NULL "
             "AND COALESCE(tailor_attempts, 0) < "
             f"{DEFAULTS['max_tailor_attempts']}"
         ),
@@ -1077,6 +1093,20 @@ def get_jobs_by_stage(conn: sqlite3.Connection | None = None,
     if opp_type:
         where += " AND opportunity_type = ?"
         params.append(opp_type)
+
+    if cohort:
+        # "immediate" -> the immediate-start marker; a 4-digit year -> that
+        # year's intake (cohort_start "YYYY" or "YYYY-MM", or a deadline in
+        # that year); "future" -> anything dated past next year.
+        if cohort == "immediate":
+            where += " AND cohort_start = 'immediate'"
+        elif re.fullmatch(r"20\d\d", str(cohort)):
+            where += " AND (cohort_start LIKE ? OR deadline LIKE ?)"
+            params.extend([f"{cohort}%", f"%{cohort}%"])
+        elif cohort == "future":
+            fy = datetime.now(timezone.utc).year + 1
+            where += " AND (substr(cohort_start,1,4) > ? OR substr(deadline,1,4) > ?)"
+            params.extend([str(fy), str(fy)])
 
     if keywords:
         if isinstance(keywords, str):
@@ -1235,7 +1265,7 @@ def scoring_queue(conn: sqlite3.Connection | None = None,
 
     where = (
         "full_description IS NOT NULL AND fit_score IS NULL AND duplicate_of IS NULL "
-        "AND COALESCE(hidden, 0) = 0 AND prefilter_reason IS NULL"
+        "AND COALESCE(hidden, 0) = 0 AND prefilter_reason IS NULL AND archived_at IS NULL"
     )
     focus = load_location_focus()
     tier_count = len((focus or {}).get("priority", []))
@@ -1243,7 +1273,7 @@ def scoring_queue(conn: sqlite3.Connection | None = None,
         where += f" AND loc_priority(location) < {tier_count}"
 
     rows = conn.execute(
-        f"SELECT url, COALESCE(site, '?') AS site, title, discovered_at "
+        f"SELECT url, COALESCE(site, '?') AS site, title, cohort_start, deadline, discovered_at "
         f"FROM jobs WHERE {where} ORDER BY discovered_at DESC"
     ).fetchall()
     if not rows:
@@ -1252,6 +1282,8 @@ def scoring_queue(conn: sqlite3.Connection | None = None,
     if not enabled:
         urls = [r["url"] for r in rows]
         return urls[:limit] if limit and limit > 0 else urls
+
+    from scoutpilot.discovery.cohort import cohort_rank
 
     rates = source_hit_rates(conn, hit_score=hit_score, min_sample=min_sample)
 
@@ -1266,11 +1298,67 @@ def scoring_queue(conn: sqlite3.Connection | None = None,
             bucket = 2  # low yield -> sampled
             if _url_bucket(r["url"], divisor) != 0:
                 continue
-        ranked.append(((bucket, -info["rate"], _title_domain_rank(r["title"]), i), r["url"]))
+        c_rank = cohort_rank(r["cohort_start"], r["deadline"])
+        ranked.append(
+            ((bucket, c_rank, -info["rate"], _title_domain_rank(r["title"]), i), r["url"])
+        )
 
     ranked.sort(key=lambda t: t[0])
     urls = [u for _, u in ranked]
     return urls[:limit] if limit and limit > 0 else urls
+
+
+_ARCHIVE_NOTE_PATH = APP_DIR / "last_discovery_archive.txt"
+
+
+def archive_discovery_results(conn: sqlite3.Connection | None = None,
+                              note_path: Path | str | None = None) -> dict:
+    """Set `archived_at` to one timestamp on the whole live discovery
+    backlog, so a fresh search starts clean without those rows competing
+    for scoring budget. Nothing is deleted.
+
+    Scope: rows not already archived, not tailored, not applied -- pipeline
+    work already in flight and all applied/tailored history are left
+    exactly as they were. Work-acquisition queries (pending_score,
+    pending_tailor, scoring_queue) filter `archived_at IS NULL`; the
+    dashboard and stats still see the rows.
+
+    Writes the one-line undo command to `note_path`
+    (~/.applypilot/last_discovery_archive.txt by default).
+
+    Returns {"archived": int, "timestamp": str, "note_path": str}.
+    """
+    if conn is None:
+        conn = get_connection()
+    ts = datetime.now(timezone.utc).isoformat()
+    target = "archived_at IS NULL AND tailored_resume_path IS NULL AND applied_at IS NULL"
+    cur = conn.execute(f"UPDATE jobs SET archived_at = ? WHERE {target}", (ts,))
+    conn.commit()
+    n = cur.rowcount
+
+    path = Path(note_path) if note_path else _ARCHIVE_NOTE_PATH
+    path.write_text(
+        f"# Discovery backlog archived {ts}\n"
+        f"# {n} rows marked (not tailored, not applied). Nothing was deleted.\n"
+        f"# To restore them, run this against {DB_PATH}:\n"
+        f"UPDATE jobs SET archived_at = NULL WHERE archived_at = '{ts}';\n",
+        encoding="utf-8",
+    )
+    return {"archived": n, "timestamp": ts, "note_path": str(path)}
+
+
+def unarchive_discovery_results(conn: sqlite3.Connection | None = None,
+                                timestamp: str | None = None) -> int:
+    """Reverse archive_discovery_results. With `timestamp`, restores just
+    that batch; without, restores every archived row. Returns rows restored."""
+    if conn is None:
+        conn = get_connection()
+    if timestamp:
+        cur = conn.execute("UPDATE jobs SET archived_at = NULL WHERE archived_at = ?", (timestamp,))
+    else:
+        cur = conn.execute("UPDATE jobs SET archived_at = NULL WHERE archived_at IS NOT NULL")
+    conn.commit()
+    return cur.rowcount
 
 
 def clean_non_tech_jobs(conn: sqlite3.Connection | None = None) -> int:
