@@ -35,9 +35,9 @@ dev = ["pytest>=7.0", "ruff>=0.1"]
 scoutpilot = "scoutpilot.cli:app"
 
 [project.urls]
-Homepage = "https://github.com/obada/scoutpilot"
-Repository = "https://github.com/obada/scoutpilot"
-Issues = "https://github.com/obada/scoutpilot/issues"
+Homepage = "https://github.com/ObadaTL/scoutpilot"
+Repository = "https://github.com/ObadaTL/scoutpilot"
+Issues = "https://github.com/ObadaTL/scoutpilot/issues"
 
 [build-system]
 requires = ["hatchling"]
