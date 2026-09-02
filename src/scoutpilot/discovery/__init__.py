@@ -3,6 +3,7 @@
 from scoutpilot.discovery.company_pages import run_company_pages_discovery
 from scoutpilot.discovery.direct_ats import run_direct_ats_discovery
 from scoutpilot.discovery.dorking import run_dorking_discovery
+from scoutpilot.discovery.grad_boards import run_grad_boards_discovery
 from scoutpilot.discovery.hacker_news import run_hn_discovery
 from scoutpilot.discovery.jobspy import run_discovery
 from scoutpilot.discovery.schemes_and_training import run_schemes_discovery
@@ -15,6 +16,7 @@ __all__ = [
     "run_smart_extract",
     "run_direct_ats_discovery",
     "run_company_pages_discovery",
+    "run_grad_boards_discovery",
     "run_hn_discovery",
     "run_schemes_discovery",
     "run_dorking_discovery",

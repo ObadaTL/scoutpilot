@@ -1,0 +1,53 @@
+# NI / UK graduate & early-career job boards not covered by JobSpy or the
+# ATS harvesters. Each is a listing-page scraper (discovery/grad_boards.py)
+# that pulls job links off search-result pages into pointer rows; the
+# enrichment stage fills in the full description per URL.
+#
+# Enable/disable and tune per board here. Every base_url below returned a
+# live 200 on 2026-09-02.
+
+grad_boards:
+  nijobs:
+    enabled: true
+    base_url: "https://www.nijobs.com"
+    list_paths:
+      - "/jobs/software"
+      - "/jobs/it"
+      - "/jobs/engineering"
+      - "/jobs/graduate"
+      - "/jobs/it?keywords=graduate"
+      - "/jobs/it?keywords=machine+learning"
+    location: "Northern Ireland"
+    max_pages: 2
+
+  gradcracker:
+    enabled: false          # 403s a scripted UA; needs a browser fetch -- not yet built
+    base_url: "https://www.gradcracker.com"
+    list_paths:
+      - "/search/computing-technology/engineering-graduate-jobs"
+    location: "United Kingdom"
+    max_pages: 2
+
+  gradireland:
+    enabled: false
+    base_url: "https://gradireland.com"
+    list_paths:
+      - "/search-jobs?keywords=software"
+    location: "Ireland"
+    max_pages: 2
+
+  brightnetwork:
+    enabled: false          # 403s a scripted UA
+    base_url: "https://www.brightnetwork.co.uk"
+    list_paths:
+      - "/graduate-jobs/technology/"
+    location: "United Kingdom"
+    max_pages: 2
+
+  milkround:
+    enabled: false
+    base_url: "https://www.milkround.com"
+    list_paths:
+      - "/jobs/software-engineering"
+    location: "United Kingdom"
+    max_pages: 2

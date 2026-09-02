@@ -279,6 +279,13 @@ def load_company_pages_config() -> dict:
     return data.get("company_pages", {})
 
 
+def load_grad_boards_config() -> dict:
+    """Load the NI/UK graduate job-board harvester registry from
+    config/grad_boards.yaml."""
+    data = _load_yaml_cached(CONFIG_DIR / "grad_boards.yaml") or {}
+    return data.get("grad_boards", {})
+
+
 def _deep_merge(base: dict, over: dict) -> dict:
     """Recursively merge `over` onto a copy of `base` (dict values only)."""
     out = dict(base)

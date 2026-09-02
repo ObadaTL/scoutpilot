@@ -67,6 +67,7 @@ def _run_discover(workers: int = 1) -> dict:
         "jobspy": None,
         "direct_ats": None,
         "company_pages": None,
+        "grad_boards": None,
         "schemes": None,
         "hacker_news": None,
         "dorking": None,
@@ -95,6 +96,17 @@ def _run_discover(workers: int = 1) -> dict:
         log.error("Company-first harvester failed: %s", e)
         console.print(f"  [red]Company-first error:[/red] {e}")
         stats["company_pages"] = f"error: {e}"
+
+    # 1c. NI/UK graduate job boards (NIJobs, ...)
+    console.print("  [cyan]NI/UK Graduate Job-Board Harvesters...[/cyan]")
+    try:
+        from scoutpilot.discovery.grad_boards import run_grad_boards_discovery
+        res = run_grad_boards_discovery()
+        stats["grad_boards"] = f"ok ({res.get('new', 0)} new, {res.get('total_found', 0)} found)"
+    except Exception as e:
+        log.error("Grad-boards harvester failed: %s", e)
+        console.print(f"  [red]Grad-boards error:[/red] {e}")
+        stats["grad_boards"] = f"error: {e}"
 
     # 2. Graduate Schemes & Funded Training Programs
     console.print("  [cyan]Graduate Schemes & Funded Training Programs...[/cyan]")
