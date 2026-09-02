@@ -74,8 +74,42 @@ def _parse_nijobs(html: str, base_url: str, location: str) -> list[dict]:
     return out
 
 
+# ── GradIreland ─────────────────────────────────────────────────────────
+# The server-rendered feed at /s/jobs/all lists links of the form
+#   /jobs/<title-slug>-<numeric-id>
+# with no employer in the URL -- company comes from enrichment.
+_GRADIRELAND_LINK_RE = re.compile(r'href="(/jobs/([a-z0-9-]+?)-(\d{5,}))"', re.I)
+
+
+def _parse_gradireland(html: str, base_url: str, location: str) -> list[dict]:
+    seen: set[str] = set()
+    out: list[dict] = []
+    for path, title_slug, job_id in _GRADIRELAND_LINK_RE.findall(html):
+        if job_id in seen:
+            continue
+        seen.add(job_id)
+        title = _titlecase(title_slug)
+        if not is_relevant_tech_role(title):
+            continue
+        url = base_url.rstrip("/") + path
+        out.append({
+            "url": url,
+            "title": title,
+            "company": None,
+            "location": location,
+            "description": f"{title} ({location}). Via gradIreland.",
+            "application_url": url,
+            "site": "gradIreland",
+            "channel": CHANNEL,
+            "opportunity_type": infer_opportunity_type(title),
+            "funding_status": "standard_salary",
+        })
+    return out
+
+
 _PARSERS = {
     "nijobs": _parse_nijobs,
+    "gradireland": _parse_gradireland,
 }
 
 

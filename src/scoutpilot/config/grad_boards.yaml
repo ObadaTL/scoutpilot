@@ -20,24 +20,29 @@ grad_boards:
     location: "Northern Ireland"
     max_pages: 2
 
+  gradireland:
+    enabled: true
+    base_url: "https://gradireland.com"
+    list_paths:
+      - "/s/jobs/all"
+    location: "Ireland"
+    max_pages: 3
+
+  # ---- blocked: Cloudflare / JS-rendered, need a browser fetch ----
+  # These have no server-rendered job links and 403 or return an empty
+  # shell to a plain HTTP client. They need the Playwright path
+  # (smartextract-style) which isn't wired here yet. Left as stubs so the
+  # work is visible; flip enabled once a browser fetcher exists.
   gradcracker:
-    enabled: false          # 403s a scripted UA; needs a browser fetch -- not yet built
+    enabled: false          # Cloudflare 403 to any scripted UA
     base_url: "https://www.gradcracker.com"
     list_paths:
       - "/search/computing-technology/engineering-graduate-jobs"
     location: "United Kingdom"
     max_pages: 2
 
-  gradireland:
-    enabled: false
-    base_url: "https://gradireland.com"
-    list_paths:
-      - "/search-jobs?keywords=software"
-    location: "Ireland"
-    max_pages: 2
-
   brightnetwork:
-    enabled: false          # 403s a scripted UA
+    enabled: false          # 403 to any scripted UA
     base_url: "https://www.brightnetwork.co.uk"
     list_paths:
       - "/graduate-jobs/technology/"
@@ -45,7 +50,7 @@ grad_boards:
     max_pages: 2
 
   milkround:
-    enabled: false
+    enabled: false          # 200 but job cards are client-rendered (no /job/ links in HTML)
     base_url: "https://www.milkround.com"
     list_paths:
       - "/jobs/software-engineering"

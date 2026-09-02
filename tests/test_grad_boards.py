@@ -75,3 +75,29 @@ def test_run_only_enabled_boards(env):
 def test_run_with_only_filter(env):
     assert gb.run_grad_boards_discovery(only="gradcracker")["boards"] == 0
     assert gb.run_grad_boards_discovery(only="nijobs")["boards"] == 1
+
+
+GRADIRELAND_HTML = """
+<a href="/jobs/graduate-software-cloud-engineer-237687">x</a>
+<a href="/jobs/data-analytics-graduate-programme-237688">x</a>
+<a href="/jobs/warehouse-operative-999999">x</a>
+<a href="/careers-advice/finding-a-job">not a job</a>
+<a href="/graduate-jobs">nav</a>
+"""
+
+
+def test_parse_gradireland():
+    rows = gb._parse_gradireland(GRADIRELAND_HTML, "https://gradireland.com", "Ireland")
+    titles = {r["title"] for r in rows}
+    urls = {r["url"] for r in rows}
+    assert "Graduate Software Cloud Engineer" in titles
+    assert "Data Analytics Graduate Programme" in titles
+    # non-job hrefs (need the -<id> suffix) are ignored
+    assert "https://gradireland.com/careers-advice/finding-a-job" not in urls
+    assert "https://gradireland.com/graduate-jobs" not in urls
+    # clearly non-tech role dropped by is_relevant_tech_role
+    assert "Warehouse Operative" not in titles
+    r = next(r for r in rows if "cloud-engineer" in r["url"])
+    assert r["site"] == "gradIreland"
+    assert r["company"] is None
+    assert r["url"] == "https://gradireland.com/jobs/graduate-software-cloud-engineer-237687"
