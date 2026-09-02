@@ -130,7 +130,29 @@ class TestEligibilityGate:
         parsed = {"score": 8, "required_country": "UK", "required_work_auth": None, "min_years_commercial": None}
         result = apply_eligibility_gate(parsed, self._profile())
         assert result["score"] == 8
-        assert result["gate_reason"] is None
+
+    def test_compound_home_region_string_does_not_gate(self):
+        """A qualified/compound REQUIRED_COUNTRY that still names the
+        candidate's own region must not gate. Measured 2026-09-02: NI
+        employers (Version 1, KX, Black Duck, Expleo) were all capped to 1
+        because "Belfast, Northern Ireland" didn't normalise to a known
+        country."""
+        from scoutpilot.scoring.scorer import apply_eligibility_gate
+        for req in ("Belfast, Northern Ireland", "Northern Ireland / UK",
+                    "UK / Ireland", "United Kingdom (Belfast)"):
+            parsed = {"score": 8, "required_country": req,
+                      "required_work_auth": None, "min_years_commercial": None}
+            result = apply_eligibility_gate(parsed, self._profile())
+            assert result["score"] == 8, req
+            assert result["gate_reason"] is None, req
+
+    def test_compound_string_naming_only_a_foreign_country_still_gates(self):
+        from scoutpilot.scoring.scorer import apply_eligibility_gate
+        parsed = {"score": 8, "required_country": "New York, United States",
+                  "required_work_auth": None, "min_years_commercial": None}
+        result = apply_eligibility_gate(parsed, self._profile())
+        assert result["score"] == 1
+        assert "United States" in result["gate_reason"]
 
     # ---- work-authorisation gate: false rejections found 2026-08-27 ----
 

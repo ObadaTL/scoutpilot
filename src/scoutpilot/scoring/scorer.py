@@ -293,6 +293,30 @@ _GENERIC_RIGHT_TO_WORK_RE = re.compile(
 )
 
 
+def _countries_in_text(text: str) -> set[str]:
+    """Every country/region named anywhere in a free-text string, each
+    resolved to its canonical name.
+
+    "Belfast, Northern Ireland" -> {"united kingdom"};
+    "UK / Ireland" -> {"united kingdom", "ireland"};
+    "Remote (must be authorised to work in the USA)" -> {"united states"}.
+    """
+    found: set[str] = set()
+    if not text:
+        return found
+    tokens = sorted(
+        set(_COUNTRY_ALIASES) | set(_COUNTRY_ALIASES.values()), key=len, reverse=True
+    )
+    for tok in tokens:
+        upper = tok.upper()
+        if upper in _CASE_SENSITIVE_COUNTRY_TOKENS:
+            if re.search(rf"\b{re.escape(upper)}\b", text):
+                found.add(_COUNTRY_ALIASES.get(tok, tok))
+        elif re.search(rf"\b{re.escape(tok)}\b", text, re.IGNORECASE):
+            found.add(_COUNTRY_ALIASES.get(tok, tok))
+    return found
+
+
 def _country_in_text(text: str) -> str | None:
     """First country named anywhere in a free-text requirement, normalised.
 
@@ -376,11 +400,22 @@ def apply_eligibility_gate(parsed: dict, profile: dict | None) -> dict:
     personal = profile.get("personal", {}) or {}
     work_auth = profile.get("work_authorization", {}) or {}
     candidate_country = _normalize_country(personal.get("country"))
-    required_country = _normalize_country(parsed.get("required_country"))
-    if required_country and candidate_country and required_country != candidate_country:
+    required_raw = parsed.get("required_country")
+    # Resolve REQUIRED_COUNTRY to the set of countries/regions it actually
+    # names, not one normalised string. A compound or qualified value like
+    # "Belfast, Northern Ireland" or "UK / Ireland" used to normalise to
+    # "belfast northern ireland" -- no alias match -- and cap every NI
+    # employer to score 1 (measured 2026-09-02: Version 1, KX, Black Duck,
+    # Expleo, all real Belfast schemes). The bar only fires when a country
+    # is named AND the candidate's own country is not among those named.
+    required_countries = _countries_in_text(str(required_raw or ""))
+    whole = _normalize_country(required_raw)
+    if whole and whole in set(_COUNTRY_ALIASES.values()):
+        required_countries.add(whole)
+    if required_countries and candidate_country and candidate_country not in required_countries:
         caps.append(1)
         reasons.append(
-            f"Requires work authorisation/location in {parsed.get('required_country')}; "
+            f"Requires work authorisation/location in {required_raw}; "
             f"profile is based in {personal.get('country') or 'unknown'}."
         )
 
@@ -392,7 +427,9 @@ def apply_eligibility_gate(parsed: dict, profile: dict | None) -> dict:
         # bar, whatever their permit says at home.
         auth_country = _country_in_text(required_auth_raw)
         if auth_country and candidate_country and auth_country != candidate_country:
-            if not (required_country and _normalize_country(parsed.get("required_country")) == auth_country):
+            # Don't double-report if the REQUIRED_COUNTRY check above already
+            # accounted for this same country.
+            if auth_country not in required_countries:
                 caps.append(1)
                 reasons.append(
                     f"Requires work authorisation in {auth_country.title()}; "
