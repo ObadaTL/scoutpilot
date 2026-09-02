@@ -715,3 +715,289 @@ class TestCanonicalSkillsLines:
     def test_no_skills_boundary_returns_empty(self):
         from applypilot.scoring.tailor import _canonical_skills_lines
         assert _canonical_skills_lines({"skills": {}}, {}) == []
+
+
+# ── Summary vs bullets: the duplication class nothing covered ─────────────
+
+class TestFindSummaryDuplicateBullets:
+    """check_no_cross_section_duplicates only ever walked EXPERIENCE and
+    PROJECTS, so a summary sentence restating a bullet went uncaught -- six
+    of the eight duplicates in the pre-v2 corpus were exactly that shape.
+    Advisory by design: these return strings for the retry path, they never
+    raise."""
+
+    def test_summary_repeating_a_bullet_verbatim_is_flagged(self):
+        from applypilot.scoring.tailor import find_summary_duplicate_bullets
+        data = {
+            "summary": "Built two parallel ML pipelines on surface-EMG signals in Python. "
+                       "Now looking for backend work in Belfast.",
+            "projects": [{"header": "EMG Project", "bullets": [
+                "Built two parallel ML pipelines on surface-EMG signals in Python",
+            ]}],
+        }
+        v = find_summary_duplicate_bullets(data)
+        assert len(v) == 1 and "almost word" in v[0]
+
+    def test_a_summary_compressing_a_bullet_is_not_flagged(self):
+        """The signal that was removed 2026-09-01 fired here, on 12 of 12
+        live CVs, and was wrong every time: a summary stating the headline
+        achievement over a bullet that elaborates it is what the tailoring
+        prompt asks for. Sharing a claim with a bullet is fine; being the
+        same sentence is not."""
+        from applypilot.scoring.tailor import find_summary_duplicate_bullets
+        data = {
+            "summary": "Built two parallel ML pipelines on surface-EMG signals in Python, "
+                       "addressing class imbalance and noisy real-world signals.",
+            "projects": [{"header": "EMG Project", "bullets": [
+                "Built two parallel ML pipelines on surface-EMG signals in Python: one for "
+                "hand-gesture classification, one for per-subject biometric identification, "
+                "with engineered time-domain features and a leakage-free evaluation split",
+            ]}],
+        }
+        assert find_summary_duplicate_bullets(data) == []
+
+    def test_a_summary_that_says_something_else_is_not_flagged(self):
+        from applypilot.scoring.tailor import find_summary_duplicate_bullets
+        data = {
+            "summary": "Backend engineer who has run production services on AWS. "
+                       "Comfortable owning deployment and on-call.",
+            "projects": [{"header": "EMG Project", "bullets": [
+                "Built two parallel ML pipelines on surface-EMG signals in Python",
+            ]}],
+        }
+        assert find_summary_duplicate_bullets(data) == []
+
+    def test_the_boundary_sits_between_the_two_observed_shapes(self):
+        """The pair that motivated _SUMMARY_DUP_MIN_COVERAGE, from the
+        2026-09-01 sample: the elaborating bullet scored 0.59 and must not
+        fire, the containing one scored 0.67 and must."""
+        from applypilot.scoring.tailor import _word_coverage, find_summary_duplicate_bullets
+        sentence = ("Diagnosed and corrected evaluation data-leakage that had inflated "
+                    "reported accuracy, re-establishing honest, leakage-free performance.")
+        contains = "Diagnosed and corrected evaluation data-leakage that had inflated reported accuracy"
+        elaborates = ("Built two parallel machine-learning pipelines for surface-EMG signal "
+                      "processing in Python and scikit-learn, one for hand-gesture "
+                      "classification and one for biometric identification")
+        assert _word_coverage(sentence, contains) > _word_coverage(sentence, elaborates)
+        assert find_summary_duplicate_bullets(
+            {"summary": sentence, "projects": [{"header": "EMG", "bullets": [contains]}]})
+        assert find_summary_duplicate_bullets(
+            {"summary": sentence, "projects": [{"header": "EMG", "bullets": [elaborates]}]}) == []
+
+    def test_each_summary_sentence_reports_at_most_once(self):
+        """One sentence duplicated across three bullets is one problem to
+        fix, not three retry notes telling the model the same thing."""
+        from applypilot.scoring.tailor import find_summary_duplicate_bullets
+        bullet = "Built two parallel ML pipelines on surface-EMG signals in Python"
+        data = {
+            "summary": "Built two parallel ML pipelines on surface-EMG signals in Python.",
+            "experience": [{"header": "VIOFEEL", "bullets": [bullet]}],
+            "projects": [{"header": "EMG Project", "bullets": [bullet, bullet]}],
+        }
+        assert len(find_summary_duplicate_bullets(data)) == 1
+
+    def test_empty_summary_or_no_bullets_is_never_a_finding(self):
+        from applypilot.scoring.tailor import find_summary_duplicate_bullets
+        bullet = "Built two parallel ML pipelines on surface-EMG signals in Python"
+        assert find_summary_duplicate_bullets({"projects": [{"header": "P", "bullets": [bullet]}]}) == []
+        assert find_summary_duplicate_bullets({"summary": bullet, "projects": []}) == []
+
+
+
+class TestRepairSummary:
+    """The duplication defect fires on nearly every CV, so it repairs one
+    field rather than retrying the document -- see _repair_summary."""
+
+    class _Client:
+        def __init__(self, reply):
+            self.reply = reply
+            self.calls = 0
+
+        def chat(self, messages, **kw):
+            self.calls += 1
+            self.last = messages
+            return self.reply
+
+    def _guard(self):
+        from applypilot.facts import NumericGuard
+        return NumericGuard(_bank(), profile=None)
+
+    def _data(self):
+        return {
+            "summary": "Built two parallel ML pipelines on surface-EMG signals in Python.",
+            "projects": [{"header": "EMG Project", "bullets": [
+                "Built two parallel ML pipelines on surface-EMG signals in Python",
+            ]}],
+        }
+
+    def test_a_clean_summary_never_calls_the_model(self):
+        from applypilot.scoring.tailor import _repair_summary
+        data = self._data()
+        data["summary"] = "Backend engineer who has run production services on AWS and owned on-call."
+        client = self._Client("unused")
+        assert _repair_summary(data, client, {}, self._guard()) == []
+        assert client.calls == 0
+
+    def test_a_summary_repeating_a_bullet_is_rewritten(self):
+        from applypilot.scoring.tailor import _repair_summary
+        data = self._data()
+        client = self._Client(
+            "Backend engineer who has run production services on AWS. Comfortable "
+            "owning deployment, monitoring and on-call for systems in use."
+        )
+        assert _repair_summary(data, client, {}, self._guard()) == []
+        assert client.calls == 1
+        assert data["summary"].startswith("Backend engineer")
+
+    def test_the_rewrite_prompt_names_the_bullets_it_must_avoid(self):
+        """Describing the rule isn't enough -- the model has to see the
+        sentences it is being kept off."""
+        from applypilot.scoring.tailor import _repair_summary
+        data = self._data()
+        client = self._Client("Backend engineer who has run production services on AWS and owned on-call.")
+        _repair_summary(data, client, {}, self._guard())
+        sent = client.last[-1]["content"]
+        assert "Built two parallel ML pipelines on surface-EMG signals in Python" in sent
+
+    def test_a_rewrite_that_still_duplicates_is_discarded(self):
+        from applypilot.scoring.tailor import _repair_summary
+        data = self._data()
+        original = data["summary"]
+        client = self._Client(
+            "Built two parallel ML pipelines on surface-EMG signals in Python "
+            "across gesture and biometric tasks."
+        )
+        problems = _repair_summary(data, client, {}, self._guard())
+        assert problems and data["summary"] == original
+
+    def test_a_failing_call_leaves_the_summary_alone(self):
+        from applypilot.scoring.tailor import _repair_summary
+
+        class Boom:
+            def chat(self, *a, **kw):
+                raise RuntimeError("provider down")
+
+        data = self._data()
+        original = data["summary"]
+        problems = _repair_summary(data, Boom(), {}, self._guard())
+        assert problems and data["summary"] == original
+
+    def test_a_rewrite_with_an_unverified_number_is_discarded(self):
+        """A rewrite is LLM-authored text like any other and gets the same
+        numeric scrutiny as the bullets around it."""
+        from applypilot.scoring.tailor import _repair_summary
+        data = self._data()
+        original = data["summary"]
+        client = self._Client("Backend engineer who has cut deployment time by 47 percent across 9 services.")
+        problems = _repair_summary(data, client, {}, self._guard())
+        assert problems and data["summary"] == original
+
+
+# ── format_facts_block: the owner has to be where the sentence is ─────────
+
+class TestFormatFactsBlockOwner:
+    def _fact(self):
+        from applypilot.facts import Fact
+        return Fact(
+            id="emg.dual", tier="verified", numbers=[2], source="emg",
+            variants={"short": "Built 2 parallel ML pipelines on surface-EMG signals",
+                      "long": "Built 2 parallel ML pipelines on surface-EMG signals in Python"},
+            evidence="resume: 2 pipelines",
+        )
+
+    def test_owner_is_repeated_on_every_variant_line(self):
+        """Once on the id line isn't enough: the variant text is what the
+        model reads when deciding what a fact says, and by then a qualifier
+        two lines up has stopped being in view."""
+        from applypilot.facts import format_facts_block
+        block = format_facts_block([self._fact()], show_owner=True)
+        for line in block.splitlines():
+            if line.strip().startswith(("short", "long")):
+                assert '[only under "emg"]' in line
+
+    def test_cover_letters_get_no_owner_at_all(self):
+        """A letter has no entries, so ownership is meaningless there."""
+        from applypilot.facts import format_facts_block
+        block = format_facts_block([self._fact()], show_owner=False)
+        assert "emg" not in block.replace("emg.dual", "")
+        assert "only under" not in block
+
+    def test_education_facts_are_never_owned_by_an_entry(self):
+        from applypilot.facts import Fact, format_facts_block
+        edu = Fact(id="edu.meng", tier="verified", numbers=[2025], source="education",
+                   variants={"short": "MEng, first class"}, evidence="2025 graduation")
+        block = format_facts_block([edu], show_owner=True)
+        assert "only under" not in block
+
+    def test_variant_text_itself_is_unchanged(self):
+        from applypilot.facts import format_facts_block
+        block = format_facts_block([self._fact()], show_owner=True)
+        assert '"Built 2 parallel ML pipelines on surface-EMG signals"' in block
+
+
+# ── An invented EXPERIENCE entry must not cost the whole document ─────────
+
+class _DegreeAsJobClient:
+    """A model that files the candidate's own degree as an EXPERIENCE entry.
+
+    Measured 2026-09-01: 2 of the 3 residual fallbacks left by the
+    fact-owner change were exactly this, not the ownership failure the
+    handoff assumed.
+    """
+
+    def chat(self, messages, max_tokens=2048, temperature=0.4, **kw):
+        return json.dumps({
+            "title": "Data Scientist",
+            "summary": "Shipped production data pipelines end to end.",
+            "skills": {"Languages": "Python, SQL"},
+            "experience": [
+                {"header": "Software Engineering Intern | Kraydel LTD",
+                 "subtitle": "Kotlin, Java | Jul 2022 - May 2023",
+                 "bullets": ["Automated a manual reporting workflow"]},
+                {"header": "MEng Software & Electronic Systems Engineering",
+                 "subtitle": "Queen's University Belfast | 2020 - 2025",
+                 "bullets": ["Studied signal processing and machine learning"]},
+            ],
+            "projects": [{"header": "Side Project", "subtitle": "Python",
+                          "bullets": ["Built a small automation tool"]}],
+            "education": "Queen's University Belfast",
+        })
+
+
+class TestInventedExperienceEntryShipsAnyway:
+    def _profile(self):
+        return {"resume_facts": {"canonical_entries": {"experience": [
+            {"header": "Software Engineering Intern | Kraydel LTD",
+             "subtitle": "Kotlin, Java | Jul 2022 - May 2023",
+             "match": ["kraydel"]},
+        ]}}}
+
+    def _run(self, monkeypatch):
+        import applypilot.scoring.tailor as tailor_mod
+        monkeypatch.setattr(tailor_mod, "get_client", lambda: _DegreeAsJobClient())
+        return tailor_mod.tailor_resume(
+            "SUMMARY\nExperienced engineer.\n",
+            {"title": "Data Scientist", "site": "TestCo", "location": "Remote",
+             "full_description": "Data role, Python."},
+            self._profile(), max_retries=1, validation_mode="lenient", fact_bank=_bank(),
+        )
+
+    def test_the_document_is_not_thrown_away(self, monkeypatch):
+        """The rejected entry is already deleted from the data by the time
+        the error is raised, so nothing real is lost -- falling back to
+        canned wording here discards a good CV to punish an entry that is
+        already gone."""
+        tailored, report = self._run(monkeypatch)
+        assert report["status"] != "approved_unquantified_fallback"
+        assert "Kraydel" in tailored
+
+    def test_the_rejected_entry_is_still_gone_and_still_reported(self, monkeypatch):
+        tailored, report = self._run(monkeypatch)
+        assert "MEng Software & Electronic Systems Engineering" not in tailored
+        assert any("invented EXPERIENCE entry" in w for w in report.get("warnings", []))
+
+    def test_it_still_spends_a_retry_before_giving_up_on_it(self, monkeypatch):
+        """Shipping is the LAST-attempt behaviour, not the first: while
+        attempts remain, a retry note is the cheaper fix."""
+        tailored, report = self._run(monkeypatch)
+        assert report["attempts"] == 2

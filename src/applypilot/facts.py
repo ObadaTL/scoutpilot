@@ -105,6 +105,16 @@ def format_facts_block(facts: list, show_owner: bool = False) -> str:
     on 2026-08-27: 182 bullets dropped this way, 158 of them under the
     VIOFEEL entry, which pushed 27 of 30 CVs onto the unquantified
     fallback path.
+
+    The owner is repeated on every variant line, not just once on the fact's
+    id line. That looks redundant read top to bottom, and isn't in practice:
+    the variant text is the part the model reads when it is deciding what a
+    fact SAYS, and by then the qualifier a line or two above has stopped
+    being in view. Naming it again where the sentence is is the cheap half
+    of the fix -- the alternative on the table was relocating a misplaced
+    bullet to its true owner instead of dropping it, which changes a
+    documented invariant (a bullet never moves) for a defect that was down
+    to roughly one job in twelve by then.
     """
     if not facts:
         return "(none relevant to this job -- do not use any numbers at all)"
@@ -113,13 +123,15 @@ def format_facts_block(facts: list, show_owner: bool = False) -> str:
         numbers = ", ".join(str(n) for n in fact.numbers) if fact.numbers else "none"
         source = (getattr(fact, "source", "") or "").lower()
         owner = ""
+        variant_owner = ""
         if show_owner and source and source != "education":
             owner = f'; belongs ONLY under the entry whose header names "{source}"'
+            variant_owner = f' [only under "{source}"]'
         lines.append(f'- "{fact.id}"  (the only numbers this fact licenses: {numbers}{owner})')
         for form in ("short", "long"):
             text = fact.variants.get(form)
             if text:
-                lines.append(f'    {form}: "{" ".join(text.split())}"')
+                lines.append(f'    {form}{variant_owner}: "{" ".join(text.split())}"')
     return "\n".join(lines)
 
 

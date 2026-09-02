@@ -167,11 +167,16 @@ def store_jobspy_results(conn: sqlite3.Connection, df, source_label: str) -> tup
         apply_url = str(row.get("job_url_direct", "")) if str(row.get("job_url_direct", "")) != "nan" else None
 
         try:
+            # `company` is in this INSERT because it was missing from it
+            # until 2026-09-02: it was read off the JobSpy row above and then
+            # silently dropped, so every LinkedIn/Indeed job ever discovered
+            # landed with company NULL -- 1082 of the 1842 jobs on the
+            # dashboard, which is why nothing could be grouped by employer.
             conn.execute(
-                "INSERT INTO jobs (url, title, salary, description, location, site, strategy, discovered_at, "
-                "full_description, application_url, detail_scraped_at) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                (url, title, salary, description, location_str, site_label, strategy, now,
+                "INSERT INTO jobs (url, title, company, salary, description, location, site, strategy, "
+                "discovered_at, full_description, application_url, detail_scraped_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (url, title, company, salary, description, location_str, site_label, strategy, now,
                  full_description, apply_url, detail_scraped_at),
             )
             new += 1

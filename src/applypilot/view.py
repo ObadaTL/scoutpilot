@@ -68,56 +68,93 @@ def get_tailor_status(url: str) -> dict:
         return dict(state) if state else {"status": "idle"}
 
 
-def _run_tailor_and_cover(url: str) -> None:
-    """Background-thread target: tailor the resume, then (if that produced
-    one) generate the cover letter, for exactly one job. Updates
-    _tailor_jobs throughout so the page's polling loop can show progress.
+def _on_demand_retries() -> int:
+    """Retry budget for a single on-demand click.
+
+    A batch run defaults to 1 retry on a local provider so hundreds of jobs
+    don't each burn multiple LLM passes. Here it's one job and the user is
+    actively waiting, so a couple more attempts (each ~30-60s locally) is
+    worth it for a better chance of passing validation on the first click.
     """
     from applypilot.llm import is_local_provider
+    return 2 if is_local_provider() else 3
+
+
+def _error_summary(errors: list | None) -> str:
+    if not errors:
+        return ""
+    return " -- " + "; ".join(str(e)[:160] for e in errors[:2])
+
+
+_TAILOR_SUCCESS_STATUSES = {
+    "approved", "approved_with_judge_warning", "approved_unquantified_fallback",
+}
+
+
+def _run_cover_letter(url: str) -> None:
+    """Generate the cover letter for one job, reporting into the job's
+    `cover` field only. Safe to call on its own -- this is what the page's
+    cover-letter retry does when the CV is already on disk."""
     from applypilot.scoring.cover_letter import cover_letter_one
+
+    _set_tailor_status(url, cover="running", stage="cover_letter", cover_error=None)
+    try:
+        result = cover_letter_one(url, max_retries=_on_demand_retries())
+    except Exception as exc:  # noqa: BLE001 -- report to the page, don't crash the thread
+        log.exception("On-demand cover letter failed for %s", url)
+        _set_tailor_status(url, cover="error", stage=None, cover_error=str(exc))
+        return
+
+    if result["status"] != "generated":
+        _set_tailor_status(
+            url, cover="error", stage=None,
+            cover_error=f"Cover letter failed ({result['status']})"
+                        f"{_error_summary(result.get('errors'))}",
+        )
+        return
+    _set_tailor_status(url, cover="done", stage=None, cover_error=None)
+
+
+def _run_tailor_and_cover(url: str) -> None:
+    """Background-thread target: tailor the CV, then generate the cover
+    letter, reporting the two outcomes SEPARATELY.
+
+    They used to share one status field, and a cover-letter failure set it
+    to "error" for the whole job. The page only reloads on success, so a
+    blocked cover letter meant the successfully tailored CV never appeared
+    on the card at all -- it was on disk and in the database the whole time,
+    with nothing on screen to say so. The two artefacts are independent
+    (the CV is useful without a letter, and `cover_letter_one` can be run
+    again on its own against the CV that already exists), so they now report
+    independently: `cv` and `cover` each settle on their own, and the
+    overall `status` is an error only when the CV itself failed.
+    """
     from applypilot.scoring.tailor import tailor_one
 
-    # A single on-demand click is a very different cost/time tradeoff than a
-    # batch run: the batch functions default to 1 retry on a local provider
-    # to keep hundreds of jobs from each burning multiple LLM passes, but
-    # here it's one job and the user is actively waiting on the result --
-    # worth spending a couple more attempts (each ~30-60s locally) for a
-    # meaningfully better chance of passing validation on the first click.
-    max_retries = 2 if is_local_provider() else 3
-
-    def _error_summary(errors: list) -> str:
-        if not errors:
-            return ""
-        return " -- " + "; ".join(str(e)[:160] for e in errors[:2])
-
+    _set_tailor_status(
+        url, status="running", stage="tailoring",
+        cv="running", cover="pending", error=None, cv_error=None, cover_error=None,
+    )
     try:
-        _set_tailor_status(url, status="running", stage="tailoring", error=None)
-        tailor_result = tailor_one(url, max_retries=max_retries)
+        tailor_result = tailor_one(url, max_retries=_on_demand_retries())
+    except Exception as exc:  # noqa: BLE001 -- report to the page, don't crash the thread
+        log.exception("On-demand tailoring failed for %s", url)
+        _set_tailor_status(url, status="error", stage=None, cv="error",
+                           cv_error=str(exc), error=str(exc), cover="skipped")
+        return
 
-        success_statuses = {"approved", "approved_with_judge_warning", "approved_unquantified_fallback"}
-        if tailor_result["status"] not in success_statuses:
-            _set_tailor_status(
-                url, status="error", stage="tailoring",
-                error=f"Tailoring failed ({tailor_result['status']})"
-                     f"{_error_summary(tailor_result.get('errors'))}",
-            )
-            return
+    if tailor_result["status"] not in _TAILOR_SUCCESS_STATUSES:
+        message = (f"Tailoring failed ({tailor_result['status']})"
+                   f"{_error_summary(tailor_result.get('errors'))}")
+        _set_tailor_status(url, status="error", stage="tailoring", cv="error",
+                           cv_error=message, error=message, cover="skipped")
+        return
 
-        _set_tailor_status(url, status="running", stage="cover_letter", error=None)
-        cover_result = cover_letter_one(url, max_retries=max_retries)
-
-        if cover_result["status"] != "generated":
-            _set_tailor_status(
-                url, status="error", stage="cover_letter",
-                error=f"CV tailored, but cover letter failed ({cover_result['status']})"
-                     f"{_error_summary(cover_result.get('errors'))}",
-            )
-            return
-
-        _set_tailor_status(url, status="done", stage=None, error=None)
-    except Exception as exc:  # noqa: BLE001 -- report to the page, don't crash the thread silently
-        log.exception("On-demand tailor+cover failed for %s", url)
-        _set_tailor_status(url, status="error", stage=None, error=str(exc))
+    # The CV is done and on disk from here on. Nothing below may set the
+    # overall status back to "error" -- the page needs to be able to show it.
+    _set_tailor_status(url, cv="done", cv_error=None, status="running")
+    _run_cover_letter(url)
+    _set_tailor_status(url, status="done", stage=None)
 
 
 def _reveal_in_file_manager(path: Path) -> None:
@@ -220,6 +257,39 @@ def generate_dashboard(output_path: str | None = None, serve_base_url: str | Non
     from collections import Counter
     from applypilot.config import load_location_focus
 
+    # Employer for every job, and -- within each employer that has more than
+    # one ad -- which of those ads read as the same posting.
+    #
+    # The `company` column is set on only 21% of these rows (see
+    # database.derive_company for why), so grouping has to derive it. The
+    # near-identical marks are advisory ONLY: they put a badge on the card
+    # and change nothing about which jobs the pipeline will act on, because
+    # employers demonstrably reuse one description across genuinely
+    # different roles and demoting those would drop real postings.
+    from applypilot.database import UNKNOWN_COMPANY, derive_company, group_near_identical
+
+    # Emitted into the page so the JS knows whether /api/search exists.
+    server_search_flag = "true" if serve_base_url else "false"
+
+    company_labels = {j["url"]: derive_company(j) for j in jobs}
+    company_counts = Counter(company_labels.values())
+
+    jobs_by_company: dict[str, list] = {}
+    for j in jobs:
+        jobs_by_company.setdefault(company_labels[j["url"]], []).append(j)
+    dup_marks: dict[str, int] = {}
+    for name, group in jobs_by_company.items():
+        # Never across the unknown bucket: it is not an employer, it is
+        # every job whose employer could not be recovered, so comparing
+        # inside it would be exactly the cross-company comparison this is
+        # scoped to avoid.
+        if name == UNKNOWN_COMPANY or len(group) < 2:
+            continue
+        for url, mark in group_near_identical(group).items():
+            dup_marks[url] = mark
+
+    dup_group_sizes = Counter(dup_marks.values())
+
     place_labels = {j["url"]: classify_location(j["location"]) for j in jobs}
     place_counts = Counter(place_labels.values())
     focus_cfg = load_location_focus()
@@ -228,6 +298,20 @@ def generate_dashboard(output_path: str | None = None, serve_base_url: str | Non
         (l for l in place_counts if l not in tier_labels),
         key=lambda l: -place_counts[l],
     )
+    # Employers ordered by ad count: the ones with several ads are exactly
+    # the ones worth grouping, so they sit at the top of the list.
+    company_options = "".join(
+        f'<option value="{escape(name)}">{escape(name)} ({count})</option>'
+        for name, count in sorted(
+            company_counts.items(),
+            key=lambda kv: (kv[0] == UNKNOWN_COMPANY, -kv[1], kv[0].lower()),
+        )
+    )
+    multi_ad_employers = sum(
+        1 for name, count in company_counts.items()
+        if count > 1 and name != UNKNOWN_COMPANY
+    )
+
     place_filter_buttons = "".join(
         f'<button class="filter-btn" onclick="filterPlace(\'{escape(label)}\', this)">'
         f'{escape(label)} ({place_counts[label]})</button>'
@@ -418,6 +502,15 @@ def generate_dashboard(output_path: str | None = None, serve_base_url: str | Non
                 f'<button type="button" class="manage-btn manage-tailor" '
                 f'onclick="tailorJob(this)">{tailor_label}</button>'
             )
+            # Cover letter on its own, once a CV exists. The letter is the
+            # half that gets blocked; being able to retry just it means a
+            # failed letter never costs the CV that was already generated.
+            if tailored_cv:
+                cover_label = "📄 Redo cover letter" if cover_letter else "📄 Cover letter"
+                manage_buttons.append(
+                    f'<button type="button" class="manage-btn manage-cover" '
+                    f'onclick="coverLetterJob(this)">{cover_label}</button>'
+                )
             if data_status != "applied":
                 manage_buttons.append(
                     '<button type="button" class="manage-btn manage-applied" '
@@ -476,17 +569,43 @@ def generate_dashboard(output_path: str | None = None, serve_base_url: str | Non
         full_desc_text = j["full_description"] or ""
         desc_preview = escape(full_desc_text[:280])
         desc_ellipsis = "..." if len(full_desc_text) > 280 else ""
-        full_desc_html = escape(full_desc_text).replace("\n", "<br>")
         desc_len = len(full_desc_text)
+        # Descriptions are ~11.7 MB of the page across 1842 jobs, all of it
+        # inside collapsed <details> the browser must still parse. When the
+        # dashboard is served they are fetched from /api/description on
+        # first expand instead.
+        #
+        # This was tried once before, on 2026-09-02, and reverted within the
+        # hour: the search box matched `card.textContent`, so removing the
+        # descriptions silently shrank what a search could reach, and because
+        # the search term persists in localStorage the effect outlived the
+        # page and read as "all my jobs disappeared". It is safe now, and
+        # only now, because the served page searches in SQL (/api/search,
+        # see _handle_search) rather than over the DOM.
+        #
+        # The static snapshot keeps them inline: a file:// page has no server
+        # to search or fetch from, so its search is still the textContent
+        # one, and being self-contained is the point of that mode.
+        full_desc_html = (
+            "" if serve_base_url else escape(full_desc_text).replace("\n", "<br>")
+        )
 
         company_summary = escape(j["company_summary"] or "")
         company_hook = escape(j["company_hook"] or "")
         gate_reason = escape(j["gate_reason"] or "")
         critic_score = j["critic_score"]
 
+        company_name = company_labels[j["url"]]
         meta_parts = [
             f'<span class="meta-tag site-tag" style="background:{site_color}33;color:{site_color}">{site}</span>'
         ]
+        if company_name != UNKNOWN_COMPANY:
+            # Rendered into the card, not just a data attribute, so the
+            # existing search box (which matches card.textContent) finds an
+            # employer by name for free.
+            meta_parts.append(
+                f'<span class="meta-tag company-tag">🏢 {escape(company_name)}</span>'
+            )
         if salary:
             meta_parts.append(f'<span class="meta-tag salary">{salary}</span>')
         if location:
@@ -502,8 +621,20 @@ def generate_dashboard(output_path: str | None = None, serve_base_url: str | Non
 
         actions_html = f'<div class="card-actions">{" ".join(action_buttons)}</div>'
 
+        # Advisory only -- see database.group_near_identical. This never
+        # removes the job from anything, it just says "you have seen this".
+        dup_mark = dup_marks.get(j["url"])
+        dup_html = ""
+        if dup_mark:
+            others = dup_group_sizes[dup_mark] - 1
+            dup_html = (
+                f'<div class="dup-box">&#128203; Nearly identical to {others} other '
+                f'ad{"s" if others != 1 else ""} from {escape(company_name)}. '
+                f'Check they are not the same role before applying to each.</div>'
+            )
+
         job_sections += f"""
-        <div class="job-card" data-url="{url}" data-score="{score}" data-site="{escape(j['site'] or '')}" data-status="{data_status}" data-hidden="{1 if is_hidden else 0}" data-place="{escape(place_labels[j['url']])}" data-has-cv="{1 if tailored_cv else 0}" data-has-cl="{1 if cover_letter else 0}" data-order="{card_order}" data-discovered="{escape(j['discovered_at'] or '')}" data-tailored="{escape(j['tailored_at'] or '')}" data-applied="{escape(applied_at or '')}" data-gated="{1 if gate_reason else 0}">
+        <div class="job-card" data-url="{url}" data-score="{score}" data-site="{escape(j['site'] or '')}" data-status="{data_status}" data-hidden="{1 if is_hidden else 0}" data-place="{escape(place_labels[j['url']])}" data-company="{escape(company_name)}" data-dup="{dup_mark or ''}" data-has-cv="{1 if tailored_cv else 0}" data-has-cl="{1 if cover_letter else 0}" data-order="{card_order}" data-discovered="{escape(j['discovered_at'] or '')}" data-tailored="{escape(j['tailored_at'] or '')}" data-applied="{escape(applied_at or '')}" data-gated="{1 if gate_reason else 0}">
           <div class="card-header">
             <div class="card-title-group">
               <span class="score-pill" style="background:{'#10b981' if score >= 7 else ('#f59e0b' if score >= 5 else '#ef4444')}">{score}</span>
@@ -535,11 +666,12 @@ def generate_dashboard(output_path: str | None = None, serve_base_url: str | Non
             <div class="kw-container">{" ".join(keywords_chips)}</div>
           </div>''' if keywords_chips else ''}
 
+          {dup_html}
           {assets_html}
           {manage_html}
 
           <p class="desc-preview">{desc_preview}{desc_ellipsis}</p>
-          {"<details class='full-desc-details'><summary class='expand-btn'>View Full Job Description (" + f'{desc_len:,}' + " chars)</summary><div class='full-desc'>" + full_desc_html + "</div></details>" if j["full_description"] else ""}
+          {("<details class='full-desc-details'" + (f''' data-desc-url="{url}" ontoggle="loadFullDesc(this)"''' if serve_base_url else "") + "><summary class='expand-btn'>View Full Job Description (" + f'{desc_len:,}' + " chars)</summary><div class='full-desc'>" + (full_desc_html or "Loading...") + "</div></details>") if j["full_description"] else ""}
 
           <div class="card-footer">{actions_html}</div>
         </div>"""
@@ -724,6 +856,9 @@ def generate_dashboard(output_path: str | None = None, serve_base_url: str | Non
   .manage-unhide {{ background: #172554; color: #93c5fd; border: 1px solid #1d4ed8; }}
   .manage-unhide:hover {{ background: #1e3a8a; color: #ffffff; }}
   .manage-tailor {{ background: #3b0764; color: #e9d5ff; border: 1px solid #7c3aed; }}
+  .manage-cover {{ background: #172554; color: #bfdbfe; border: 1px solid #3b82f6; }}
+  .company-tag {{ background: #1e293b; color: #cbd5e1; }}
+  .dup-box {{ margin-top: 0.6rem; padding: 0.5rem 0.75rem; border-radius: 6px; font-size: 0.78rem; background: #2a2015; color: #dfa463; border: 1px solid #7c5a2a; }}
   .manage-tailor:hover {{ background: #4c1d95; color: #ffffff; }}
   .manage-tailor:disabled {{ opacity: 0.6; cursor: default; }}
 
@@ -849,9 +984,18 @@ def generate_dashboard(output_path: str | None = None, serve_base_url: str | Non
   </div>
 
   <div class="filter-row">
+    <span class="filter-label">Employer:</span>
+    <select id="company-select" class="sort-select" onchange="filterCompany(this.value)">
+      <option value="all">All employers ({len(company_counts)}, {multi_ad_employers} with several ads)</option>
+      {company_options}
+    </select>
+  </div>
+
+  <div class="filter-row">
     <span class="filter-label">Sort:</span>
     <select id="sort-select" class="sort-select" onchange="applySort(this.value)">
       <option value="score">Fit Score (default)</option>
+      <option value="company-asc">Employer (A-Z, groups ads together)</option>
       <option value="discovered-desc">Newest Discovered</option>
       <option value="discovered-asc">Oldest Discovered</option>
       <option value="tailored-desc">Recently Tailored</option>
@@ -996,6 +1140,25 @@ function unhideJob(btn) {{
     .catch(err => alert('Failed to unhide job: ' + err.message));
 }}
 
+// Descriptions are not in the served page (see full_desc_html in
+// generate_dashboard); the search reaches them through SQL instead. Fetch
+// one the first time its <details> opens, once -- on failure the flag is
+// cleared so closing and reopening retries.
+function loadFullDesc(el) {{
+  if (!el.open || el.dataset.loaded) return;
+  const box = el.querySelector('.full-desc');
+  if (!box) return;
+  el.dataset.loaded = '1';
+  box.textContent = 'Loading...';
+  fetch('/api/description?url=' + encodeURIComponent(el.dataset.descUrl))
+    .then(r => r.json())
+    .then(d => {{ box.textContent = d.text || '(no description stored for this job)'; }})
+    .catch(err => {{
+      el.dataset.loaded = '';
+      box.textContent = 'Could not load the description: ' + err.message;
+    }});
+}}
+
 const FOCUS_STORAGE_KEY = 'applypilot_focus_url';
 
 function tailorJob(btn) {{
@@ -1011,28 +1174,84 @@ function tailorJob(btn) {{
     }});
 }}
 
-function pollTailorStatus(url, btn) {{
+// Reload as soon as the CV lands, not when the whole job finishes. A cover
+// letter can take another minute or fail outright, and the CV is already on
+// disk and worth showing -- waiting for both is what used to leave a
+// perfectly good CV invisible whenever the letter was blocked. The reload
+// drops this polling loop, so the URL is parked in localStorage and picked
+// up again by resumeCoverPolling() on the way back.
+const COVER_RESUME_KEY = 'applypilot_cover_pending_url';
+
+function coverButtonFor(url) {{
+  const card = document.querySelector('.job-card[data-url="' + CSS.escape(url) + '"]');
+  return card ? card.querySelector('.manage-cover') : null;
+}}
+
+function pollTailorStatus(url, btn, opts) {{
+  const coverOnly = !!(opts && opts.coverOnly);
   fetch('/api/tailor-status?url=' + encodeURIComponent(url))
     .then(r => r.json())
     .then(data => {{
-      if (data.status === 'running') {{
-        const stageLabel = data.stage === 'cover_letter' ? 'Writing cover letter...' : 'Tailoring CV...';
-        btn.textContent = '⏳ ' + stageLabel;
-        setTimeout(() => pollTailorStatus(url, btn), 3000);
-      }} else if (data.status === 'done') {{
-        localStorage.setItem(FOCUS_STORAGE_KEY, url);
-        location.reload();
-      }} else if (data.status === 'error') {{
-        alert('Tailoring failed: ' + (data.error || 'unknown error'));
-        btn.disabled = false;
-        btn.textContent = '🪄 Tailor CV + Cover Letter';
-      }} else {{
-        // idle/unknown -- keep waiting briefly in case the POST hasn't
-        // registered the job yet
-        setTimeout(() => pollTailorStatus(url, btn), 1500);
+      if (!coverOnly && data.cv === 'error') {{
+        alert('Tailoring failed: ' + (data.cv_error || data.error || 'unknown error'));
+        localStorage.removeItem(COVER_RESUME_KEY);
+        if (btn) {{ btn.disabled = false; btn.textContent = '🪄 Tailor CV + Cover Letter'; }}
+        return;
       }}
+      // The CV is ready: show it now and let the letter finish in the
+      // background. The server keeps this job's status either way.
+      if (!coverOnly && data.cv === 'done') {{
+        localStorage.setItem(FOCUS_STORAGE_KEY, url);
+        if (data.cover === 'running' || data.cover === 'pending') {{
+          localStorage.setItem(COVER_RESUME_KEY, url);
+        }}
+        location.reload();
+        return;
+      }}
+      if (coverOnly && (data.cover === 'done' || data.cover === 'error')) {{
+        localStorage.removeItem(COVER_RESUME_KEY);
+        if (data.cover === 'error') {{
+          if (btn) {{
+            btn.disabled = false;
+            btn.textContent = '📄 Retry cover letter';
+            btn.title = data.cover_error || 'The cover letter failed; the CV above is fine.';
+          }}
+        }} else {{
+          localStorage.setItem(FOCUS_STORAGE_KEY, url);
+          location.reload();
+        }}
+        return;
+      }}
+      if (btn) {{
+        btn.textContent = '⏳ ' + (data.stage === 'cover_letter'
+          ? 'Writing cover letter...' : 'Tailoring CV...');
+      }}
+      setTimeout(() => pollTailorStatus(url, btn, opts), data.status === 'idle' ? 1500 : 3000);
     }})
-    .catch(() => setTimeout(() => pollTailorStatus(url, btn), 3000));
+    .catch(() => setTimeout(() => pollTailorStatus(url, btn, opts), 3000));
+}}
+
+// Picks the cover letter back up after the reload that showed the CV.
+function resumeCoverPolling() {{
+  let url;
+  try {{ url = localStorage.getItem(COVER_RESUME_KEY); }} catch (e) {{ return; }}
+  if (!url) return;
+  const btn = coverButtonFor(url);
+  if (btn) {{ btn.disabled = true; btn.textContent = '⏳ Writing cover letter...'; }}
+  pollTailorStatus(url, btn, {{coverOnly: true}});
+}}
+
+function coverLetterJob(btn) {{
+  const url = cardUrl(btn);
+  btn.disabled = true;
+  btn.textContent = '⏳ Writing cover letter...';
+  apiPost('/api/cover-letter-one', {{url}})
+    .then(() => pollTailorStatus(url, btn, {{coverOnly: true}}))
+    .catch(err => {{
+      alert('Failed to start the cover letter: ' + err.message);
+      btn.disabled = false;
+      btn.textContent = '📄 Cover letter';
+    }});
 }}
 
 function focusStoredCard() {{
@@ -1100,6 +1319,14 @@ function applySort(val) {{
   }});
 }}
 
+let activeCompanyFilter = 'all';
+
+function filterCompany(val) {{
+  activeCompanyFilter = val;
+  saveFilterState();
+  applyFilters();
+}}
+
 function filterScore(val, btn) {{
   activeScoreFilter = val;
   btn.parentElement.querySelectorAll('.filter-btn').forEach(b => b.classList.remove('active'));
@@ -1124,10 +1351,49 @@ function filterPlace(val, btn) {{
   applyFilters();
 }}
 
+// When the dashboard is served, the search runs in SQL (/api/search) so it
+// can reach the job descriptions without them having to be in the page.
+// `serverMatches` is the set of matching urls, or null for "no answer yet".
+//
+// null deliberately means "do not filter by text", never "nothing matched".
+// A search whose fetch is still in flight, or that failed outright, shows
+// everything rather than hiding everything -- getting that backwards is
+// what made the board look empty on 2026-09-02.
+const SERVER_SEARCH = {server_search_flag};
+let serverMatches = null;
+let searchSeq = 0;
+let searchTimer = null;
+
+function fetchSearchMatches(term) {{
+  const seq = ++searchSeq;
+  return fetch('/api/search?q=' + encodeURIComponent(term))
+    .then(r => r.json())
+    .then(d => {{
+      if (seq !== searchSeq) return;          // a later keystroke already won
+      serverMatches = (d && d.urls) ? new Set(d.urls) : null;
+      applyFilters();
+    }})
+    .catch(() => {{
+      if (seq !== searchSeq) return;
+      serverMatches = null;                    // fail open, never blank
+      applyFilters();
+    }});
+}}
+
 function filterText(text) {{
   searchText = text.toLowerCase();
   saveFilterState();
-  applyFilters();
+  if (!SERVER_SEARCH) {{
+    applyFilters();
+    return;
+  }}
+  searchSeq++;                                 // invalidate anything in flight
+  serverMatches = null;
+  applyFilters();                              // responsive immediately
+  clearTimeout(searchTimer);
+  if (searchText) {{
+    searchTimer = setTimeout(() => fetchSearchMatches(searchText), 200);
+  }}
 }}
 
 // Filters live only as in-memory JS state, so a plain location.reload()
@@ -1143,6 +1409,7 @@ function saveFilterState() {{
       score: activeScoreFilter,
       status: activeStatusFilter,
       place: activePlaceFilter,
+      company: activeCompanyFilter,
       search: searchText,
       hideAppliedUnavailable: hideAppliedUnavailable,
       compactMode: compactMode,
@@ -1173,6 +1440,7 @@ function restoreFilterState() {{
   activeScoreFilter = saved.score || 'all';
   activeStatusFilter = saved.status || 'all';
   activePlaceFilter = saved.place || 'all';
+  activeCompanyFilter = saved.company || 'all';
   searchText = saved.search || '';
   hideAppliedUnavailable = saved.hideAppliedUnavailable !== false;
   compactMode = saved.compactMode === true;
@@ -1185,9 +1453,19 @@ function restoreFilterState() {{
   const compactToggle = document.getElementById('compact-toggle-input');
   if (compactToggle) compactToggle.checked = compactMode;
   document.body.classList.toggle('compact-mode', compactMode);
+  const companySelect = document.getElementById('company-select');
+  // A stored employer that no longer has any ads on the page would filter
+  // everything away with no obvious cause, so fall back to "all" instead.
+  if (companySelect) {{
+    const known = Array.from(companySelect.options).some(o => o.value === activeCompanyFilter);
+    if (!known) activeCompanyFilter = 'all';
+    companySelect.value = activeCompanyFilter;
+  }}
   const sortSelect = document.getElementById('sort-select');
   if (sortSelect) sortSelect.value = activeSort;
   applySort(activeSort);
+
+  if (SERVER_SEARCH && searchText) fetchSearchMatches(searchText);
 
   _setActiveFilterButton('.filter-btn[onclick^="filterScore("]', activeScoreFilter);
   _setActiveFilterButton('.filter-btn[onclick^="filterStatus("]', activeStatusFilter);
@@ -1231,6 +1509,10 @@ function applyFilters() {{
     // Place Filter
     const placeMatch = activePlaceFilter === 'all' || place === activePlaceFilter;
 
+    // Employer Filter
+    const companyMatch = activeCompanyFilter === 'all'
+      || (card.dataset.company || '') === activeCompanyFilter;
+
     // Hide Applied/Unavailable/Hidden toggle (default on) combines with the
     // filters above, but a specific Status filter always wins -- picking
     // "Applied" or "Hidden by you" is an explicit request to see exactly
@@ -1239,9 +1521,13 @@ function applyFilters() {{
       || (status !== 'applied' && status !== 'closed' && status !== 'manual' && !isHidden);
 
     // Search Text Match
-    const textMatch = !searchText || text.includes(searchText);
+    // Server-side when served (serverMatches null = answer not in yet, so
+    // don't filter), client-side against the card's own text otherwise.
+    const textMatch = !searchText
+      || (SERVER_SEARCH ? (serverMatches === null || serverMatches.has(card.dataset.url))
+                        : text.includes(searchText));
 
-    if (scoreMatch && statusMatch && placeMatch && hideMatch && textMatch) {{
+    if (scoreMatch && statusMatch && placeMatch && companyMatch && hideMatch && textMatch) {{
       card.classList.remove('hidden');
       shown++;
     }} else {{
@@ -1266,6 +1552,7 @@ function applyFilters() {{
 restoreFilterState();
 applyFilters();
 focusStoredCard();
+resumeCoverPolling();
 </script>
 
 </body>
@@ -1334,6 +1621,10 @@ def serve_dashboard(output_path: str | None = None, port: int = 8765) -> None:
                 self._serve_asset(urllib.parse.parse_qs(parsed.query))
             elif parsed.path == "/api/tailor-status":
                 self._handle_tailor_status(urllib.parse.parse_qs(parsed.query))
+            elif parsed.path == "/api/search":
+                self._handle_search(urllib.parse.parse_qs(parsed.query))
+            elif parsed.path == "/api/description":
+                self._handle_description(urllib.parse.parse_qs(parsed.query))
             else:
                 self.send_response(404)
                 self.end_headers()
@@ -1354,6 +1645,8 @@ def serve_dashboard(output_path: str | None = None, port: int = 8765) -> None:
                 self._handle_open_folder(payload)
             elif parsed.path == "/api/tailor-one":
                 self._handle_tailor_one(payload)
+            elif parsed.path == "/api/cover-letter-one":
+                self._handle_cover_letter_one(payload)
             else:
                 self.send_response(404)
                 self.end_headers()
@@ -1376,6 +1669,92 @@ def serve_dashboard(output_path: str | None = None, port: int = 8765) -> None:
             thread = threading.Thread(target=_run_tailor_and_cover, args=(url,), daemon=True)
             thread.start()
             self._respond_json(200, {"ok": True, "status": "started"})
+
+        def _handle_cover_letter_one(self, payload: dict) -> None:
+            # Generates ONLY the cover letter, against the CV already on
+            # disk. This is the other half of separating the two: when a
+            # letter is blocked, the CV it belongs to is fine and re-running
+            # the whole tailor pass to get another shot at the letter would
+            # throw that CV away and cost another minute.
+            url = str(payload.get("url") or "").strip()
+            if not url:
+                self._respond_json(400, {"ok": False, "error": "url is required"})
+                return
+
+            existing = get_tailor_status(url)
+            if existing.get("cover") == "running" or existing.get("cv") == "running":
+                self._respond_json(200, {"ok": True, "status": "already_running"})
+                return
+
+            row = get_connection().execute(
+                "SELECT tailored_resume_path FROM jobs WHERE url = ?", (url,)
+            ).fetchone()
+            if row is None or not row["tailored_resume_path"]:
+                self._respond_json(
+                    400,
+                    {"ok": False, "error": "this job has no tailored CV yet -- tailor it first"},
+                )
+                return
+
+            thread = threading.Thread(target=_run_cover_letter, args=(url,), daemon=True)
+            thread.start()
+            self._respond_json(200, {"ok": True, "status": "started"})
+
+        # Columns a search looks in. `full_description` is here so that
+        # searching for something only the description mentions still works
+        # -- that used to happen in the browser, against the description
+        # text inlined into every card, and it is the reason the page could
+        # not be made smaller. Doing it in SQL instead costs ~30ms over 6184
+        # rows (measured 2026-09-02) and frees the page from having to carry
+        # 11.7 MB of description text purely to be searchable.
+        _SEARCH_COLUMNS = (
+            "title", "company", "site", "location", "salary",
+            "score_reasoning", "company_summary",
+        )
+
+        def _handle_description(self, query: dict[str, list[str]]) -> None:
+            """One job's description, fetched when its <details> is expanded."""
+            url = (query.get("url") or [""])[0]
+            if not url:
+                self._respond_json(400, {"ok": False, "error": "url is required"})
+                return
+            row = get_connection().execute(
+                "SELECT COALESCE(NULLIF(full_description, ''), description) AS text "
+                "FROM jobs WHERE url = ?",
+                (url,),
+            ).fetchone()
+            if row is None:
+                self._respond_json(404, {"ok": False, "error": "no such job"})
+                return
+            self._respond_json(200, {"ok": True, "text": row["text"] or ""})
+
+        def _handle_search(self, query: dict[str, list[str]]) -> None:
+            term = (query.get("q") or [""])[0].strip().lower()
+            if not term:
+                # An empty query means "no text filter", which is not the
+                # same as "nothing matches" -- returning an empty list here
+                # would blank the board.
+                self._respond_json(200, {"ok": True, "q": "", "urls": None})
+                return
+
+            like = f"%{term}%"
+            columns = " OR ".join(
+                f"lower(COALESCE({c}, '')) LIKE ?" for c in self._SEARCH_COLUMNS
+            )
+            sql = (
+                "SELECT url FROM jobs "
+                "WHERE (fit_score IS NOT NULL OR tailored_resume_path IS NOT NULL) "
+                f"AND ({columns} "
+                "OR lower(COALESCE(full_description, description, '')) LIKE ?)"
+            )
+            params = (like,) * (len(self._SEARCH_COLUMNS) + 1)
+            try:
+                urls = [r["url"] for r in get_connection().execute(sql, params)]
+            except Exception as exc:  # noqa: BLE001 -- a failed search must not blank the page
+                log.exception("Dashboard search failed for %r", term)
+                self._respond_json(500, {"ok": False, "error": str(exc)})
+                return
+            self._respond_json(200, {"ok": True, "q": term, "urls": urls})
 
         def _handle_tailor_status(self, query: dict[str, list[str]]) -> None:
             url = (query.get("url") or [""])[0]

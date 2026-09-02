@@ -201,44 +201,74 @@ def get_currency_symbol(currency_code: str) -> str:
     return _CURRENCY_SYMBOLS.get(currency_code, "")
 
 
-def load_search_config() -> dict:
-    """Load search configuration from ~/.applypilot/searches.yaml."""
+# Parsed YAML, keyed by path and invalidated by the file's own mtime/size.
+#
+# These loaders are called from inside per-job loops, and re-parsing a config
+# file per job is not a cost anyone budgeted for. Measured 2026-09-02 on a
+# 6184-job database: rendering the dashboard called load_search_config()
+# 1843 times -- once per job via database.classify_location -- and spent
+# 25.6 of 34 seconds in yaml.safe_load. The DB query behind the same page
+# takes 0.08s. That was the whole "the dashboard is slow because the
+# database got big" symptom: the database was never the problem.
+#
+# Keyed on (mtime_ns, size) rather than cached outright because these are
+# files the user edits by hand -- searches.yaml especially -- and a config
+# change has to take effect on the next call without restarting anything.
+_yaml_cache: dict[Path, tuple[tuple[int, int], object]] = {}
+
+
+def _load_yaml_cached(path: Path):
+    """Parse `path` as YAML, reusing the previous parse while it is unchanged.
+
+    Returns None if the file doesn't exist or can't be read, so callers keep
+    their existing "missing file" branches.
+    """
     import yaml
+    try:
+        st = path.stat()
+    except OSError:
+        return None
+    stamp = (st.st_mtime_ns, st.st_size)
+    cached = _yaml_cache.get(path)
+    if cached is not None and cached[0] == stamp:
+        return cached[1]
+    data = yaml.safe_load(path.read_text(encoding="utf-8"))
+    _yaml_cache[path] = (stamp, data)
+    return data
+
+
+def load_search_config() -> dict:
+    """Load search configuration from ~/.applypilot/searches.yaml.
+
+    Cached on the file's mtime -- see _load_yaml_cached. Callers must treat
+    the result as read-only: it is shared between them.
+    """
     if not SEARCH_CONFIG_PATH.exists():
         # Fall back to package-shipped example
         example = CONFIG_DIR / "searches.example.yaml"
         if example.exists():
-            return yaml.safe_load(example.read_text(encoding="utf-8"))
+            return _load_yaml_cached(example) or {}
         return {}
-    return yaml.safe_load(SEARCH_CONFIG_PATH.read_text(encoding="utf-8"))
+    return _load_yaml_cached(SEARCH_CONFIG_PATH) or {}
 
 
 def load_sites_config() -> dict:
-    """Load sites.yaml configuration (sites list, manual_ats, blocked, etc.)."""
-    import yaml
-    path = CONFIG_DIR / "sites.yaml"
-    if not path.exists():
-        return {}
-    return yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+    """Load sites.yaml configuration (sites list, manual_ats, blocked, etc.).
+
+    Cached on mtime; treat the result as read-only (see load_search_config).
+    """
+    return _load_yaml_cached(CONFIG_DIR / "sites.yaml") or {}
 
 
 def load_ats_employers() -> dict:
     """Load Direct ATS employers from config/ats_employers.yaml."""
-    import yaml
-    path = CONFIG_DIR / "ats_employers.yaml"
-    if not path.exists():
-        return {}
-    data = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+    data = _load_yaml_cached(CONFIG_DIR / "ats_employers.yaml") or {}
     return data.get("employers", {})
 
 
 def load_schemes_config() -> dict:
     """Load Graduate Schemes & Funded Training config from config/schemes.yaml."""
-    import yaml
-    path = CONFIG_DIR / "schemes.yaml"
-    if not path.exists():
-        return {}
-    data = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+    data = _load_yaml_cached(CONFIG_DIR / "schemes.yaml") or {}
     return data.get("schemes", {})
 
 

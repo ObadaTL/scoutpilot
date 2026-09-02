@@ -182,6 +182,7 @@ Each fact names the entry it belongs under. Attach it ONLY to a bullet inside th
 - Preserved companies: {companies_str} -- names stay as-is
 - Preserved school: {school}
 - EDUCATION is code-overridden after you respond -- whatever you write in that field is discarded and replaced with the candidate's real degree, honours, and dates. Fill it with anything non-empty (e.g. just the school name); do not spend effort on it.
+- The degree and the university are NEVER an EXPERIENCE entry. EXPERIENCE holds employers and nothing else -- exactly these: {companies_str}. An entry headed with a degree, a course, or {school} is deleted in code before the {doc} is assembled, and every bullet you wrote under it goes with it.
 - Must fill {pages} full page{'s' if pages != 1 else ''} -- do not compress to fewer, do not pad with filler to reach more.
 
 ## OUTPUT: Return ONLY valid JSON. No markdown fences. No commentary. No "here is" preamble.
@@ -1286,6 +1287,85 @@ def find_header_restating_bullets(resolved_data: dict) -> list[str]:
     return violations
 
 
+def find_summary_duplicate_bullets(resolved_data: dict) -> list[str]:
+    """Summary sentences that are a bullet below, retyped.
+
+    check_no_cross_section_duplicates compares every bullet pair in the
+    document, but it only ever walks _DUP_CHECK_SECTIONS -- the summary is
+    not a section and has never been in the comparison. The critic's
+    SAME_WORK_PAIRS clause used to be the only thing near this and it was
+    removed 2026-08-27 for answering unreliably, so nothing covered it.
+
+    One signal: word coverage, the same measure _bullets_similar uses
+    between two bullets, but at its own threshold. Bullet-vs-bullet and
+    summary-vs-bullet are not the same question. Two bullets sharing 30% of
+    their significant words are saying the same thing twice; a summary
+    sharing 30% with a bullet is doing its job, because a summary is
+    SUPPOSED to state in compressed form what a bullet elaborates. See
+    _SUMMARY_DUP_MIN_COVERAGE for where its number comes from.
+
+    A second signal was built and removed the same day, and the reason is
+    worth keeping. It flagged a summary sentence and a bullet that resolve
+    to the SAME verified fact under _likely_fact_id, on the pre-v2 corpus
+    finding that six of eight duplicates paired a bullet with a summary
+    sentence. Measured over 12 live postings it produced 14 findings and the
+    repair below could not fix a single one -- because they were not
+    defects. The shape it kept flagging:
+
+        summary: "Built two parallel ML pipelines on surface-EMG signals in
+                  Python/scikit-learn, addressing class imbalance ..."
+        bullet:  "Built two parallel ML pipelines on surface-EMG signals in
+                  Python/scikit-learn: one for hand-gesture classification,
+                  one for per-subject biometric identification, with
+                  engineered time-domain features."
+
+    That is a summary compressing the headline achievement and a bullet
+    elaborating it, which is what a CV is supposed to do -- and what
+    _build_tailor_prompt's SUMMARY rule explicitly asks for ("lead with the
+    single most relevant thing this person has actually done"). A check
+    that fires on 12 of 12 documents against the instruction the generator
+    was given is measuring the instruction, not a defect. Sharing a claim
+    with a bullet is fine; being the same sentence is not, and that is all
+    this decides now. Bringing the fact-id signal back needs evidence from
+    a corpus generated after the fallback fix, not the pre-v2 one (see
+    corpus_v2/README.md, which states why that corpus is not evidence).
+
+    Advisory, unlike check_no_cross_section_duplicates: a summary echoing a
+    bullet is a quality problem, not a fabrication or misattribution risk,
+    and it never refuses a CV. It doesn't drive a retry either -- see
+    _repair_summary, which rewrites the one field instead. Returns
+    human-readable strings; nothing here calls an LLM.
+    """
+    summary = str(resolved_data.get("summary") or "").strip()
+    if not summary:
+        return []
+
+    bullets: list[tuple[str, str]] = []  # (header, text)
+    for section in _DUP_CHECK_SECTIONS:
+        for entry in resolved_data.get(section) or []:
+            if not isinstance(entry, dict):
+                continue
+            header = str(entry.get("header") or "?")
+            for b in entry.get("bullets") or []:
+                bullets.append((header, _bullet_text(b)))
+    if not bullets:
+        return []
+
+    violations: list[str] = []
+    for sentence in re.split(r"(?<=[.!?])\s+", summary):
+        sentence = sentence.strip()
+        if not _significant_words(sentence):
+            continue
+        for header, text in bullets:
+            if _word_coverage(sentence, text) >= _SUMMARY_DUP_MIN_COVERAGE:
+                violations.append(
+                    f"A summary sentence repeats a bullet under '{header}' almost word "
+                    f"for word. Say something the bullets don't: {sentence[:100]!r}"
+                )
+                break
+    return violations
+
+
 def _bullet_text(bullet) -> str:
     """Best-effort plain text for a bullet, which may still be a raw
     {"fact": id, "form": ...} dict at this point (canonicalization runs
@@ -1318,17 +1398,46 @@ _WORD_RE = re.compile(r"[a-z0-9]+")
 # claim) started at 0.40.
 _BULLET_DUP_MIN_COVERAGE = 0.30
 
+# Summary-vs-bullet needs its own, much higher bar than bullet-vs-bullet.
+# Two bullets sharing 30% of their significant words are saying the same
+# thing twice; a summary sharing 30% with a bullet is doing its job.
+#
+# Measured over the 50 summary sentences in the 24 CVs generated at this
+# commit (2026-09-01 A/B plus the 2026-08-27 fact-owner run), scored against
+# their closest bullet and read pair by pair. The two shapes separate with a
+# gap between them:
+#
+#   0.94  summary sentence IS the bullet, minus a trailing phrase   defect
+#   0.67  summary fully contains the bullet and adds one clause     defect
+#   ----------------------------------------------------------- 0.65
+#   0.59  summary compresses; bullet elaborates with new specifics  fine
+#   0.56  same claim, genuinely different detail either side        fine
+#   0.53  summary covers two things, bullet is one of them          fine
+#
+# 0.65 sits in that gap and fires on 3 of the 50. This is a small sample --
+# it is a boundary drawn where the two shapes visibly stop overlapping, not
+# a tuned optimum, and the corpus regenerated after the fallback fix should
+# re-check it before anything else is built on top of it.
+_SUMMARY_DUP_MIN_COVERAGE = 0.65
+
 
 def _significant_words(text: str) -> set[str]:
     return {w for w in _WORD_RE.findall(text.lower()) if w not in _BULLET_STOPWORDS and len(w) > 1}
 
 
-def _bullets_similar(a: str, b: str) -> bool:
+def _word_coverage(a: str, b: str) -> float:
+    """Share of significant words the two texts have in common, taken as the
+    weaker of the two directions so that a long text cannot score highly
+    just by containing a short one."""
     wa, wb = _significant_words(a), _significant_words(b)
     if not wa or not wb:
-        return False
+        return 0.0
     inter = wa & wb
-    return min(len(inter) / len(wa), len(inter) / len(wb)) >= _BULLET_DUP_MIN_COVERAGE
+    return min(len(inter) / len(wa), len(inter) / len(wb))
+
+
+def _bullets_similar(a: str, b: str) -> bool:
+    return _word_coverage(a, b) >= _BULLET_DUP_MIN_COVERAGE
 
 
 def _merge_canonical_section(entries: list, records: list[dict]) -> tuple[list, list]:
@@ -1500,23 +1609,62 @@ def _summary_rut(summary: str) -> str:
     return ""
 
 
-def _repair_summary_rut(resolved_data: dict, client, job: dict, guard: NumericGuard) -> None:
-    """Rewrite `resolved_data["summary"]` in place if it fell into a rut.
+def _repair_summary(resolved_data: dict, client, job: dict, guard: NumericGuard) -> list[str]:
+    """Rewrite `resolved_data["summary"]` in place if it fell into a rut or
+    just repeats a bullet, and return whatever is still wrong afterwards.
+
+    Two problems, one repair. The rut check (_summary_rut) was here first;
+    the duplication check (find_summary_duplicate_bullets) joined it because
+    it has the same shape and the same right answer. Both are stylistic
+    defects in ONE field, and the argument the rut repair was built on
+    applies unchanged: a full retry would spend an attempt from the budget
+    and discard an otherwise-good CV, and if the re-roll then failed
+    validation the run would ship something worse than what it threw away.
+    Rewriting one field costs one short call and cannot lose the document.
+
+    A retry would be wrong here for a second reason too: neither defect is
+    reliably fixable, so a retry that fails leaves the document worse off
+    for having been re-rolled. Measured over 12 live postings, the repair
+    succeeded on 3 of the 12 summaries it was handed. That is fine for a
+    single-field rewrite that cannot lose anything -- the other 9 keep the
+    summary they had and are reported -- and would not have been fine as a
+    retry.
 
     Mutates only on success, and "success" is strict: the replacement must
-    itself be rut-free, must be a plausible summary length, and must pass
-    NumericGuard (a rewrite is LLM-authored text like any other, so it gets
-    the same numeric scrutiny as the bullets around it). Any failure -- a
-    bad rewrite, an unparseable response, or the LLM call raising at all --
-    leaves the original summary exactly as it was. A stylistic improvement
-    is never worth risking the document over, which is also why this
-    swallows exceptions rather than letting a transient LLM error take down
-    a CV that had already passed everything else.
+    be a plausible summary length, must pass NumericGuard (a rewrite is
+    LLM-authored text like any other), and must leave STRICTLY FEWER
+    problems than the summary it replaces -- a rewrite that trades a
+    duplicate for a rut is not an improvement and is discarded. Any failure
+    -- a bad rewrite, an unparseable response, or the LLM call raising at
+    all -- leaves the original summary exactly as it was.
+
+    Returns:
+        The problems still present when this returns: [] when there was
+        nothing to fix or the repair worked, otherwise the notes the caller
+        should log/report. Never raises.
     """
     summary = str(resolved_data.get("summary", ""))
-    rut = _summary_rut(summary)
-    if not rut:
-        return
+
+    def _problems(text: str) -> list[str]:
+        probe = dict(resolved_data)
+        probe["summary"] = text
+        rut = _summary_rut(text)
+        return ([rut] if rut else []) + find_summary_duplicate_bullets(probe)
+
+    problems = _problems(summary)
+    if not problems:
+        return []
+
+    # The bullets the rewrite must not restate. Naming them beats describing
+    # the rule: the model has to see the sentences it is being kept off.
+    existing = [
+        _bullet_text(b)
+        for section in _DUP_CHECK_SECTIONS
+        for entry in resolved_data.get(section) or []
+        if isinstance(entry, dict)
+        for b in entry.get("bullets") or []
+    ]
+    bullets_block = "\n".join(f"- {b}" for b in existing[:12])
 
     messages = [
         {"role": "system", "content": (
@@ -1527,33 +1675,43 @@ def _repair_summary_rut(resolved_data: dict, client, job: dict, guard: NumericGu
             f"TARGET JOB: {job.get('title', '')}\n\n"
             f"JOB DESCRIPTION:\n{(job.get('full_description') or '')[:2000]}\n\n"
             f"CURRENT SUMMARY:\n{summary}\n\n"
-            f"PROBLEM: {rut}\n\n"
+            f"BULLETS ALREADY ON THIS CV (the summary must not restate any of these):\n"
+            f"{bullets_block}\n\n"
+            f"PROBLEM: {' '.join(problems)}\n\n"
             "Rewrite the summary in 2-3 sentences, angled at the target job above. "
             "Keep every claim it makes -- same facts, same numbers, invent nothing new "
             "and drop nothing real. Every sentence must be a complete sentence: CV "
             "register with an implied subject is fine (\"Built the ingest pipeline...\"), "
             "a headless noun phrase is not (\"Signal processing in Python, addressing "
-            "...\"). Return the rewritten summary only:"
+            "...\"). Say what the bullets above do NOT: the shape of the work, the "
+            "domain, what this person is for -- not a second copy of the first bullet. "
+            "Return the rewritten summary only:"
         )},
     ]
 
     try:
         rewritten = sanitize_text(client.chat(messages, max_tokens=300, temperature=0.7)).strip()
     except Exception:
-        log.warning("Summary rut repair call failed; keeping the original summary.", exc_info=True)
-        return
+        log.warning("Summary repair call failed; keeping the original summary.", exc_info=True)
+        return problems
 
-    if not (40 <= len(rewritten) <= 700) or _summary_rut(rewritten):
-        log.debug("Summary rut repair produced an unusable result; keeping the original.")
-        return
+    if not (40 <= len(rewritten) <= 700):
+        log.debug("Summary repair produced an unusable result; keeping the original.")
+        return problems
     try:
         guard.check(rewritten)
     except NumericGuardViolation as e:
-        log.debug("Summary rut repair introduced unverified number(s) %s; keeping the original.", e.numbers)
-        return
+        log.debug("Summary repair introduced unverified number(s) %s; keeping the original.", e.numbers)
+        return problems
+    remaining = _problems(rewritten)
+    if len(remaining) >= len(problems):
+        log.debug("Summary repair did not improve on the original (%d -> %d problems); keeping it.",
+                  len(problems), len(remaining))
+        return problems
 
-    log.debug("Summary rut repaired: %s", rut)
+    log.debug("Summary repaired: %s", "; ".join(problems))
     resolved_data["summary"] = rewritten
+    return remaining
 
 
 def _build_guard_scan_text(resolved_data: dict) -> str:
@@ -1830,7 +1988,38 @@ def tailor_resume(
         # the point where an unknown fact id or a digit-bearing plain bullet
         # gets caught in code (not just flagged by instruction).
         resolved_data, resolution_errors = _resolve_fact_bullets(data, fact_bank)
-        resolution_errors = canonical_errors + resolution_errors
+
+        # canonical_errors and resolution_errors are NOT the same severity,
+        # and lumping them together (as this did until 2026-09-01) cost real
+        # CVs. Both are worth a retry while attempts remain, so both go into
+        # avoid_notes -- but only one of them is worth abandoning a tailored
+        # document for on the last attempt.
+        #
+        # A resolution error means a bullet was DROPPED: the model filed a
+        # verified fact under an entry that doesn't own it, or wrote a digit
+        # with no fact behind it. Real, quantified content is missing from
+        # the document, so shipping the canned-wording fallback instead is
+        # the better of two bad outcomes.
+        #
+        # A canonical error means an INVENTED EXPERIENCE entry was rejected
+        # -- and _apply_canonical_entries has already removed it from `data`
+        # by the time this runs. Nothing real is lost: an entry that matched
+        # no canonical record by keyword contains no recognizable employer
+        # content to lose. Measured 2026-09-01 across the residual fallbacks
+        # from the fact-owner A/B: 2 of the 3 were this, both the same
+        # shape, the model filing its own degree ("MEng Software &
+        # Electronic Systems Engineering") as a job. Falling back there
+        # throws away a good tailored CV to punish a hallucinated entry that
+        # is already gone from the document.
+        if canonical_errors:
+            avoid_notes.extend(canonical_errors)
+            if not is_last_attempt:
+                continue
+            log.warning(
+                "Shipping '%s' after rejecting an invented EXPERIENCE entry: %s",
+                job.get("title", "?"), "; ".join(canonical_errors),
+            )
+            report.setdefault("warnings", []).extend(canonical_errors)
 
         if resolution_errors:
             avoid_notes.extend(resolution_errors)
@@ -1838,7 +2027,7 @@ def tailor_resume(
                 continue
             tailored = _ship_unquantified_fallback(data, profile, extra_sections, fact_bank, guard, resume_text)
             report["status"] = "approved_unquantified_fallback"
-            report["guard_violation"] = {"errors": resolution_errors}
+            report["guard_violation"] = {"errors": canonical_errors + resolution_errors}
             return tailored, report
 
         # Hard assertion: the same bullet must never appear in more than one
@@ -1906,7 +2095,18 @@ def tailor_resume(
         # than what it threw away. Rewriting one field costs one short call,
         # cannot lose the rest of the document, and asking for a single
         # sentence is a much easier request than re-deriving the whole CV.
-        _repair_summary_rut(resolved_data, client, job, guard)
+        # Also repairs a summary that just restates a bullet -- see
+        # find_summary_duplicate_bullets, and _repair_summary for why that
+        # defect is repaired in place rather than retried like the two
+        # checks above. Anything it could not fix is reported, never
+        # retried, and never blocks the document.
+        summary_problems = _repair_summary(resolved_data, client, job, guard)
+        if summary_problems:
+            log.warning(
+                "Shipping '%s' with an unrepaired summary problem: %s",
+                job.get("title", "?"), "; ".join(summary_problems),
+            )
+            report.setdefault("warnings", []).extend(summary_problems)
 
         # Normalize `education` here, not at assembly time. validate_json_fields
         # below inspects the raw field, so repairing it during assembly (which

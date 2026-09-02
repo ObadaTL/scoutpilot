@@ -96,6 +96,204 @@ def classify_location(location: str | None) -> str:
     return "Remote" if any(k in location.lower() for k in _GENERIC_REMOTE_TERMS) else "Other"
 
 
+# Boards that list many employers: their `site` is a job board, never a
+# company. Anything else in `site` IS the employer (the Workday-style
+# per-company scrapers store it that way).
+_AGGREGATOR_SITES = {
+    "linkedin", "indeed", "glassdoor", "ziprecruiter", "google", "remoteok",
+    "welcometothejungle", "job bank canada", "careerjet canada", "hacker news",
+}
+
+# "Greenhouse (GitLab)", "Ashby (Supabase)", "Lever (Spotify)".
+_BOARD_SITE_RE = re.compile(
+    r"^(?:greenhouse|ashby|lever|workday|smartrecruiters)\s*\((.+)\)\s*$", re.I
+)
+
+# The scorer writes company_summary as prose that opens on the employer:
+# "Riff Financial is a pre-launch UK fintech...", "Esri develops...",
+# "Cisco's Webex Engineering Group is...". Up to four capitalised words
+# before the verb, which covers "Motorola Solutions" and "M Group Energy"
+# without swallowing half a sentence.
+_COMPANY_NAME = r"[A-Z][\w&.\-]*(?:\s+[A-Z][\w&.\-]*){0,3}"
+# Two shapes, possessive first: in "Cisco's Webex Engineering Group is
+# building ..." the employer is Cisco, and the name ends at the apostrophe --
+# without this branch the verb pattern below walks past it and matches
+# nothing, because what follows "Cisco's" is another proper noun rather
+# than a verb.
+_SUMMARY_COMPANY_RES = (
+    re.compile(rf"^\s*({_COMPANY_NAME})(?:'s|’s)\s"),
+    re.compile(
+        rf"^\s*({_COMPANY_NAME})\s+"
+        r"(?:is|are|was|operates|builds|provides|develops|delivers|has|works|"
+        r"specialis|specializ)"
+    ),
+)
+
+UNKNOWN_COMPANY = "Unknown employer"
+
+
+def derive_company(job: dict | sqlite3.Row) -> str:
+    """Best available employer name for a job, for grouping in the dashboard.
+
+    Derived at read time rather than backfilled into the `company` column,
+    because only the first source below is authoritative -- the other two
+    are recovery for rows that should have had a company and don't.
+
+    Three sources, most trustworthy first:
+
+    1. `company` itself. Set by the direct-ATS and schemes harvesters, and
+       (from 2026-09-02) by the JobSpy path, which read it and then dropped
+       it on the floor for the whole life of the database -- see
+       discovery/jobspy.store_jobspy_results. That bug is why this function
+       has to exist for the rows already stored: 1456 of 1842 dashboard
+       jobs have no company, and re-discovering them is not possible for
+       postings that have since closed.
+    2. `site`, when it is not one of the aggregator boards. The
+       per-employer scrapers put the employer there ("Thomson Reuters"),
+       and the ATS ones use "Board (Employer)".
+    3. The opening words of `company_summary`, which the scorer writes as
+       prose starting on the employer's name.
+
+    Returns UNKNOWN_COMPANY rather than None so callers can group on the
+    result without a special case; measured 2026-09-02 this identifies 57%
+    of dashboard rows, up from the 21% that had the column set.
+    """
+    def _get(key: str) -> str:
+        try:
+            value = job[key]
+        except (KeyError, IndexError, TypeError):
+            return ""
+        return (value or "").strip() if isinstance(value, str) else ""
+
+    explicit = _get("company")
+    if explicit:
+        return explicit
+
+    site = _get("site")
+    board = _BOARD_SITE_RE.match(site)
+    if board:
+        return board.group(1).strip()
+    if site and site.lower() not in _AGGREGATOR_SITES:
+        return site
+
+    summary = _get("company_summary")
+    for pattern in _SUMMARY_COMPANY_RES:
+        match = pattern.match(summary)
+        if match:
+            return match.group(1).strip()
+
+    return UNKNOWN_COMPANY
+
+
+_SHINGLE_WORD_RE = re.compile(r"[a-z0-9]+")
+_SHINGLE_K = 5
+# Only the first N words are shingled. Descriptions average ~1000 words and
+# this runs over every ad of every multi-ad employer on each dashboard
+# render, so the tail is cut to bound that cost; two postings that agree
+# across their first 600 words are not going to diverge into different jobs
+# after it.
+_SHINGLE_MAX_WORDS = 600
+
+# Jaccard over those shingles at which two ads are worth pointing out to a
+# human. Measured 2026-09-02 over 1188 randomly sampled same-employer pairs,
+# scored against difflib.SequenceMatcher.ratio() -- the same measure
+# find_duplicate_groups treats as authoritative at 0.85:
+#
+#   jaccard   pairs   share that are duplicates by ratio >= 0.85
+#     <= 0.7    1093       0%
+#        0.8      12      58%
+#        0.9      11      81%
+#        1.0      72      90%
+#
+# 0.8 is where findings start existing at all: below it the rate is a flat
+# zero across more than a thousand pairs, so a lower bar would produce pure
+# noise. Above it the minority that are not true duplicates are employers
+# reusing one description across genuinely different roles, which is worth
+# a human glance rather than a silent decision -- see NOT_A_DUPLICATE_MARK.
+_NEAR_IDENTICAL_JACCARD = 0.8
+
+# This drives a BADGE and nothing else. find_duplicate_groups stays the only
+# thing that sets `duplicate_of`, because a job marked duplicate drops out of
+# scoring, tailoring and apply entirely, and the 2026-09-02 audit found the
+# cases this would get wrong: three Ciena postings differing only by which
+# air force base, a Thomson Reuters Principal vs Staff pair, and an iOS and
+# an Android graduate programme that scored 6 and 8. All are near-identical
+# text. None are duplicates.
+NOT_A_DUPLICATE_MARK = True
+
+
+def description_shingles(text: str) -> frozenset:
+    """Set of 5-word shingle hashes over a description's first 600 words.
+
+    Order-independent and immune to a shared boilerplate header, unlike a
+    prefix comparison: an employer's standard preamble contributes the same
+    shingles to every one of its ads and so cancels out of the Jaccard.
+    """
+    words = _SHINGLE_WORD_RE.findall((text or "").lower())[:_SHINGLE_MAX_WORDS]
+    if len(words) < _SHINGLE_K:
+        return frozenset()
+    return frozenset(
+        hash(" ".join(words[i:i + _SHINGLE_K]))
+        for i in range(len(words) - _SHINGLE_K + 1)
+    )
+
+
+def shingle_jaccard(a: frozenset, b: frozenset) -> float:
+    if not a or not b:
+        return 0.0
+    union = len(a | b)
+    return (len(a & b) / union) if union else 0.0
+
+
+def group_near_identical(jobs: list, threshold: float = _NEAR_IDENTICAL_JACCARD) -> dict[str, int]:
+    """Map url -> a group number, for ads that read as the same posting.
+
+    Only urls sharing a number with at least one other appear in the result,
+    so a url that is absent has nothing to flag.
+
+    Compares pairwise within whatever list it is given. Callers pass ONE
+    employer's ads at a time: that keeps the pair count small and means two
+    unrelated companies' boilerplate is never compared, which was the flaw
+    in the first version of this analysis.
+    """
+    scored = [(j, description_shingles(
+        (j["full_description"] or j["description"]) if not isinstance(j, dict)
+        else (j.get("full_description") or j.get("description") or "")
+    )) for j in jobs]
+    scored = [(j, sh) for j, sh in scored if sh]
+    if len(scored) < 2:
+        return {}
+
+    parent = list(range(len(scored)))
+
+    def find(i: int) -> int:
+        while parent[i] != i:
+            parent[i] = parent[parent[i]]
+            i = parent[i]
+        return i
+
+    for i in range(len(scored)):
+        for k in range(i + 1, len(scored)):
+            if find(i) == find(k):
+                continue
+            if shingle_jaccard(scored[i][1], scored[k][1]) >= threshold:
+                parent[find(i)] = find(k)
+
+    clusters: dict[int, list] = {}
+    for i, (job, _) in enumerate(scored):
+        clusters.setdefault(find(i), []).append(job)
+
+    out: dict[str, int] = {}
+    number = 0
+    for members in clusters.values():
+        if len(members) < 2:
+            continue
+        number += 1
+        for job in members:
+            out[job["url"]] = number
+    return out
+
+
 def _register_loc_priority(conn: sqlite3.Connection) -> None:
     """Register the `loc_priority(location)` SQL function used to rank/filter
     jobs by the optional location_focus config (config.load_location_focus).
