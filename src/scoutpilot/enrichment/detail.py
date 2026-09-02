@@ -32,8 +32,102 @@ log = logging.getLogger(__name__)
 
 UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
 
+# A fuller browser-like header set for the plain-HTTP path (see
+# _http_fetch_html). Some WAFs (Akamai Bot Manager on the StepStone group
+# sites -- nijobs.com, totaljobs.com) reject a bare UA but pass a client
+# that looks like a real navigation and carries the challenge cookies.
+_HTTP_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
+    ),
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+    "Accept-Language": "en-GB,en;q=0.9",
+    "Sec-Fetch-Dest": "document",
+    "Sec-Fetch-Mode": "navigate",
+    "Sec-Fetch-Site": "none",
+    "Upgrade-Insecure-Requests": "1",
+}
+
 # Sites that block scraping -- skip detail extraction entirely
 SKIP_DETAIL_SITES = {"glassdoor", "google", "Workopolis"}
+
+
+def _http_fetch_html(url: str, timeout: float = 30.0) -> tuple[str, str] | None:
+    """Fetch a detail page with a plain HTTP/1.1 client instead of the
+    browser.
+
+    Chromium negotiates HTTP/2, and some bot-protection edges (Akamai on
+    the StepStone group -- nijobs.com / totaljobs.com) kill the h2 stream
+    with ERR_HTTP2_PROTOCOL_ERROR. A vanilla httpx client speaks HTTP/1.1
+    (the h2 extra isn't installed) and, after one warm-up GET to the site
+    root to pick up the challenge cookies, is served the real page.
+
+    Returns (html, final_url) or None.
+    """
+    try:
+        from urllib.parse import urlsplit
+        parts = urlsplit(url)
+        origin = f"{parts.scheme}://{parts.netloc}/"
+        proxy = None
+        if _PROXY_CONFIG and _PROXY_CONFIG.get("jobspy"):
+            proxy = f"http://{_PROXY_CONFIG['jobspy']}"
+        with httpx.Client(
+            headers=_HTTP_HEADERS, timeout=timeout, follow_redirects=True,
+            proxy=proxy,
+        ) as c:
+            resp = c.get(url)
+            # Retry once behind a root-page warm-up if the edge served a
+            # non-200 or a suspiciously small challenge stub.
+            if resp.status_code != 200 or len(resp.text) < 2000:
+                try:
+                    c.get(origin)
+                    resp = c.get(url)
+                except httpx.HTTPError:
+                    pass
+            if resp.status_code != 200 or not resp.text:
+                return None
+            return resp.text, str(resp.url)
+    except Exception as e:  # noqa: BLE001
+        log.debug("_http_fetch_html failed for %s: %s", url, e)
+        return None
+
+
+def _intel_from_html(html: str, final_url: str = "") -> dict:
+    """Build the same `intel` dict collect_detail_intelligence() returns,
+    from raw HTML -- so extract_from_json_ld() works with no browser."""
+    intel: dict = {"json_ld": [], "page_title": "", "final_url": final_url}
+    soup = BeautifulSoup(html, "html.parser")
+    title_el = soup.find("title")
+    if title_el:
+        intel["page_title"] = title_el.get_text(strip=True)
+    for el in soup.find_all("script", attrs={"type": "application/ld+json"}):
+        raw = el.string or el.get_text() or ""
+        try:
+            intel["json_ld"].append(json.loads(raw))
+        except (json.JSONDecodeError, TypeError):
+            continue
+    return intel
+
+
+def _http_first_detail(url: str) -> dict | None:
+    """Try to enrich a detail page over plain HTTP + JSON-LD, no browser.
+    Returns a scrape_detail_page-shaped result (tier_used=0) or None."""
+    fetched = _http_fetch_html(url)
+    if not fetched:
+        return None
+    html, final_url = fetched
+    intel = _intel_from_html(html, final_url)
+    ld = extract_from_json_ld(intel)
+    if not ld or not ld.get("full_description"):
+        return None
+    return {
+        "full_description": ld["full_description"],
+        "application_url": ld.get("application_url"),
+        "status": "ok" if ld.get("application_url") else "partial",
+        "tier_used": 0,
+        "error": None,
+    }
 
 # Confirmed live 2026-08-23: two "score >=8" LinkedIn jobs were tailored,
 # cover-lettered, and only THEN found expired at apply time -- burning a
@@ -570,7 +664,13 @@ PERMANENT_FAILURES = {404, 410, 451}
 
 
 def scrape_detail_page(page, url: str) -> dict:
-    """Full cascade for one detail page."""
+    """Full cascade for one detail page.
+
+    Tier 0: plain HTTP/1.1 fetch + JSON-LD -- no browser. Fast, and the
+    only path that works for Akamai-fronted sites (StepStone group:
+    nijobs.com, totaljobs.com) whose HTTP/2 edge breaks Chromium.
+    Tiers 1-3 use the browser `page`.
+    """
     result: dict = {
         "full_description": None,
         "application_url": None,
@@ -579,6 +679,11 @@ def scrape_detail_page(page, url: str) -> dict:
         "error": None,
     }
     t0 = time.time()
+
+    http_first = _http_first_detail(url)
+    if http_first and http_first.get("full_description"):
+        http_first["elapsed"] = time.time() - t0
+        return http_first
 
     try:
         resp = page.goto(url, timeout=45000)
