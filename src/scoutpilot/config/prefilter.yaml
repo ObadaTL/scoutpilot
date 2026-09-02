@@ -1,0 +1,152 @@
+# Ingest pre-filter + scoring-queue budget.
+#
+# Two jobs:
+#   1. prefilter  -- a cheap, deterministic check run at ingest (store_jobs),
+#      BEFORE any LLM call. A job that trips a rule is still stored, but its
+#      `prefilter_reason` column is set, and the scoring queue skips any row
+#      with a non-NULL prefilter_reason. Reversible: clear the column to
+#      un-filter (UPDATE jobs SET prefilter_reason = NULL WHERE ...).
+#   2. queue      -- orders the scoring backlog by each source's live hit
+#      rate (share of its scored jobs that reached fit >= hit_score), so
+#      high-yield sources are scored first. Sources with enough history but
+#      a rate below `floor` are sampled, not scored exhaustively.
+#
+# Everything here is overridable: a `prefilter:` and/or `scoring_queue:`
+# block in ~/.applypilot/searches.yaml is deep-merged over these defaults.
+
+prefilter:
+  enabled: true
+
+  # ---- location: outside UK/Ireland and not UK-relevant remote ----
+  # Conservative on purpose. A rule only fires when the location text names
+  # a term in `deny_terms` AND names nothing in `allow_terms` AND isn't a
+  # bare/UK "remote". A blank or unknown location never trips it -- the
+  # scorer still sees those. `deny_terms` is a denylist by necessity; extend
+  # it in searches.yaml as fresh foreign locations surface.
+  location:
+    enabled: true
+    allow_terms:
+      - united kingdom
+      - "uk"
+      - "gb"
+      - great britain
+      - england
+      - scotland
+      - wales
+      - northern ireland
+      - belfast
+      - london
+      - ireland
+      - republic of ireland
+      - dublin
+      - cork
+      - galway
+      - eire
+    deny_terms:
+      - united states
+      - "usa"
+      - "u.s."
+      - "u.s.a."
+      - america
+      - canada
+      - "nyc"
+      - new york
+      - san francisco
+      - los angeles
+      - seattle
+      - austin
+      - texas
+      - boston
+      - chicago
+      - atlanta
+      - dallas
+      - denver
+      - florida
+      - raleigh
+      - charlotte
+      - toronto
+      - calgary
+      - vancouver
+      - montreal
+      - shenzhen
+      - beijing
+      - shanghai
+      - tokyo
+      - singapore
+      - sydney
+      - melbourne
+      - canberra
+      - berlin
+      - munich
+      - paris
+      - amsterdam
+      - madrid
+      - lisbon
+      - warsaw
+      - poland
+      - brazil
+      - mexico
+      - india
+      - bangalore
+      - bengaluru
+      - "amer"
+      - "latam"
+      - "apac"
+      - "emea"
+
+  # ---- seniority in the title ----
+  seniority_title:
+    enabled: true
+    terms:
+      - senior
+      - "sr."
+      - staff
+      - principal
+      - lead
+      - director
+      - "head of"
+      - "vp "
+      - vice president
+      - architect
+      - manager
+    # words that make an otherwise-senior title junior-friendly again
+    allow_terms:
+      - graduate
+      - junior
+      - intern
+      - placement
+      - "entry level"
+      - "entry-level"
+      - trainee
+      - apprentice
+      - "early career"
+      - "early careers"
+      - "new grad"
+
+  # ---- explicit multi-year experience requirement ----
+  # Matched against title + whatever description text exists at ingest.
+  experience_years:
+    enabled: true
+    max_years: 2          # more than this many years demanded -> filtered
+    # scan: "title" (default) or "title_and_body". Title-only on purpose:
+    # on the historical DB, body scanning matched JD boilerplate in
+    # otherwise-junior UK roles and would have dropped ~17 jobs that later
+    # scored fit 7+. The scorer's MIN_YEARS_COMMERCIAL extraction + the
+    # eligibility gate already handle in-body year requirements, with
+    # context this regex doesn't have. Set to title_and_body only if you'd
+    # rather over-filter.
+    scan: title
+    # Group 1 must be the year count. [^.\n]{0,40} keeps a match inside one
+    # sentence so "20 years of history. 5 years experience" only trips on
+    # the second clause.
+    patterns:
+      - '(\d+)\s*\+?\s*years?[^.\n]{0,40}?\b(?:experience|exp)\b'
+      - '(?:minimum|at\s+least|min\.?)\s+(?:of\s+)?(\d+)\s*\+?\s*years?'
+      - '(\d+)\s*[-–]\s*\d+\s*years?[^.\n]{0,40}?\b(?:experience|exp)\b'
+
+scoring_queue:
+  enabled: true
+  hit_score: 7            # fit_score >= this counts as a "hit"
+  floor: 0.05            # a source at/below this hit rate is sampled, not exhausted
+  min_sample: 15         # scored jobs a source needs before its rate is trusted
+  sample_divisor: 6      # sampled sources: queue ~1 in N of their pending rows

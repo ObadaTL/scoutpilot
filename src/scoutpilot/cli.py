@@ -389,9 +389,14 @@ def status() -> None:
     """Show pipeline statistics from the database."""
     _bootstrap()
 
-    from scoutpilot.database import get_stats
+    from scoutpilot.database import get_connection, get_stats, source_hit_rates
 
     stats = get_stats()
+    conn = get_connection()
+    filtered_at_ingest = conn.execute(
+        "SELECT COUNT(*) FROM jobs WHERE prefilter_reason IS NOT NULL"
+    ).fetchone()[0]
+    hit_rates = source_hit_rates(conn)
 
     console.print("\n[bold]ScoutPilot Pipeline Status[/bold]\n")
 
@@ -406,6 +411,7 @@ def status() -> None:
     summary.add_row("Enrichment errors", str(stats["detail_errors"]))
     summary.add_row("Scored by LLM", str(stats["scored"]))
     summary.add_row("Pending scoring", str(stats["unscored"]))
+    summary.add_row("Filtered at ingest", str(filtered_at_ingest))
     summary.add_row("Tailored resumes", str(stats["tailored"]))
     summary.add_row("Pending tailoring (7+)", str(stats["untailored_eligible"]))
     summary.add_row("Cover letters", str(stats["with_cover_letter"]))
@@ -436,14 +442,35 @@ def status() -> None:
 
         console.print(dist_table)
 
-    # By site
+    # By site, with live hit rate (share of scored jobs reaching fit 7+).
+    # This is the number that orders the scoring queue: high-yield sources
+    # first, low-yield trusted sources sampled rather than scored in full.
     if stats["by_site"]:
-        site_table = Table(title="\nJobs by Source", show_header=True, header_style="bold magenta")
+        site_table = Table(title="\nJobs by Source (hit rate = fit 7+ / scored)",
+                           show_header=True, header_style="bold magenta")
         site_table.add_column("Site")
-        site_table.add_column("Count", justify="right")
+        site_table.add_column("Total", justify="right")
+        site_table.add_column("Scored", justify="right")
+        site_table.add_column("Fit 7+", justify="right")
+        site_table.add_column("Hit rate", justify="right")
+        site_table.add_column("Queue", justify="left")
 
         for site, count in stats["by_site"]:
-            site_table.add_row(site or "Unknown", str(count))
+            key = site or "?"
+            hr = hit_rates.get(key)
+            if not hr or hr["scored"] == 0:
+                site_table.add_row(site or "Unknown", str(count), "0", "0", "-", "unknown")
+                continue
+            if not hr["trusted"]:
+                queue = "[yellow]unknown[/yellow]"
+            elif hr["rate"] > 0.05:
+                queue = "[green]priority[/green]"
+            else:
+                queue = "[red]sampled[/red]"
+            site_table.add_row(
+                site or "Unknown", str(count), str(hr["scored"]), str(hr["hits"]),
+                f"{hr['rate'] * 100:.0f}%", queue,
+            )
 
         console.print(site_table)
 

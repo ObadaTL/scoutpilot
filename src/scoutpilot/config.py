@@ -272,6 +272,35 @@ def load_schemes_config() -> dict:
     return data.get("schemes", {})
 
 
+def _deep_merge(base: dict, over: dict) -> dict:
+    """Recursively merge `over` onto a copy of `base` (dict values only)."""
+    out = dict(base)
+    for k, v in (over or {}).items():
+        if isinstance(v, dict) and isinstance(out.get(k), dict):
+            out[k] = _deep_merge(out[k], v)
+        else:
+            out[k] = v
+    return out
+
+
+def load_prefilter_config() -> dict:
+    """Ingest pre-filter + scoring-queue budget config (config/prefilter.yaml).
+
+    A `prefilter:` and/or `scoring_queue:` block in the user's searches.yaml
+    is deep-merged over the shipped defaults, so a user can tune a single
+    threshold without restating the whole file. Cached on mtime; treat the
+    result as read-only.
+    """
+    shipped = _load_yaml_cached(CONFIG_DIR / "prefilter.yaml") or {}
+    search_cfg = load_search_config()
+    override = {
+        k: search_cfg[k]
+        for k in ("prefilter", "scoring_queue")
+        if isinstance(search_cfg.get(k), dict)
+    }
+    return _deep_merge(shipped, override) if override else shipped
+
+
 def is_manual_ats(url: str | None) -> bool:
     """Check if a URL routes through an ATS that requires manual application."""
     if not url:

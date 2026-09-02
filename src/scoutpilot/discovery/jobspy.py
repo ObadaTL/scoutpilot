@@ -123,6 +123,10 @@ def store_jobspy_results(conn: sqlite3.Connection, df, source_label: str) -> tup
     new = 0
     existing = 0
 
+    from scoutpilot.discovery.prefilter import evaluate_prefilter
+    from scoutpilot.config import load_prefilter_config
+    pf_cfg = load_prefilter_config()
+
     for _, row in df.iterrows():
         url = str(row.get("job_url", ""))
         if not url or url == "nan":
@@ -166,6 +170,12 @@ def store_jobspy_results(conn: sqlite3.Connection, df, source_label: str) -> tup
         # Extract apply URL if JobSpy provided it
         apply_url = str(row.get("job_url_direct", "")) if str(row.get("job_url_direct", "")) != "nan" else None
 
+        prefilter_reason = evaluate_prefilter(
+            {"title": title, "location": location_str,
+             "description": description, "full_description": full_description},
+            pf_cfg,
+        )
+
         try:
             # `company` is in this INSERT because it was missing from it
             # until 2026-09-02: it was read off the JobSpy row above and then
@@ -174,10 +184,10 @@ def store_jobspy_results(conn: sqlite3.Connection, df, source_label: str) -> tup
             # dashboard, which is why nothing could be grouped by employer.
             conn.execute(
                 "INSERT INTO jobs (url, title, company, salary, description, location, site, strategy, "
-                "discovered_at, full_description, application_url, detail_scraped_at) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                "discovered_at, full_description, application_url, detail_scraped_at, prefilter_reason) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (url, title, company, salary, description, location_str, site_label, strategy, now,
-                 full_description, apply_url, detail_scraped_at),
+                 full_description, apply_url, detail_scraped_at, prefilter_reason),
             )
             new += 1
         except sqlite3.IntegrityError:

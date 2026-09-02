@@ -12,7 +12,7 @@ import time
 from datetime import datetime, timezone
 
 from scoutpilot.config import RESUME_PATH, load_profile
-from scoutpilot.database import get_connection, get_jobs_by_stage
+from scoutpilot.database import get_connection, get_jobs_by_stage, scoring_queue
 from scoutpilot.llm import get_client
 from scoutpilot.scoring.validator import ToolLeakGuard
 
@@ -508,7 +508,8 @@ def run_scoring(
         if limit > 0:
             query += f" LIMIT {limit}"
         jobs = conn.execute(query).fetchall()
-    else:
+    elif channel or opp_type or keywords:
+        # Targeted run: honour the explicit filter, skip the yield-ordered queue.
         jobs = get_jobs_by_stage(
             conn=conn,
             stage="pending_score",
@@ -517,6 +518,20 @@ def run_scoring(
             opp_type=opp_type,
             keywords=keywords,
         )
+    else:
+        # Default run: order the backlog by each source's live hit rate, so
+        # high-yield sources are scored first and low-yield ones are sampled
+        # (see database.scoring_queue).
+        urls = scoring_queue(conn=conn, limit=limit)
+        if urls:
+            placeholders = ",".join("?" for _ in urls)
+            fetched = conn.execute(
+                f"SELECT * FROM jobs WHERE url IN ({placeholders})", urls
+            ).fetchall()
+            by_url = {r["url"]: r for r in fetched}
+            jobs = [by_url[u] for u in urls if u in by_url]
+        else:
+            jobs = []
 
     if not jobs:
         log.info("No unscored jobs with descriptions found.")

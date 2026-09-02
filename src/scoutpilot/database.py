@@ -5,6 +5,7 @@ pipeline stage are created up front so any stage can run independently
 without migration ordering issues.
 """
 
+import hashlib
 import json
 import re
 import sqlite3
@@ -414,6 +415,13 @@ def init_db(db_path: Path | str | None = None) -> sqlite3.Connection:
             company_hook          TEXT,
             gate_reason           TEXT,
 
+            -- Ingest pre-filter (discovery/prefilter.py): a short reason
+            -- string when a deterministic rule filtered this row out before
+            -- any LLM saw it; NULL means it passed (or predates the filter).
+            -- The scoring queue skips any row where this is set. Reversible:
+            -- UPDATE jobs SET prefilter_reason = NULL WHERE ...
+            prefilter_reason      TEXT,
+
             -- Tailoring stage (resume tailor)
             tailored_resume_path  TEXT,
             tailored_at           TEXT,
@@ -554,6 +562,8 @@ _ALL_COLUMNS: dict[str, str] = {
     "company_summary": "TEXT",
     "company_hook": "TEXT",
     "gate_reason": "TEXT",
+    # Ingest pre-filter reason (discovery/prefilter.py); NULL = passed / predates it
+    "prefilter_reason": "TEXT",
     # Tailoring
     "tailored_resume_path": "TEXT",
     "tailored_at": "TEXT",
@@ -947,20 +957,29 @@ def store_jobs(conn: sqlite3.Connection, jobs: list[dict],
     new = 0
     existing = 0
 
+    # Deterministic ingest pre-filter -- runs here, before any LLM call. A
+    # tripped job is still stored; prefilter_reason just gets set and the
+    # scoring queue skips it. Lazy import to keep database.py free of a
+    # discovery-package dependency at module load.
+    from scoutpilot.discovery.prefilter import evaluate_prefilter
+    from scoutpilot.config import load_prefilter_config
+    pf_cfg = load_prefilter_config()
+
     for job in jobs:
         url = job.get("url")
         if not url:
             continue
-        
+
         full_desc = job.get("full_description")
         detail_scraped_at = now if (full_desc and len(full_desc) > 200) else None
+        prefilter_reason = evaluate_prefilter(job, pf_cfg)
 
         try:
             conn.execute(
                 "INSERT INTO jobs (url, title, company, salary, description, location, site, strategy, "
                 "opportunity_type, deadline, funding_status, cohort_start, channel, discovered_at, "
-                "full_description, application_url, detail_scraped_at) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                "full_description, application_url, detail_scraped_at, prefilter_reason) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (
                     url,
                     job.get("title"),
@@ -979,6 +998,7 @@ def store_jobs(conn: sqlite3.Connection, jobs: list[dict],
                     full_desc,
                     job.get("application_url"),
                     detail_scraped_at,
+                    prefilter_reason,
                 ),
             )
             new += 1
@@ -1023,7 +1043,10 @@ def get_jobs_by_stage(conn: sqlite3.Connection | None = None,
         # COALESCE(hidden, 0) = 0 on every acquisition query: a job the user
         # hid from the dashboard is a "never apply to this" decision, so it
         # must never be picked up for scoring/tailoring/apply again.
-        "pending_score": "full_description IS NOT NULL AND fit_score IS NULL AND duplicate_of IS NULL AND COALESCE(hidden, 0) = 0",
+        "pending_score": (
+            "full_description IS NOT NULL AND fit_score IS NULL AND duplicate_of IS NULL "
+            "AND COALESCE(hidden, 0) = 0 AND prefilter_reason IS NULL"
+        ),
         "scored": "fit_score IS NOT NULL",
         "pending_tailor": (
             "fit_score >= ? AND full_description IS NOT NULL "
@@ -1109,6 +1132,145 @@ def get_jobs_by_stage(conn: sqlite3.Connection | None = None,
         columns = rows[0].keys()
         return [dict(zip(columns, row)) for row in rows]
     return []
+
+
+# ── Per-source hit rate & scoring-queue budget ───────────────────────────
+# The scorer used to work the backlog in roughly arrival order, so a big
+# unscored pile built up behind sources (global startup ATS boards) that
+# almost never produce a fit-7 job for this candidate. These two functions
+# reorder the queue by each source's *measured* yield instead.
+
+_DOMAIN_RANK_CASES = (
+    (("graduate", "junior", "early career", "intern"), 1),
+    (("signal", "dsp", "audio", "video", "biosignal"), 2),
+    (("ai", "machine learning", "ml", "deep learning"), 3),
+    (("python", "fastapi", "backend", "back-end"), 4),
+    (("fullstack", "full stack", "full-stack", "software", "developer", "engineer"), 5),
+)
+
+
+def _title_domain_rank(title: str | None) -> int:
+    """Same profile-domain ordering get_jobs_by_stage applies in SQL, in
+    Python, so scoring_queue can use it as a within-bucket tiebreak."""
+    t = (title or "").lower()
+    for needles, rank in _DOMAIN_RANK_CASES:
+        if any(n in t for n in needles):
+            return rank
+    return 6
+
+
+def _url_bucket(url: str, divisor: int) -> int:
+    """Stable 0..divisor-1 bucket for a URL (deterministic sampling)."""
+    if divisor <= 1:
+        return 0
+    return int(hashlib.md5(url.encode("utf-8")).hexdigest(), 16) % divisor
+
+
+def source_hit_rates(conn: sqlite3.Connection | None = None,
+                     hit_score: int = 7,
+                     min_sample: int = 15) -> dict[str, dict]:
+    """Live per-source hit rate: of a source's scored jobs, the share that
+    reached ``fit_score >= hit_score``.
+
+    Source is the ``site`` column -- the finest actionable grain (a specific
+    board or employer portal), which is what the queue orders on.
+
+    Returns ``{site: {scored, hits, rate, trusted}}`` where ``trusted`` is
+    ``scored >= min_sample`` -- below that the rate is too noisy to act on
+    and the queue treats the source as unknown rather than high or low.
+    """
+    if conn is None:
+        conn = get_connection()
+    rows = conn.execute(
+        """
+        SELECT COALESCE(site, '?') AS s,
+               COUNT(*) AS scored,
+               SUM(CASE WHEN fit_score >= ? THEN 1 ELSE 0 END) AS hits
+        FROM jobs
+        WHERE fit_score IS NOT NULL
+        GROUP BY s
+        """,
+        (hit_score,),
+    ).fetchall()
+    out: dict[str, dict] = {}
+    for r in rows:
+        scored = r["scored"] or 0
+        hits = r["hits"] or 0
+        out[r["s"]] = {
+            "scored": scored,
+            "hits": hits,
+            "rate": (hits / scored) if scored else 0.0,
+            "trusted": scored >= min_sample,
+        }
+    return dict(sorted(out.items(), key=lambda kv: (-kv[1]["rate"], -kv[1]["scored"])))
+
+
+def scoring_queue(conn: sqlite3.Connection | None = None,
+                  limit: int = 0,
+                  cfg: dict | None = None) -> list[str]:
+    """Ordered list of job URLs to score next, highest-yield source first.
+
+    Ordering: high-yield sources (trusted history, hit rate above ``floor``)
+    first, ranked by rate; then unknown sources (too little history); then
+    low-yield sources, which are *sampled* -- only ~1 in ``sample_divisor``
+    of their pending rows are queued at all -- so the backlog isn't spent
+    exhausting a source that doesn't produce, while still feeding it enough
+    new data points to keep its rate honest. Within every bucket, the
+    candidate's profile-domain title ordering breaks ties.
+
+    Reads only ``url``/``site``/``title`` for the pending rows (never the
+    descriptions) so it stays cheap on a large backlog.
+    """
+    if conn is None:
+        conn = get_connection()
+    if cfg is None:
+        from scoutpilot.config import load_prefilter_config
+        cfg = load_prefilter_config()
+    q = cfg.get("scoring_queue", {}) or {}
+    hit_score = int(q.get("hit_score", 7))
+    floor = float(q.get("floor", 0.05))
+    min_sample = int(q.get("min_sample", 15))
+    divisor = int(q.get("sample_divisor", 6))
+    enabled = q.get("enabled", True)
+
+    where = (
+        "full_description IS NOT NULL AND fit_score IS NULL AND duplicate_of IS NULL "
+        "AND COALESCE(hidden, 0) = 0 AND prefilter_reason IS NULL"
+    )
+    focus = load_location_focus()
+    tier_count = len((focus or {}).get("priority", []))
+    if tier_count:
+        where += f" AND loc_priority(location) < {tier_count}"
+
+    rows = conn.execute(
+        f"SELECT url, COALESCE(site, '?') AS site, title, discovered_at "
+        f"FROM jobs WHERE {where} ORDER BY discovered_at DESC"
+    ).fetchall()
+    if not rows:
+        return []
+
+    if not enabled:
+        urls = [r["url"] for r in rows]
+        return urls[:limit] if limit and limit > 0 else urls
+
+    rates = source_hit_rates(conn, hit_score=hit_score, min_sample=min_sample)
+
+    ranked: list[tuple] = []
+    for i, r in enumerate(rows):
+        info = rates.get(r["site"], {"rate": 0.0, "trusted": False})
+        if info["trusted"] and info["rate"] > floor:
+            bucket = 0  # high yield
+        elif not info["trusted"]:
+            bucket = 1  # unknown
+        else:
+            bucket = 2  # low yield -> sampled
+            if _url_bucket(r["url"], divisor) != 0:
+                continue
+        ranked.append(((bucket, -info["rate"], _title_domain_rank(r["title"]), i), r["url"]))
+
+    ranked.sort(key=lambda t: t[0])
+    urls = [u for _, u in ranked]
+    return urls[:limit] if limit and limit > 0 else urls
 
 
 def clean_non_tech_jobs(conn: sqlite3.Connection | None = None) -> int:
