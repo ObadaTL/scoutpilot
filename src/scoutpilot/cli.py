@@ -500,7 +500,9 @@ def status() -> None:
     summary.add_row("Pending enrichment", str(stats["pending_detail"]))
     summary.add_row("Enrichment errors", str(stats["detail_errors"]))
     summary.add_row("Scored by LLM", str(stats["scored"]))
-    summary.add_row("Pending scoring", str(stats["unscored"]))
+    summary.add_row("Pending scoring (queued)", str(stats["unscored"]))
+    if stats.get("unscored_raw", stats["unscored"]) != stats["unscored"]:
+        summary.add_row("  unscored incl. set-aside", str(stats["unscored_raw"]))
     summary.add_row("Filtered at ingest", str(filtered_at_ingest))
     summary.add_row("Tailored resumes", str(stats["tailored"]))
     summary.add_row("Pending tailoring (7+)", str(stats["untailored_eligible"]))

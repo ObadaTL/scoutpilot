@@ -884,9 +884,17 @@ def get_stats(conn: sqlite3.Connection | None = None) -> dict:
         "SELECT COUNT(*) FROM jobs WHERE fit_score IS NOT NULL"
     ).fetchone()[0]
 
+    # "unscored" == what the scorer would actually pick up: excludes rows
+    # set aside by the discovery archive or the ingest pre-filter, so this
+    # tracks the real scoring queue rather than the raw backlog.
     stats["unscored"] = conn.execute(
         "SELECT COUNT(*) FROM jobs "
-        "WHERE full_description IS NOT NULL AND fit_score IS NULL"
+        "WHERE full_description IS NOT NULL AND fit_score IS NULL "
+        "AND archived_at IS NULL AND prefilter_reason IS NULL "
+        "AND duplicate_of IS NULL AND COALESCE(hidden, 0) = 0"
+    ).fetchone()[0]
+    stats["unscored_raw"] = conn.execute(
+        "SELECT COUNT(*) FROM jobs WHERE full_description IS NOT NULL AND fit_score IS NULL"
     ).fetchone()[0]
 
     # Score distribution
