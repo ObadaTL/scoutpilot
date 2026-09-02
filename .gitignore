@@ -1,11 +1,36 @@
+# Local state / user data
 *.db
 *.db-wal
 *.db-shm
 artifacts/
-__pycache__/
 chrome-profiles/
 .env
 profile.yaml
+profile.json
 searches.yaml
 facts.yaml
+my_profile/
+dashboard.html
+
+# Personal documents — never commit a real CV / cover letter or anything
+# derived from one (the calibration corpus, sample regenerations, the
+# critic report all embed real resume content).
 *.pdf
+*.docx
+*.DOCX
+/sample*.txt
+/*_after*.txt
+/critic_validation_report.txt
+/corpus_v2/
+/*_CV*.txt
+/*CV-*.txt
+/CoverLetter*
+/Cover?Letter*
+
+# Python
+__pycache__/
+*.pyc
+.pytest_cache/
+*.egg-info/
+build/
+dist/

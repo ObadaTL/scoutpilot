@@ -2263,7 +2263,7 @@ def _ship_unquantified_fallback(
     on the fully assembled text, which includes the profile-injected header
     (name/email/phone) that assemble_resume_text builds from `profile`, not
     from LLM content. That stripped digits out of the candidate's own email
-    address and phone number -- "user123@example.com" became
+    address and phone number -- e.g. "user123@example.com" became
     "user@example.com", the phone number vanished entirely. Stripping the
     data dict's fields first and assembling afterward keeps the header, which
     was never LLM content and never needed sanitizing, structurally out of
