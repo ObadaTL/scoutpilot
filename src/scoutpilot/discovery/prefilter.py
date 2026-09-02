@@ -36,14 +36,32 @@ def _contains_term(text: str, term: str) -> bool:
     return re.search(rf"\b{re.escape(term.lower().strip())}\b", text) is not None
 
 
-def _check_location(location: str | None, rule: dict) -> str | None:
+def _check_location(location: str | None, rule: dict, channel: str | None = None,
+                    body: str = "") -> str | None:
     if not rule.get("enabled", True):
         return None
     loc = (location or "").strip().lower()
+    allow = rule.get("allow_terms", []) or []
+    has_uk_signal = bool(loc) and any(_contains_term(loc, t) for t in allow)
+
+    # Strict channels (the high-volume global ATS / Workday harvesters):
+    # a job must POSITIVELY signal UK/Ireland -- in the location, or failing
+    # that in the posting body -- or it's set aside. A blank or bare
+    # "Remote" location is NOT enough: on a US company's board a remote role
+    # is a US-remote role unless it says otherwise. These sources are most
+    # of the database and, measured, ~none of the fit-7 jobs.
+    strict = set(rule.get("strict_channels", []) or [])
+    if channel and channel in strict:
+        body_l = (body or "").lower()
+        body_signal = any(_contains_term(body_l, t) for t in allow) if body_l else False
+        if has_uk_signal or body_signal:
+            return None
+        shown = (location or "").strip()[:60] or "unspecified"
+        return f"location: {shown!r} (no UK/Ireland signal, {channel})"
+
     if not loc:
         return None
-    allow = rule.get("allow_terms", []) or []
-    if any(_contains_term(loc, t) for t in allow):
+    if has_uk_signal:
         return None
     deny = rule.get("deny_terms", []) or []
     hit = next((t for t in deny if _contains_term(loc, t)), None)
@@ -91,9 +109,11 @@ def _check_experience(title: str, body: str, rule: dict) -> str | None:
     return None
 
 
-def evaluate_prefilter(job: dict, cfg: dict | None = None) -> str | None:
+def evaluate_prefilter(job: dict, cfg: dict | None = None, channel: str | None = None) -> str | None:
     """Return a short reason string if `job` should be filtered at ingest,
-    else None. `cfg` defaults to load_prefilter_config()."""
+    else None. `cfg` defaults to load_prefilter_config(). `channel` is the
+    job's discovery channel/strategy -- used by the location rule's
+    strict_channels list; falls back to job['channel'] / job['strategy']."""
     cfg = cfg if cfg is not None else load_prefilter_config()
     pf = cfg.get("prefilter", {}) or {}
     if not pf.get("enabled", True):
@@ -102,9 +122,10 @@ def evaluate_prefilter(job: dict, cfg: dict | None = None) -> str | None:
     title = job.get("title") or ""
     location = job.get("location")
     body = job.get("full_description") or job.get("description") or ""
+    channel = channel or job.get("channel") or job.get("strategy")
 
     return (
-        _check_location(location, pf.get("location", {}) or {})
+        _check_location(location, pf.get("location", {}) or {}, channel, body)
         or _check_seniority(title, pf.get("seniority_title", {}) or {})
         or _check_experience(title, body, pf.get("experience_years", {}) or {})
     )
@@ -118,8 +139,9 @@ def prefilter_breakdown(job: dict, cfg: dict | None = None) -> list[str]:
         return []
     title = job.get("title") or ""
     body = job.get("full_description") or job.get("description") or ""
+    channel = job.get("channel") or job.get("strategy")
     reasons = [
-        _check_location(job.get("location"), pf.get("location", {}) or {}),
+        _check_location(job.get("location"), pf.get("location", {}) or {}, channel, body),
         _check_seniority(title, pf.get("seniority_title", {}) or {}),
         _check_experience(title, body, pf.get("experience_years", {}) or {}),
     ]

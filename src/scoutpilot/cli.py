@@ -438,6 +438,25 @@ def archive_discovery(
     )
 
 
+@app.command(name="refresh-prefilter")
+def refresh_prefilter_cmd() -> None:
+    """Re-apply the ingest pre-filter to the live unscored backlog.
+
+    Rewrites each row's prefilter_reason from the current
+    config/prefilter.yaml. Only touches live, unscored, un-tailored rows --
+    a computed marker, reversible with `scoutpilot refresh-prefilter` again
+    after reverting the config.
+    """
+    _bootstrap()
+    from scoutpilot.database import refresh_prefilter
+    res = refresh_prefilter()
+    console.print(
+        f"[bold green]Checked {res['checked']}[/bold green] -- "
+        f"{res['now_filtered']} newly filtered, {res['now_cleared']} cleared, "
+        f"{res['changed']} changed."
+    )
+
+
 @app.command(name="restore-discovery")
 def restore_discovery(
     timestamp: Optional[str] = typer.Option(None, "--timestamp", help="Restore only this archive batch (default: all)."),

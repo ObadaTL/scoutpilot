@@ -16,6 +16,7 @@ from scoutpilot.database import (
     get_jobs_by_stage,
     source_hit_rates,
     scoring_queue,
+    refresh_prefilter,
     get_connection,
     close_connection,
 )
@@ -26,6 +27,7 @@ CFG = {
         "enabled": True,
         "location": {
             "enabled": True,
+            "strict_channels": ["direct_ats", "workday_api"],
             "allow_terms": ["united kingdom", "uk", "belfast", "london", "ireland", "dublin"],
             "deny_terms": ["united states", "usa", "new york", "san francisco",
                            "toronto", "berlin", "india", "bangalore", "amer"],
@@ -95,6 +97,29 @@ def test_location_blank_passes():
 def test_location_substring_not_matched_as_word():
     # "uk" inside "Paducah"? no -- but guard against "uk" matching "ukraine"
     assert evaluate_prefilter(_job(location="Kyiv, Ukraine"), CFG) is None  # ukraine not in deny list, uk not a word
+
+
+# ── strict channels: global ATS must positively signal UK/IE ────────────
+
+def test_strict_channel_needs_uk_signal():
+    # non-strict channel: "Remote" is fine, no deny term -> passes
+    assert evaluate_prefilter(_job(location="Remote / Unspecified"), CFG, channel="jobspy") is None
+    # strict channel: bare/blank/"Remote" location with no UK signal -> filtered
+    for loc in ("Remote / Unspecified", "Remote", "", None, "San Francisco, CA"):
+        r = evaluate_prefilter(_job(location=loc), CFG, channel="direct_ats")
+        assert r and "no UK/Ireland signal" in r, loc
+    # strict channel with a UK signal in the location -> passes
+    assert evaluate_prefilter(_job(location="London, UK"), CFG, channel="direct_ats") is None
+    # strict channel, UK signal only in the body -> passes
+    assert evaluate_prefilter(
+        _job(location="Remote", full_description="This role is open to candidates in the United Kingdom."),
+        CFG, channel="direct_ats") is None
+
+
+def test_strict_channel_read_from_job_dict():
+    r = evaluate_prefilter(
+        {"title": "Engineer", "location": "San Francisco", "strategy": "direct_ats"}, CFG)
+    assert r and r.startswith("location:")
 
 
 # ── seniority rule ──────────────────────────────────────────────────────
@@ -304,6 +329,27 @@ def test_scoring_queue_excludes_prefiltered_and_respects_limit(db):
     q = scoring_queue(db, limit=0, cfg=CFG)
     assert set(q) == {"keep1", "keep2"}
     assert len(scoring_queue(db, limit=1, cfg=CFG)) == 1
+
+
+def test_refresh_prefilter_rewrites_reason(db, monkeypatch):
+    # stored under the fixture CFG (strict direct_ats) -> "Remote" is filtered
+    store_jobs(db, [
+        {"url": "k", "title": "Engineer", "location": "Remote", "full_description": "x" * 300},
+    ], site="B", strategy="direct_ats")
+    assert dict(db.execute("SELECT url, prefilter_reason FROM jobs").fetchall())["k"].startswith("location:")
+
+    # config changed to disabled -> refresh clears the marker
+    monkeypatch.setattr("scoutpilot.config.load_prefilter_config",
+                        lambda: {"prefilter": {"enabled": False}})
+    res = refresh_prefilter(db)
+    assert res["now_cleared"] == 1 and res["changed"] == 1
+    assert dict(db.execute("SELECT url, prefilter_reason FROM jobs").fetchall())["k"] is None
+
+    # config changed back -> refresh re-applies it
+    monkeypatch.setattr("scoutpilot.config.load_prefilter_config", lambda: CFG)
+    res = refresh_prefilter(db)
+    assert res["now_filtered"] == 1
+    assert dict(db.execute("SELECT url, prefilter_reason FROM jobs").fetchall())["k"].startswith("location:")
 
 
 def test_scoring_queue_disabled_falls_back_to_recency(db):

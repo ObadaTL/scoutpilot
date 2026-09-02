@@ -983,7 +983,9 @@ def store_jobs(conn: sqlite3.Connection, jobs: list[dict],
 
         full_desc = job.get("full_description")
         detail_scraped_at = now if (full_desc and len(full_desc) > 200) else None
-        prefilter_reason = evaluate_prefilter(job, pf_cfg)
+        prefilter_reason = evaluate_prefilter(
+            job, pf_cfg, channel=job.get("channel") or strategy
+        )
         cohort_start = job.get("cohort_start") or infer_cohort_start(
             job.get("title"), full_desc or job.get("description"), job.get("opportunity_type")
         )
@@ -1367,6 +1369,54 @@ def unarchive_discovery_results(conn: sqlite3.Connection | None = None,
         cur = conn.execute("UPDATE jobs SET archived_at = NULL WHERE archived_at IS NOT NULL")
     conn.commit()
     return cur.rowcount
+
+
+def refresh_prefilter(conn: sqlite3.Connection | None = None) -> dict:
+    """Re-run the ingest pre-filter over the live, unscored backlog and
+    rewrite each row's prefilter_reason from the current config/rules.
+
+    Only touches rows that are live (archived_at IS NULL), unscored, not
+    tailored and not applied -- rewriting a computed marker, never real
+    data. Use after changing config/prefilter.yaml or the rule code.
+
+    Returns {"checked": int, "now_filtered": int, "now_cleared": int,
+    "changed": int}.
+    """
+    if conn is None:
+        conn = get_connection()
+    from scoutpilot.discovery.prefilter import evaluate_prefilter
+    from scoutpilot.config import load_prefilter_config
+    cfg = load_prefilter_config()
+
+    rows = conn.execute(
+        "SELECT url, title, location, description, full_description, channel, strategy, "
+        "prefilter_reason FROM jobs "
+        "WHERE archived_at IS NULL AND fit_score IS NULL "
+        "AND tailored_resume_path IS NULL AND applied_at IS NULL"
+    ).fetchall()
+
+    now_filtered = now_cleared = changed = 0
+    for r in rows:
+        job = {
+            "title": r["title"], "location": r["location"],
+            "description": r["description"], "full_description": r["full_description"],
+            "channel": r["channel"], "strategy": r["strategy"],
+        }
+        new = evaluate_prefilter(job, cfg)
+        old = r["prefilter_reason"]
+        if new == old:
+            continue
+        changed += 1
+        if new and not old:
+            now_filtered += 1
+        elif old and not new:
+            now_cleared += 1
+        conn.execute("UPDATE jobs SET prefilter_reason = ? WHERE url = ?", (new, r["url"]))
+    conn.commit()
+    return {
+        "checked": len(rows), "now_filtered": now_filtered,
+        "now_cleared": now_cleared, "changed": changed,
+    }
 
 
 def clean_non_tech_jobs(conn: sqlite3.Connection | None = None) -> int:

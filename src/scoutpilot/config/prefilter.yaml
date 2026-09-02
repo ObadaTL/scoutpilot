@@ -25,6 +25,16 @@ prefilter:
   # it in searches.yaml as fresh foreign locations surface.
   location:
     enabled: true
+    # For these high-volume discovery channels the rule is inverted: a job
+    # must POSITIVELY name a UK/Ireland location (allow_terms) or be a
+    # bare/UK "remote", otherwise it's set aside. These sources are most of
+    # the database and almost none of the fit-7 jobs, so they carry the
+    # burden of proof. Other channels only trip on an explicit deny_terms
+    # match.
+    strict_channels:
+      - direct_ats
+      - workday_api
+      - company_pages
     allow_terms:
       - united kingdom
       - "uk"
