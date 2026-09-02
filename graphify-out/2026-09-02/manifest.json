@@ -24,9 +24,9 @@
     "semantic_hash": ""
   },
   "tests/test_scorer.py": {
-    "mtime": 1788359778.9143624,
-    "seen": 1788360039.6787012,
-    "ast_hash": "88b79b56bb0eb50feaa636cdead20e6e",
+    "mtime": 1788367335.8501575,
+    "seen": 1788368719.4673545,
+    "ast_hash": "5b36b0692b0dfba6c3c7f69ab5417a19",
     "semantic_hash": ""
   },
   "tests/test_terminal_view.py": {
@@ -252,9 +252,9 @@
     "semantic_hash": ""
   },
   "src/scoutpilot/cli.py": {
-    "mtime": 1788363793.2576559,
-    "seen": 1788363862.1385355,
-    "ast_hash": "a65c6fc9d57c64fa799970ea5359f5bb",
+    "mtime": 1788368377.020327,
+    "seen": 1788368719.4673545,
+    "ast_hash": "1e632bc5d2661094b965ecd2e2ca664a",
     "semantic_hash": ""
   },
   "src/scoutpilot/config.py": {
@@ -264,9 +264,9 @@
     "semantic_hash": ""
   },
   "src/scoutpilot/database.py": {
-    "mtime": 1788363787.899363,
-    "seen": 1788363862.1385355,
-    "ast_hash": "d4ef508cac109df0d4f48230196017a5",
+    "mtime": 1788364595.8443317,
+    "seen": 1788368719.4673545,
+    "ast_hash": "e99408292767012e1c95cb0e03d27f78",
     "semantic_hash": ""
   },
   "src/scoutpilot/discovery/__init__.py": {
@@ -324,9 +324,9 @@
     "semantic_hash": ""
   },
   "src/scoutpilot/enrichment/detail.py": {
-    "mtime": 1788359778.8973472,
-    "seen": 1788360039.6787012,
-    "ast_hash": "04aea54ca9418f91fabe864f0a3a625a",
+    "mtime": 1788368281.1167932,
+    "seen": 1788368719.4673545,
+    "ast_hash": "4839b043317ebbac193844c29162411d",
     "semantic_hash": ""
   },
   "src/scoutpilot/facts.py": {
@@ -372,9 +372,9 @@
     "semantic_hash": ""
   },
   "src/scoutpilot/scoring/scorer.py": {
-    "mtime": 1788362449.122658,
-    "seen": 1788363862.1385355,
-    "ast_hash": "6d5fc153c55331082c4286a060d2139a",
+    "mtime": 1788367296.2094235,
+    "seen": 1788368719.4673545,
+    "ast_hash": "776c83e5c89ae67349bebe080d20a904",
     "semantic_hash": ""
   },
   "src/scoutpilot/scoring/tailor.py": {
@@ -396,9 +396,9 @@
     "semantic_hash": ""
   },
   "src/scoutpilot/view.py": {
-    "mtime": 1788359778.9093623,
-    "seen": 1788360039.6787012,
-    "ast_hash": "192b3c70a696164a06593865016e75b5",
+    "mtime": 1788368678.9833243,
+    "seen": 1788368719.4673545,
+    "ast_hash": "ce3f5be527fb226d0c1e05b4cef60f18",
     "semantic_hash": ""
   },
   "src/scoutpilot/wizard/__init__.py": {
@@ -507,6 +507,18 @@
     "mtime": 1788363453.0604184,
     "seen": 1788363862.1385355,
     "ast_hash": "5d2863413186e84fd35182a287804ac2",
+    "semantic_hash": ""
+  },
+  "src/scoutpilot/manual.py": {
+    "mtime": 1788368367.4365225,
+    "seen": 1788368719.4673545,
+    "ast_hash": "8459ac626e1b789547f64101037cc125",
+    "semantic_hash": ""
+  },
+  "tests/test_enrichment.py": {
+    "mtime": 1788368315.61295,
+    "seen": 1788368719.4673545,
+    "ast_hash": "2bb1c6fe45ab34099caba38f08b77461",
     "semantic_hash": ""
   }
 }
