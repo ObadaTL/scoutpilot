@@ -23,6 +23,27 @@ def test_intel_from_html_parses_json_ld():
     assert intel["json_ld"][0]["@type"] == "JobPosting"
 
 
+def test_json_ld_title():
+    intel = detail._intel_from_html(JOB_LD, "")
+    assert detail._json_ld_title(intel) == "Software Engineer"
+    assert detail._json_ld_title({"json_ld": []}) is None
+
+
+def test_http_first_detail_carries_title(monkeypatch):
+    monkeypatch.setattr(detail, "_http_fetch_html", lambda url, timeout=30.0: (JOB_LD, url))
+    res = detail._http_first_detail("https://x/job")
+    assert res["title"] == "Software Engineer"
+
+
+def test_manual_clean_title():
+    from scoutpilot.manual import _clean_title
+    assert _clean_title("Software Systems Engineer - 125285 - IBM") == "Software Systems Engineer"
+    assert _clean_title("Software Engineer | Enisca Browne") == "Software Engineer"
+    assert _clean_title("Co-Founder - VIOFEEL") == "Co-Founder"
+    assert _clean_title("Data Scientist in London, UK | Acme") == "Data Scientist"
+    assert _clean_title(None) is None
+
+
 def test_http_first_detail_uses_json_ld(monkeypatch):
     monkeypatch.setattr(detail, "_http_fetch_html", lambda url, timeout=30.0: (JOB_LD, url))
     res = detail._http_first_detail("https://www.nijobs.com/job/x-job1")

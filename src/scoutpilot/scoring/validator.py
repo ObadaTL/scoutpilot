@@ -526,6 +526,22 @@ _ACRONYM_STOPWORDS: frozenset[str] = frozenset({
     "into", "than", "then", "also", "all", "any", "each", "some", "more",
     "most", "much", "many", "few", "such", "only", "just", "very", "own",
     "same", "other", "you", "he", "she", "they", "them",
+    # More ordinary words a job ad routinely ALL-CAPS in a heading or a
+    # hyphenated phrase ("UK-BASED", "OFFICE-BASED ROLE", "JOIN US", "WHAT
+    # YOU'LL DO"). Confirmed live 2026-09-02: "BASED" from an IBM posting
+    # registered as a tool and, because the CV of course contains the word
+    # "based", tripped ToolLeakGuard and failed the tailored CV.
+    "based", "team", "role", "roles", "work", "works", "join", "help",
+    "make", "made", "build", "built", "grow", "lead", "here", "now",
+    "next", "world", "life", "plus", "full", "part", "time", "home",
+    "site", "level", "entry", "days", "day", "week", "year", "years",
+    "hour", "paid", "free", "new", "job", "jobs", "apply", "hire",
+    "hiring", "meet", "love", "care", "want", "need", "know", "come",
+    "look", "find", "give", "take", "keep", "use", "get", "put", "us",
+    "per", "via", "out", "up", "off", "over", "down", "back", "well",
+    "good", "great", "best", "top", "key", "big", "high", "low", "long",
+    "short", "hard", "fast", "real", "true", "open", "close", "start",
+    "end", "day", "hours", "week", "weeks", "month", "months",
 })
 
 # Well-known plain Title-Case tool/product names -- invisible to the shape

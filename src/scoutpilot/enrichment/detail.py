@@ -110,6 +110,56 @@ def _intel_from_html(html: str, final_url: str = "") -> dict:
     return intel
 
 
+def _json_ld_title(intel: dict) -> str | None:
+    """The JobPosting `title` from any JSON-LD block in `intel`, if present."""
+    def _walk(node):
+        if isinstance(node, dict):
+            if node.get("@type") == "JobPosting" and node.get("title"):
+                return str(node["title"]).strip()
+            for v in node.values():
+                got = _walk(v)
+                if got:
+                    return got
+        elif isinstance(node, list):
+            for v in node:
+                got = _walk(v)
+                if got:
+                    return got
+        return None
+
+    for ld in intel.get("json_ld", []):
+        t = _walk(ld)
+        if t:
+            return t[:200]
+    return None
+
+
+def browser_title(url: str, timeout_ms: int = 30000) -> str | None:
+    """Last-resort title fetch for a JS-rendered page (career-site SPAs):
+    launch a headless browser, read JSON-LD title or the <title> tag."""
+    try:
+        with sync_playwright() as p:
+            launch_opts: dict = {"headless": True}
+            if _PROXY_CONFIG:
+                launch_opts["proxy"] = _PROXY_CONFIG["playwright"]
+            browser = p.chromium.launch(**launch_opts)
+            try:
+                page = browser.new_context(user_agent=UA).new_page()
+                page.goto(url, timeout=timeout_ms, wait_until="domcontentloaded")
+                try:
+                    page.wait_for_load_state("networkidle", timeout=8000)
+                except Exception:
+                    pass
+                intel = collect_detail_intelligence(page)
+                title = _json_ld_title(intel) or (intel.get("page_title") or None)
+                return title[:200] if title else None
+            finally:
+                browser.close()
+    except Exception as e:  # noqa: BLE001
+        log.debug("browser_title failed for %s: %s", url, e)
+        return None
+
+
 def _http_first_detail(url: str) -> dict | None:
     """Try to enrich a detail page over plain HTTP + JSON-LD, no browser.
     Returns a scrape_detail_page-shaped result (tier_used=0) or None."""
@@ -124,6 +174,7 @@ def _http_first_detail(url: str) -> dict | None:
     return {
         "full_description": ld["full_description"],
         "application_url": ld.get("application_url"),
+        "title": _json_ld_title(intel) or (intel.get("page_title") or None),
         "status": "ok" if ld.get("application_url") else "partial",
         "tier_used": 0,
         "error": None,
@@ -706,6 +757,7 @@ def scrape_detail_page(page, url: str) -> dict:
         return result
 
     intel = collect_detail_intelligence(page)
+    result["title"] = _json_ld_title(intel) or (intel.get("page_title") or None)
 
     # Tier 1: JSON-LD
     json_ld_result = extract_from_json_ld(intel)
@@ -814,6 +866,14 @@ def scrape_site_batch(
                         "detail_scraped_at = ?, detail_error = NULL WHERE url = ?",
                         (result.get("full_description"), result.get("application_url"), now, url),
                     )
+                    # Fill in a real title when the row only had a placeholder
+                    # (the URL, or nothing) -- e.g. a manually added job.
+                    if result.get("title") and (not title or title == url):
+                        conn.execute(
+                            "UPDATE jobs SET title = ? WHERE url = ? "
+                            "AND (title IS NULL OR title = '' OR title = url)",
+                            (result["title"][:200], url),
+                        )
                 else:
                     stats["error"] += 1
                     conn.execute(

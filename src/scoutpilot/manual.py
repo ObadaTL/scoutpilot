@@ -8,6 +8,7 @@ box.
 from __future__ import annotations
 
 import logging
+import re
 from datetime import datetime, timezone
 
 from scoutpilot.database import get_connection, init_db
@@ -15,6 +16,41 @@ from scoutpilot.database import get_connection, init_db
 log = logging.getLogger(__name__)
 
 MANUAL_CHANNEL = "manual"
+
+
+def _clean_title(raw: str | None) -> str | None:
+    """Trim a page <title> down to the job title: drop a " | Company" /
+    " - Company" / " - <reqID> - Company" tail and a " in <Location>" tail.
+    Splits only on a hyphen with spaces on both sides, so "Co-Founder"
+    survives."""
+    if not raw:
+        return None
+    t = re.split(r"\s+[\|–—·-]\s+", raw.strip())[0]
+    t = re.split(r"\s+\bin\b\s+[A-Z]", t)[0]
+    t = t.strip()
+    return t[:200] or None
+
+
+def _derive_title(url: str) -> str | None:
+    """Best-effort real job title for a manually added URL: JSON-LD
+    JobPosting title, then the <title> tag, over plain HTTP; a headless
+    browser as a last resort for JS-rendered career sites."""
+    from scoutpilot.enrichment.detail import (
+        _http_fetch_html, _intel_from_html, _json_ld_title, browser_title,
+    )
+    fetched = _http_fetch_html(url)
+    if fetched:
+        html, final_url = fetched
+        intel = _intel_from_html(html, final_url)
+        title = _json_ld_title(intel)
+        if title:
+            return title
+        cleaned = _clean_title(intel.get("page_title"))
+        # A bare site name ("IBM Careers", "Jobs") is not a job title -- fall
+        # through to the browser.
+        if cleaned and len(cleaned.split()) >= 2 and "career" not in cleaned.lower():
+            return cleaned
+    return _clean_title(browser_title(url))
 
 
 def _insert_stub(conn, url: str) -> str:
@@ -74,6 +110,19 @@ def add_and_process_job(url: str, rescore: bool = True) -> dict:
             enrich_status = "partial"
         else:
             enrich_status = "error"
+
+    # The stub row's title is the URL. scrape_site_batch fills a real title
+    # from JSON-LD / <title> when it enriches; this covers the case where
+    # the row was already enriched (no scrape) but still titled by URL.
+    cur_title = (conn.execute("SELECT title FROM jobs WHERE url = ?", (url,)).fetchone()["title"] or "").strip()
+    if not cur_title or cur_title == url:
+        try:
+            real_title = _derive_title(url)
+        except Exception:  # noqa: BLE001
+            real_title = None
+        if real_title:
+            conn.execute("UPDATE jobs SET title = ? WHERE url = ?", (real_title, url))
+            conn.commit()
 
     # --- score ---
     row = conn.execute(

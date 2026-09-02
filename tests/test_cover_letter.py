@@ -76,6 +76,16 @@ class TestToolLeakGuard:
         job = {"site": "Acme", "full_description": "UK role, HR will reach out, AI-adjacent team."}
         guard.check(job, "Dear Hiring Manager, based in the UK, happy for HR to follow up.")  # no raise
 
+    def test_allcaps_heading_words_not_flagged(self):
+        """Confirmed live 2026-09-02: an IBM posting's "UK-BASED" /
+        "OFFICE-BASED" made 'based' register as a tool; the CV contains
+        the word 'based', so ToolLeakGuard failed the tailored CV."""
+        guard = ToolLeakGuard(_profile())
+        job = {"site": "IBM", "full_description":
+               "This is a UK-BASED role. WHAT YOU WILL DO: JOIN US and BUILD great things. OFFICE-BASED."}
+        # a CV/letter that naturally uses these words must pass
+        guard.check(job, "A Belfast-based engineer, I build backend services and want to join the team.")
+
 
 # ── _strip_preamble / _strip_after_signoff ─────────────────────────────
 
