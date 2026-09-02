@@ -11,8 +11,8 @@ import json
 
 import pytest
 
-from applypilot.facts import Fact, FactBank
-from applypilot.scoring.validator import ToolLeakGuard, ToolLeakViolation
+from scoutpilot.facts import Fact, FactBank
+from scoutpilot.scoring.validator import ToolLeakGuard, ToolLeakViolation
 
 
 # ── Fixtures ────────────────────────────────────────────────────────────
@@ -81,25 +81,25 @@ class TestToolLeakGuard:
 
 class TestStripHelpers:
     def test_strip_preamble_removes_meta_commentary(self):
-        from applypilot.scoring.cover_letter import _strip_preamble
+        from scoutpilot.scoring.cover_letter import _strip_preamble
         text = "Here is the cover letter:\n\nDear Hiring Manager,\n\nBody."
         assert _strip_preamble(text).startswith("Dear Hiring Manager,")
 
     def test_strip_preamble_not_fooled_by_mid_word_dear(self):
         """'endeared'/'dearest' mid-preamble must not be mistaken for the
         letter's real opening -- only a line-start Dear counts."""
-        from applypilot.scoring.cover_letter import _strip_preamble
+        from scoutpilot.scoring.cover_letter import _strip_preamble
         text = "I have always been endeared to this company.\nDear Hiring Manager,\n\nBody."
         result = _strip_preamble(text)
         assert result.startswith("Dear Hiring Manager,")
 
     def test_strip_preamble_noop_when_already_clean(self):
-        from applypilot.scoring.cover_letter import _strip_preamble
+        from scoutpilot.scoring.cover_letter import _strip_preamble
         text = "Dear Hiring Manager,\n\nBody.\n\nJordan"
         assert _strip_preamble(text) == text
 
     def test_strip_after_signoff_truncates_trailing_notes(self):
-        from applypilot.scoring.cover_letter import _strip_after_signoff
+        from scoutpilot.scoring.cover_letter import _strip_after_signoff
         text = "Dear Hiring Manager,\n\nBody.\n\nJordan\n\nP.S. I also do freelance work."
         result = _strip_after_signoff(text, "Jordan")
         assert result.endswith("Jordan")
@@ -108,7 +108,7 @@ class TestStripHelpers:
     def test_strip_after_signoff_uses_last_occurrence(self):
         """An incidental earlier mention of the name must not truncate the
         real body that follows it."""
-        from applypilot.scoring.cover_letter import _strip_after_signoff
+        from scoutpilot.scoring.cover_letter import _strip_after_signoff
         text = "Dear Hiring Manager,\n\nMy name is Jordan and I built X.\n\nMore body.\n\nJordan"
         result = _strip_after_signoff(text, "Jordan")
         assert "More body." in result
@@ -131,7 +131,7 @@ class _FabricatingClient:
 
 class TestGenerateCoverLetterNeverShipsOnFailedGuard:
     def test_exhausted_retries_returns_passed_false(self, monkeypatch):
-        import applypilot.scoring.cover_letter as cl_mod
+        import scoutpilot.scoring.cover_letter as cl_mod
 
         monkeypatch.setattr(cl_mod, "get_client", lambda: _FabricatingClient())
 
@@ -159,7 +159,7 @@ class TestGenerateCoverLetterNeverShipsOnFailedGuard:
         strip fallback -- the path that produced the mangled letters of
         2026-08-25.
         """
-        import applypilot.scoring.cover_letter as cl_mod
+        import scoutpilot.scoring.cover_letter as cl_mod
 
         seen_temperatures = []
 
@@ -190,12 +190,12 @@ class TestGenerateCoverLetterNeverShipsOnFailedGuard:
 def isolated_env(tmp_path, monkeypatch):
     """Fully isolated scratch environment: temp DB, profile, resume,
     facts.yaml -- never touches the real ~/.applypilot data."""
-    import applypilot.config as config_mod
-    import applypilot.database as database_mod
-    import applypilot.facts as facts_mod
-    import applypilot.scoring.cover_letter as cl_mod
+    import scoutpilot.config as config_mod
+    import scoutpilot.database as database_mod
+    import scoutpilot.facts as facts_mod
+    import scoutpilot.scoring.cover_letter as cl_mod
 
-    app_dir = tmp_path / "applypilot_home"
+    app_dir = tmp_path / "scoutpilot_home"
     app_dir.mkdir()
     cover_dir = app_dir / "cover_letters"
     cover_dir.mkdir()
@@ -265,7 +265,7 @@ class TestRunCoverLettersIntegration:
             raise RuntimeError("Chromium crashed")
 
         monkeypatch.setattr(cl_mod, "get_client", lambda: _CleanClient())
-        monkeypatch.setattr("applypilot.scoring.pdf.convert_to_pdf", _flaky_convert)
+        monkeypatch.setattr("scoutpilot.scoring.pdf.convert_to_pdf", _flaky_convert)
 
         result = cl_mod.run_cover_letters(min_score=1, validation_mode="lenient")
 
@@ -286,7 +286,7 @@ class TestRunCoverLettersIntegration:
         isolated_env["tailored_txt"].unlink()  # remove the .txt sibling
 
         monkeypatch.setattr(cl_mod, "get_client", lambda: _CleanClient())
-        monkeypatch.setattr("applypilot.scoring.pdf.convert_to_pdf",
+        monkeypatch.setattr("scoutpilot.scoring.pdf.convert_to_pdf",
                             lambda path: path.with_suffix(".pdf"))
 
         import logging
@@ -344,7 +344,7 @@ class TestStructuralValidation:
 
     def test_orphaned_percent_is_rejected(self):
         """"...with % accuracy" -- the digit-blanking fallback's signature."""
-        from applypilot.scoring.validator import validate_cover_letter
+        from scoutpilot.scoring.validator import validate_cover_letter
 
         letter = self._wrap(
             "I built a machine-learning pipeline for signal processing that "
@@ -361,7 +361,7 @@ class TestStructuralValidation:
 
     def test_dangling_opener_is_rejected(self):
         """A first body paragraph opening on a referent that was deleted."""
-        from applypilot.scoring.validator import validate_cover_letter
+        from scoutpilot.scoring.validator import validate_cover_letter
 
         letter = self._wrap(
             "This directly addresses the challenge of developing robust models "
@@ -379,7 +379,7 @@ class TestStructuralValidation:
     def test_midletter_back_reference_is_allowed(self):
         """Only the FIRST body paragraph can dangle -- a later "That ..."
         points at the paragraph above it and is ordinary English."""
-        from applypilot.scoring.validator import has_dangling_reference
+        from scoutpilot.scoring.validator import has_dangling_reference
 
         letter = self._wrap(
             "I built a reporting workflow that removed a manual end-of-month "
@@ -394,7 +394,7 @@ class TestStructuralValidation:
     def test_stub_letter_is_rejected_even_in_lenient_mode(self):
         """lenient tolerates style sins, not a letter with holes in it --
         and lenient is what a local provider runs in by default."""
-        from applypilot.scoring.validator import validate_cover_letter
+        from scoutpilot.scoring.validator import validate_cover_letter
 
         letter = self._wrap(
             "At Acme I designed and shipped an audit-event system across the "
@@ -407,7 +407,7 @@ class TestStructuralValidation:
     def test_strip_no_longer_blanks_digits(self):
         """The fallback drops the paragraph rather than leaving its units
         stranded. Less text is recoverable; mangled text is not."""
-        from applypilot.scoring.validator import strip_numbered_sentences
+        from scoutpilot.scoring.validator import strip_numbered_sentences
 
         stripped = strip_numbered_sentences(
             "Built it and reached 92% accuracy. Improved it by a further 15%.\n\n"
@@ -420,7 +420,7 @@ class TestStructuralValidation:
         """The real bug: no blank line between "Dear Hiring Manager," and the
         dangling first sentence used to hide the whole paragraph from the
         check (it starts with "dear", so it looked like pure greeting)."""
-        from applypilot.scoring.validator import has_dangling_reference
+        from scoutpilot.scoring.validator import has_dangling_reference
 
         letter = (
             "Dear Hiring Manager,\n"
@@ -434,7 +434,7 @@ class TestStructuralValidation:
     def test_repeated_phrase_is_rejected(self):
         """The same 5+ word claim showing up twice reads as padding, not two
         different pieces of evidence."""
-        from applypilot.scoring.validator import validate_cover_letter
+        from scoutpilot.scoring.validator import validate_cover_letter
 
         letter = self._wrap(
             "I want to build scalable systems and data pipelines for teams that "
@@ -450,7 +450,7 @@ class TestStructuralValidation:
     def test_lifted_jd_span_is_rejected(self):
         """Reciting the posting's own marketing copy back at it isn't
         personalization."""
-        from applypilot.scoring.validator import validate_cover_letter
+        from scoutpilot.scoring.validator import validate_cover_letter
 
         jd = (
             "Acme is building a global financial super app, offering services "
@@ -474,7 +474,7 @@ class TestStructuralValidation:
         ('Revolut's description mentions ...') said the identical
         narrating-instead-of-claiming thing and passed. Confirmed live
         2026-08-26."""
-        from applypilot.scoring.validator import validate_cover_letter
+        from scoutpilot.scoring.validator import validate_cover_letter
 
         letter = self._wrap(
             "I built a reporting pipeline that removed a manual end-of-month "
@@ -489,13 +489,13 @@ class TestStructuralValidation:
         assert any("Narrates the source" in e for e in result["errors"])
 
     def test_clean_signoff_is_not_flagged(self):
-        from applypilot.scoring.validator import has_bad_signoff
+        from scoutpilot.scoring.validator import has_bad_signoff
         assert has_bad_signoff("Sincerely,\n\nJordan", "Jordan") is None
 
     def test_signoff_with_trailing_text_is_rejected(self):
         """The prompt asks for 'Sincerely,' then the name and nothing else --
         a trailing note past that point is the model not stopping where told."""
-        from applypilot.scoring.validator import has_bad_signoff
+        from scoutpilot.scoring.validator import has_bad_signoff
 
         error = has_bad_signoff("Sincerely,\n\nJordan\nP.S. I would love to chat!", "Jordan")
         assert error is not None

@@ -22,14 +22,14 @@ class TestTailorCoverSeparation:
 
     @pytest.fixture(autouse=True)
     def _clean_state(self):
-        import applypilot.view as view
+        import scoutpilot.view as view
         view._tailor_jobs.clear()
         yield
         view._tailor_jobs.clear()
 
     def _patch(self, monkeypatch, tailor_status="approved", cover=None):
-        import applypilot.scoring.cover_letter as cl_mod
-        import applypilot.scoring.tailor as tailor_mod
+        import scoutpilot.scoring.cover_letter as cl_mod
+        import scoutpilot.scoring.tailor as tailor_mod
         monkeypatch.setattr(
             tailor_mod, "tailor_one",
             lambda url, max_retries=1: {"status": tailor_status, "errors": ["nope"]},
@@ -38,7 +38,7 @@ class TestTailorCoverSeparation:
             monkeypatch.setattr(cl_mod, "cover_letter_one", cover)
 
     def test_blocked_cover_letter_still_reports_the_cv_as_done(self, monkeypatch):
-        import applypilot.view as view
+        import scoutpilot.view as view
         self._patch(monkeypatch, cover=lambda url, max_retries=1: {
             "status": "blocked", "errors": ["ToolLeakGuard: llm"]})
         view._run_tailor_and_cover("job-1")
@@ -52,7 +52,7 @@ class TestTailorCoverSeparation:
         assert "ToolLeakGuard" in status["cover_error"]
 
     def test_a_cover_letter_that_raises_is_contained(self, monkeypatch):
-        import applypilot.view as view
+        import scoutpilot.view as view
 
         def boom(url, max_retries=1):
             raise RuntimeError("provider down")
@@ -67,7 +67,7 @@ class TestTailorCoverSeparation:
     def test_a_failed_cv_is_still_an_overall_error(self, monkeypatch):
         """The separation must not swallow the failure that genuinely means
         there is nothing to show."""
-        import applypilot.view as view
+        import scoutpilot.view as view
         self._patch(monkeypatch, tailor_status="failed_validation")
         view._run_tailor_and_cover("job-3")
 
@@ -79,8 +79,8 @@ class TestTailorCoverSeparation:
     def test_a_letter_only_run_never_touches_cv_state(self, monkeypatch):
         """The retry path runs against the CV already on disk, so it must
         report into `cover` alone."""
-        import applypilot.scoring.cover_letter as cl_mod
-        import applypilot.view as view
+        import scoutpilot.scoring.cover_letter as cl_mod
+        import scoutpilot.view as view
         monkeypatch.setattr(cl_mod, "cover_letter_one",
                             lambda url, max_retries=1: {"status": "generated", "errors": []})
         view._run_cover_letter("job-4")
@@ -100,7 +100,7 @@ class TestYamlConfigCache:
     def test_an_unchanged_file_is_parsed_once(self, tmp_path, monkeypatch):
         import yaml as yaml_mod
 
-        from applypilot import config as config_mod
+        from scoutpilot import config as config_mod
 
         path = tmp_path / "searches.yaml"
         path.write_text("location_focus:\n  enabled: true\n  priority:\n    - [Belfast]\n",
@@ -122,7 +122,7 @@ class TestYamlConfigCache:
         own mtime/size rather than cached outright."""
         import os
 
-        from applypilot import config as config_mod
+        from scoutpilot import config as config_mod
 
         path = tmp_path / "searches.yaml"
         path.write_text("a: 1\n", encoding="utf-8")
@@ -138,7 +138,7 @@ class TestYamlConfigCache:
         assert config_mod._load_yaml_cached(path) == {"a": 2, "b": 3}
 
     def test_a_missing_file_returns_none_rather_than_raising(self, tmp_path):
-        from applypilot import config as config_mod
+        from scoutpilot import config as config_mod
         assert config_mod._load_yaml_cached(tmp_path / "nope.yaml") is None
 
 
@@ -157,7 +157,7 @@ class TestSearchHaystack:
     """
 
     def _render(self, tmp_path, monkeypatch, **kwargs):
-        import applypilot.view as view
+        import scoutpilot.view as view
 
         rows = [{
             "url": "https://example.com/job/1", "title": "Backend Engineer",
@@ -261,28 +261,28 @@ class TestDeriveCompany:
     derive_company recovers the rest from what else is on the row."""
 
     def test_the_column_wins_when_it_is_set(self):
-        from applypilot.database import derive_company
+        from scoutpilot.database import derive_company
         assert derive_company({"company": "Kraydel", "site": "linkedin",
                                "company_summary": "Someone Else is a firm."}) == "Kraydel"
 
     def test_an_ats_board_site_names_the_employer(self):
-        from applypilot.database import derive_company
+        from scoutpilot.database import derive_company
         for site, expected in [("Greenhouse (GitLab)", "GitLab"),
                                ("Ashby (Supabase)", "Supabase"),
                                ("Lever (Spotify)", "Spotify")]:
             assert derive_company({"company": None, "site": site}) == expected
 
     def test_a_per_employer_scraper_puts_the_employer_in_site(self):
-        from applypilot.database import derive_company
+        from scoutpilot.database import derive_company
         assert derive_company({"company": "", "site": "Thomson Reuters"}) == "Thomson Reuters"
 
     def test_an_aggregator_site_is_never_treated_as_an_employer(self):
-        from applypilot.database import UNKNOWN_COMPANY, derive_company
+        from scoutpilot.database import UNKNOWN_COMPANY, derive_company
         for site in ("linkedin", "indeed", "Glassdoor"):
             assert derive_company({"company": None, "site": site}) == UNKNOWN_COMPANY
 
     def test_the_company_summary_is_the_last_resort(self):
-        from applypilot.database import derive_company
+        from scoutpilot.database import derive_company
         cases = {
             "Riff Financial is a pre-launch UK fintech company.": "Riff Financial",
             "Esri develops industry-leading ArcGIS products.": "Esri",
@@ -295,7 +295,7 @@ class TestDeriveCompany:
             ) == expected
 
     def test_nothing_recoverable_returns_the_shared_unknown_label(self):
-        from applypilot.database import UNKNOWN_COMPANY, derive_company
+        from scoutpilot.database import UNKNOWN_COMPANY, derive_company
         assert derive_company({"company": None, "site": "indeed",
                                "company_summary": None}) == UNKNOWN_COMPANY
         assert derive_company({}) == UNKNOWN_COMPANY
@@ -316,20 +316,20 @@ class TestGroupNearIdentical:
                 + " " + extra)
 
     def test_two_copies_of_one_ad_are_grouped(self):
-        from applypilot.database import group_near_identical
+        from scoutpilot.database import group_near_identical
         text = self._long()
         marks = group_near_identical([self._job("a", text),
                                       self._job("b", text + " apply today")])
         assert marks["a"] == marks["b"]
 
     def test_unrelated_ads_are_not_grouped(self):
-        from applypilot.database import group_near_identical
+        from scoutpilot.database import group_near_identical
         a = self._long()
         b = " ".join(f"marketing campaigns for retail brands item{i}" for i in range(60))
         assert group_near_identical([self._job("a", a), self._job("b", b)]) == {}
 
     def test_a_job_with_no_similar_sibling_is_absent_from_the_result(self):
-        from applypilot.database import group_near_identical
+        from scoutpilot.database import group_near_identical
         text = self._long()
         marks = group_near_identical([
             self._job("a", text), self._job("b", text),
@@ -338,12 +338,12 @@ class TestGroupNearIdentical:
         assert "c" not in marks and marks["a"] == marks["b"]
 
     def test_a_description_too_short_to_fingerprint_is_ignored(self):
-        from applypilot.database import group_near_identical
+        from scoutpilot.database import group_near_identical
         assert group_near_identical([self._job("a", "hi"), self._job("b", "hi")]) == {}
 
     def test_the_threshold_matches_what_was_measured(self):
         """Below 0.8 Jaccard, 0 of 1093 sampled same-employer pairs were
         duplicates by the production difflib measure. If someone lowers this,
         the badge becomes noise."""
-        from applypilot.database import _NEAR_IDENTICAL_JACCARD
+        from scoutpilot.database import _NEAR_IDENTICAL_JACCARD
         assert _NEAR_IDENTICAL_JACCARD >= 0.8

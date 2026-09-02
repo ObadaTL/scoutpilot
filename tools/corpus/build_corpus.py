@@ -31,12 +31,12 @@ OUT = ROOT / "corpus_v2"
 OUT.mkdir(exist_ok=True)
 sys.path.insert(0, str(ROOT / "src"))
 
-from applypilot.config import load_profile
-from applypilot.facts import FactBank
-from applypilot.llm import get_client
-from applypilot.scoring.critic import run_cv_critic
-from applypilot.scoring.scorer import score_job
-from applypilot.scoring.tailor import build_bullet_floor_map, tailor_resume
+from scoutpilot.config import load_profile
+from scoutpilot.facts import FactBank
+from scoutpilot.llm import get_client
+from scoutpilot.scoring.critic import run_cv_critic
+from scoutpilot.scoring.scorer import score_job
+from scoutpilot.scoring.tailor import build_bullet_floor_map, tailor_resume
 
 SHA = subprocess.run(["git", "rev-parse", "HEAD"], cwd=ROOT,
                      capture_output=True, text=True).stdout.strip()

@@ -1,6 +1,6 @@
 """Tests for the company_summary/company_hook capture added to fit scoring."""
 
-from applypilot.scoring.scorer import _parse_score_response
+from scoutpilot.scoring.scorer import _parse_score_response
 
 
 class TestParseScoreResponse:
@@ -90,21 +90,21 @@ class TestEligibilityGate:
         return base
 
     def test_country_mismatch_caps_at_one(self):
-        from applypilot.scoring.scorer import apply_eligibility_gate
+        from scoutpilot.scoring.scorer import apply_eligibility_gate
         parsed = {"score": 8, "required_country": "United States", "required_work_auth": None, "min_years_commercial": None}
         result = apply_eligibility_gate(parsed, self._profile())
         assert result["score"] == 1
         assert "United States" in result["gate_reason"]
 
     def test_work_auth_mismatch_caps_at_one(self):
-        from applypilot.scoring.scorer import apply_eligibility_gate
+        from scoutpilot.scoring.scorer import apply_eligibility_gate
         parsed = {"score": 9, "required_country": None, "required_work_auth": "STEM OPT/F1", "min_years_commercial": None}
         result = apply_eligibility_gate(parsed, self._profile())
         assert result["score"] == 1
         assert "STEM OPT/F1" in result["gate_reason"]
 
     def test_insufficient_years_caps_at_five(self):
-        from applypilot.scoring.scorer import apply_eligibility_gate
+        from scoutpilot.scoring.scorer import apply_eligibility_gate
         parsed = {"score": 7, "required_country": None, "required_work_auth": None, "min_years_commercial": 3}
         result = apply_eligibility_gate(parsed, self._profile())
         assert result["score"] == 5
@@ -113,20 +113,20 @@ class TestEligibilityGate:
     def test_exactly_meeting_years_requirement_does_not_gate(self):
         """0.9 does not satisfy a 1-year minimum -- an 11-month placement is
         under a year, not rounded up to meet it."""
-        from applypilot.scoring.scorer import apply_eligibility_gate
+        from scoutpilot.scoring.scorer import apply_eligibility_gate
         parsed = {"score": 7, "required_country": None, "required_work_auth": None, "min_years_commercial": 1}
         result = apply_eligibility_gate(parsed, self._profile())
         assert result["score"] == 5
 
     def test_no_requirements_stated_never_gates(self):
-        from applypilot.scoring.scorer import apply_eligibility_gate
+        from scoutpilot.scoring.scorer import apply_eligibility_gate
         parsed = {"score": 8, "required_country": None, "required_work_auth": None, "min_years_commercial": None}
         result = apply_eligibility_gate(parsed, self._profile())
         assert result["score"] == 8
         assert result["gate_reason"] is None
 
     def test_matching_country_does_not_gate(self):
-        from applypilot.scoring.scorer import apply_eligibility_gate
+        from scoutpilot.scoring.scorer import apply_eligibility_gate
         parsed = {"score": 8, "required_country": "UK", "required_work_auth": None, "min_years_commercial": None}
         result = apply_eligibility_gate(parsed, self._profile())
         assert result["score"] == 8
@@ -158,7 +158,7 @@ class TestEligibilityGate:
         matched as substrings in neither direction, so the gate capped the
         score at 1 -- on 112 jobs in the live database. Settled status IS an
         unrestricted right to work in the UK."""
-        from applypilot.scoring.scorer import apply_eligibility_gate
+        from scoutpilot.scoring.scorer import apply_eligibility_gate
         result = apply_eligibility_gate(
             self._parsed(required_work_auth="Right to work in the UK"), self._uk_profile())
         assert result["score"] == 8
@@ -168,7 +168,7 @@ class TestEligibilityGate:
         """The most obviously wrong reason in the database, on 30 jobs:
         'Requires work authorisation/location in GB; profile is based in
         United Kingdom.' GB was simply missing from the alias map."""
-        from applypilot.scoring.scorer import apply_eligibility_gate
+        from scoutpilot.scoring.scorer import apply_eligibility_gate
         result = apply_eligibility_gate(
             self._parsed(required_country="GB"), self._uk_profile())
         assert result["score"] == 8
@@ -179,7 +179,7 @@ class TestEligibilityGate:
         'UK security cleared or willing & eligible to go through the
         process' names the candidate's own country and is not a foreign
         visa category."""
-        from applypilot.scoring.scorer import apply_eligibility_gate
+        from scoutpilot.scoring.scorer import apply_eligibility_gate
         result = apply_eligibility_gate(
             self._parsed(required_work_auth=
                          "UK security cleared or willing & eligible to go through the process"),
@@ -190,14 +190,14 @@ class TestEligibilityGate:
         """The counterpart the fix must not swallow. An unrestricted permit
         at home says nothing about holding STEM OPT/F1, which names no
         country and is not a generic right-to-work line."""
-        from applypilot.scoring.scorer import apply_eligibility_gate
+        from scoutpilot.scoring.scorer import apply_eligibility_gate
         result = apply_eligibility_gate(
             self._parsed(required_work_auth="STEM OPT/F1"), self._uk_profile())
         assert result["score"] == 1
         assert "STEM OPT/F1" in result["gate_reason"]
 
     def test_requirement_naming_a_foreign_country_still_gates(self):
-        from applypilot.scoring.scorer import apply_eligibility_gate
+        from scoutpilot.scoring.scorer import apply_eligibility_gate
         result = apply_eligibility_gate(
             self._parsed(required_work_auth="Must be authorized to work in the United States"),
             self._uk_profile())
@@ -208,7 +208,7 @@ class TestEligibilityGate:
         """The structured flags are what decide it, so a candidate who does
         need sponsorship is still gated by the same requirement that the
         settled-status holder passes."""
-        from applypilot.scoring.scorer import apply_eligibility_gate
+        from scoutpilot.scoring.scorer import apply_eligibility_gate
         profile = self._uk_profile()
         profile["work_authorization"] = {
             "legally_authorized_to_work": False,
@@ -222,17 +222,17 @@ class TestEligibilityGate:
     def test_lowercase_us_pronoun_is_not_read_as_a_country(self):
         """'us' is a pronoun far more often than a country in job text, so
         the two-letter codes only count when capitalised."""
-        from applypilot.scoring.scorer import _country_in_text
+        from scoutpilot.scoring.scorer import _country_in_text
         assert _country_in_text("Come and build great things with us") is None
         assert _country_in_text("Authorised to work in the US") == "united states"
 
     def test_copyright_does_not_match_the_right_to_work_phrase(self):
-        from applypilot.scoring.scorer import _GENERIC_RIGHT_TO_WORK_RE
+        from scoutpilot.scoring.scorer import _GENERIC_RIGHT_TO_WORK_RE
         assert not _GENERIC_RIGHT_TO_WORK_RE.search("copyright to work products assigned")
         assert _GENERIC_RIGHT_TO_WORK_RE.search("must have the right to work here")
 
     def test_country_and_years_combine_to_the_lower_cap(self):
-        from applypilot.scoring.scorer import apply_eligibility_gate
+        from scoutpilot.scoring.scorer import apply_eligibility_gate
         parsed = {"score": 8, "required_country": "United States", "required_work_auth": None, "min_years_commercial": 3}
         result = apply_eligibility_gate(parsed, self._profile())
         assert result["score"] == 1  # country cap (1) wins over years cap (5)
@@ -244,7 +244,7 @@ class TestStripFabricatedSkillSentences:
         return {"skills_boundary": {"programming_languages": ["Python", "Java"]}}
 
     def test_strips_sentence_naming_an_unlisted_tool(self):
-        from applypilot.scoring.scorer import _strip_fabricated_skill_sentences
+        from scoutpilot.scoring.scorer import _strip_fabricated_skill_sentences
         job = {"site": "Acme", "full_description": "We use Hugging Face and LangChain extensively."}
         reasoning = (
             "The candidate has strong Python skills. They also have experience with "
@@ -255,7 +255,7 @@ class TestStripFabricatedSkillSentences:
         assert "strong Python skills" in cleaned
 
     def test_leaves_clean_reasoning_untouched(self):
-        from applypilot.scoring.scorer import _strip_fabricated_skill_sentences
+        from scoutpilot.scoring.scorer import _strip_fabricated_skill_sentences
         job = {"site": "Acme", "full_description": "We use Python and Java."}
         reasoning = "The candidate has strong Python and Java skills."
         assert _strip_fabricated_skill_sentences(reasoning, job, self._profile()) == reasoning

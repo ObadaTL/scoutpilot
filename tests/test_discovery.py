@@ -5,29 +5,29 @@ import sqlite3
 import pytest
 from unittest.mock import patch, MagicMock
 
-from applypilot.database import init_db, store_jobs, ensure_columns, get_connection
-from applypilot.discovery.direct_ats import (
+from scoutpilot.database import init_db, store_jobs, ensure_columns, get_connection
+from scoutpilot.discovery.direct_ats import (
     infer_opportunity_type,
     fetch_greenhouse_jobs,
     fetch_ashby_jobs,
     fetch_lever_jobs,
     run_direct_ats_discovery,
 )
-from applypilot.discovery.hacker_news import (
+from scoutpilot.discovery.hacker_news import (
     parse_hn_comment,
     _clean_hn_html,
     run_hn_discovery,
 )
-from applypilot.discovery.schemes_and_training import (
+from scoutpilot.discovery.schemes_and_training import (
     parse_github_jobs_markdown,
     run_schemes_discovery,
 )
-from applypilot.discovery.dorking import (
+from scoutpilot.discovery.dorking import (
     _clean_ddg_url,
     search_duckduckgo,
     run_dorking_discovery,
 )
-from applypilot.pipeline import _run_discover
+from scoutpilot.pipeline import _run_discover
 
 
 # ── Opportunity Type Inference Tests ────────────────────────────────────────
@@ -79,7 +79,7 @@ def test_fetch_greenhouse_jobs_mocked():
         ]
     }
 
-    with patch("applypilot.discovery.direct_ats._http_get_json", return_value=sample_gh_response):
+    with patch("scoutpilot.discovery.direct_ats._http_get_json", return_value=sample_gh_response):
         jobs = fetch_greenhouse_jobs("kainos", "Kainos")
         assert len(jobs) == 2
         assert jobs[0]["title"] == "Graduate Software Engineer"
@@ -104,7 +104,7 @@ def test_fetch_ashby_jobs_mocked():
         ]
     }
 
-    with patch("applypilot.discovery.direct_ats._http_get_json", return_value=sample_ashby_response):
+    with patch("scoutpilot.discovery.direct_ats._http_get_json", return_value=sample_ashby_response):
         jobs = fetch_ashby_jobs("openai", "OpenAI")
         assert len(jobs) == 1
         assert jobs[0]["title"] == "Junior Backend Engineer"
@@ -124,7 +124,7 @@ def test_fetch_lever_jobs_mocked():
         }
     ]
 
-    with patch("applypilot.discovery.direct_ats._http_get_json", return_value=sample_lever_response):
+    with patch("scoutpilot.discovery.direct_ats._http_get_json", return_value=sample_lever_response):
         jobs = fetch_lever_jobs("spotify", "Spotify")
         assert len(jobs) == 1
         assert jobs[0]["title"] == "Software Engineering Trainee"
@@ -173,7 +173,7 @@ def test_parse_github_jobs_markdown():
 
 def test_run_schemes_discovery(tmp_path):
     db_file = tmp_path / "test_schemes.db"
-    with patch("applypilot.database.DB_PATH", db_file):
+    with patch("scoutpilot.database.DB_PATH", db_file):
         init_db(db_file)
         res = run_schemes_discovery()
         assert res["total_found"] > 0
@@ -204,8 +204,8 @@ def test_run_dorking_discovery(tmp_path):
         }
     ]
 
-    with patch("applypilot.database.DB_PATH", db_file), \
-         patch("applypilot.discovery.dorking.search_duckduckgo", return_value=fake_hits):
+    with patch("scoutpilot.database.DB_PATH", db_file), \
+         patch("scoutpilot.discovery.dorking.search_duckduckgo", return_value=fake_hits):
         init_db(db_file)
         res = run_dorking_discovery(queries=["site:boards.greenhouse.io graduate software"])
         assert res["total_found"] == 1

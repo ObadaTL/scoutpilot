@@ -9,13 +9,13 @@ a pytest-suite concern: there is no deterministic "correct" LLM output to
 assert against, only the fixed threshold math this file covers).
 """
 
-from applypilot.facts import Fact
-from applypilot.scoring.critic import (
+from scoutpilot.facts import Fact
+from scoutpilot.scoring.critic import (
     combined_critic_score,
     evaluate_cv_observations,
     evaluate_letter_observations,
 )
-from applypilot.scoring.tailor import build_bullet_floor_map
+from scoutpilot.scoring.tailor import build_bullet_floor_map
 
 
 class _StubBank:
@@ -369,7 +369,7 @@ class TestDropUnverifiableQuotes:
     )
 
     def test_quote_absent_from_the_cv_is_dropped(self):
-        from applypilot.scoring.critic import drop_unverifiable_quotes
+        from scoutpilot.scoring.critic import drop_unverifiable_quotes
         obs = {"bullet_counts": {}, "bullet_jd_relevance": [
             {"bullet": "- Corrected data-leakage that inflated model accuracy", "jd_line": "NONE"},
         ]}
@@ -380,7 +380,7 @@ class TestDropUnverifiableQuotes:
     def test_real_bullet_survives_despite_the_rendered_dash(self):
         """The model quotes bullets as rendered; resolved bullets have no
         dash. Stripping it is the whole reason _quote_key exists."""
-        from applypilot.scoring.critic import drop_unverifiable_quotes
+        from scoutpilot.scoring.critic import drop_unverifiable_quotes
         obs = {"bullet_counts": {}, "bullet_jd_relevance": [
             {"bullet": "- Designed and shipped an end-to-end audit-event system", "jd_line": "x"},
         ]}
@@ -392,7 +392,7 @@ class TestDropUnverifiableQuotes:
         """Documented consequence of the rule as specified: containment is
         checked against the whole CV, so real summary text quoted as a
         bullet is not a fabrication. Only text with no basis at all goes."""
-        from applypilot.scoring.critic import drop_unverifiable_quotes
+        from scoutpilot.scoring.critic import drop_unverifiable_quotes
         obs = {"bullet_counts": {}, "bullet_jd_relevance": [
             {"bullet": "diagnosing and correcting data-leakage that inflated model accuracy",
              "jd_line": "NONE"},
@@ -401,7 +401,7 @@ class TestDropUnverifiableQuotes:
         assert dropped == []
 
     def test_dropping_shrinks_the_relevance_denominator(self):
-        from applypilot.scoring.critic import drop_unverifiable_quotes
+        from scoutpilot.scoring.critic import drop_unverifiable_quotes
         obs = {"bullet_counts": {}, "bullet_jd_relevance": [
             {"bullet": "- Designed and shipped an end-to-end audit-event system", "jd_line": "x"},
             {"bullet": "Invented bullet that is not in the document", "jd_line": "NONE"},
@@ -411,7 +411,7 @@ class TestDropUnverifiableQuotes:
         assert len(dropped) == 1
 
     def test_no_cv_text_drops_nothing(self):
-        from applypilot.scoring.critic import drop_unverifiable_quotes
+        from scoutpilot.scoring.critic import drop_unverifiable_quotes
         obs = {"bullet_counts": {}, "bullet_jd_relevance": [{"bullet": "anything", "jd_line": "x"}]}
         cleaned, dropped = drop_unverifiable_quotes(obs, "")
         assert dropped == []
@@ -422,7 +422,7 @@ class TestFindHeaderRestatingBullets:
     """The code check that replaced the model clause."""
 
     def test_bullet_adding_nothing_to_its_header_is_flagged(self):
-        from applypilot.scoring.tailor import find_header_restating_bullets
+        from scoutpilot.scoring.tailor import find_header_restating_bullets
         data = {"experience": [{
             "header": "Software Engineering Intern | Kraydel LTD - Belfast",
             "subtitle": "Kotlin, Java | Jul 2022 - May 2023",
@@ -434,7 +434,7 @@ class TestFindHeaderRestatingBullets:
     def test_duration_restating_the_date_range_is_flagged(self):
         """The exact bullet the model never flagged: '11-month industry
         placement ...' under a subtitle already reading Jul 2022 - May 2023."""
-        from applypilot.scoring.tailor import find_header_restating_bullets
+        from scoutpilot.scoring.tailor import find_header_restating_bullets
         data = {"experience": [{
             "header": "Software Engineering Intern | Kraydel LTD - Belfast",
             "subtitle": "Kotlin, Java | Jul 2022 - May 2023",
@@ -444,7 +444,7 @@ class TestFindHeaderRestatingBullets:
         assert len(v) == 1 and "restates the date range as a duration" in v[0]
 
     def test_repeating_the_date_range_verbatim_is_flagged(self):
-        from applypilot.scoring.tailor import find_header_restating_bullets
+        from scoutpilot.scoring.tailor import find_header_restating_bullets
         data = {"experience": [{
             "header": "Software Engineering Intern | Kraydel LTD",
             "subtitle": "Kotlin, Java | Jul 2022 - May 2023",
@@ -454,7 +454,7 @@ class TestFindHeaderRestatingBullets:
         assert len(v) == 1 and "repeats the entry's own date range" in v[0]
 
     def test_real_bullet_is_not_flagged(self):
-        from applypilot.scoring.tailor import find_header_restating_bullets
+        from scoutpilot.scoring.tailor import find_header_restating_bullets
         data = {"experience": [{
             "header": "Software Engineering Intern | Kraydel LTD - Belfast",
             "subtitle": "Kotlin, Java | Jul 2022 - May 2023",
@@ -466,7 +466,7 @@ class TestFindHeaderRestatingBullets:
         """'1st place, QUB Dragon's Den 2024' under 'Apr 2024 - Mar 2026'
         shares a year and is still real content. A bare year must never
         flag on its own."""
-        from applypilot.scoring.tailor import find_header_restating_bullets
+        from scoutpilot.scoring.tailor import find_header_restating_bullets
         data = {"experience": [{
             "header": "Co-Founder & Shareholder | VIOFEEL Ltd",
             "subtitle": "MedTech Wearable Tech | Apr 2024 - Mar 2026",
@@ -477,9 +477,9 @@ class TestFindHeaderRestatingBullets:
     def test_open_ended_range_never_produces_a_duration_finding(self):
         """'Aug 2026 - Present' has no fixed span, so a duration claim
         against it can't be decided deterministically and must not fire."""
-        from applypilot.scoring.tailor import find_header_restating_bullets
+        from scoutpilot.scoring.tailor import find_header_restating_bullets
         data = {"projects": [{
-            "header": "ApplyPilot",
+            "header": "ScoutPilot",
             "subtitle": "Python, SQLite | Aug 2026 - Present",
             "bullets": ["Spent 3 months building an autonomous application pipeline in Python"],
         }]}

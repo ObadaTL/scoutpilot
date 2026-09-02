@@ -1,11 +1,11 @@
   ### 1. Architectural Overview
 
-  ApplyPilot is an autonomous, AI-driven job discovery and application platform. Its architecture is divided into two primary subsystems coordinated
+  ScoutPilot is an autonomous, AI-driven job discovery and application platform. Its architecture is divided into two primary subsystems coordinated
   around a centralized SQLite database:
 
-  1. Preparation Pipeline (applypilot run): A linear or streaming data-processing pipeline that discovers jobs, enriches descriptions, scores fit against
+  1. Preparation Pipeline (scoutpilot run): A linear or streaming data-processing pipeline that discovers jobs, enriches descriptions, scores fit against
   the candidate's profile, tailors resumes/cover letters, and renders PDFs.
-  2. Autonomous Application Engine (applypilot apply): A multi-worker execution runtime that launches isolated Chrome instances over Chrome DevTools
+  2. Autonomous Application Engine (scoutpilot apply): A multi-worker execution runtime that launches isolated Chrome instances over Chrome DevTools
   Protocol (CDP), orchestrates autonomous Claude Code CLI sessions, fills forms, uploads tailored assets, and tracks results in real-time.
 
     flowchart TD
@@ -106,7 +106,7 @@
   • Community 4 & 16 (get_connection / init_db): SQLite state management and cross-stage persistence.
   • Community 12 (LLMClient): Unified OpenAI/Gemini API abstraction with fallback handling.
   • Community 9 (pipeline.py): Sequential and streaming pipeline orchestrator.
-  • Community 14, 15, 17, 19 (cli.py, run_wizard, _bootstrap, main): CLI interface, diagnostic doctor (applypilot doctor), and first-time setup wizard.
+  • Community 14, 15, 17, 19 (cli.py, run_wizard, _bootstrap, main): CLI interface, diagnostic doctor (scoutpilot doctor), and first-time setup wizard.
   ──────
   ### 4. End-to-End Data Flow: From Discovery to Application
 

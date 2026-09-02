@@ -20,8 +20,8 @@ os.environ.pop("GEMINI_API_KEY", None)
 ROOT = pathlib.Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "src"))
 
-from applypilot.config import load_profile
-from applypilot.scoring.scorer import score_job
+from scoutpilot.config import load_profile
+from scoutpilot.scoring.scorer import score_job
 
 resume_text = pathlib.Path(os.path.expanduser("~/.applypilot/resume.txt")).read_text(encoding="utf-8")
 profile = load_profile()

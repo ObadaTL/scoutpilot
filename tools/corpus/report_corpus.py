@@ -12,14 +12,14 @@ from collections import Counter
 ROOT = pathlib.Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "src"))
 
-from applypilot.facts import BulletPlacementViolation, FactBank
-from applypilot.scoring.critic import (
+from scoutpilot.facts import BulletPlacementViolation, FactBank
+from scoutpilot.scoring.critic import (
     _JD_IRRELEVANCE_MIN_SAMPLE,
     _is_differentiator_bullet,
     drop_unverifiable_quotes,
     evaluate_cv_observations,
 )
-from applypilot.scoring.tailor import (
+from scoutpilot.scoring.tailor import (
     build_bullet_floor_map,
     check_no_cross_section_duplicates,
     find_header_restating_bullets,

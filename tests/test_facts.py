@@ -10,7 +10,7 @@ import json
 
 import pytest
 
-from applypilot.facts import (
+from scoutpilot.facts import (
     Fact,
     FactBank,
     FactBankLoadError,
@@ -246,7 +246,7 @@ class _FakeClient:
 
 class TestGuardFailureFallsBack:
     def test_exhausted_retries_falls_back_instead_of_shipping(self, monkeypatch):
-        import applypilot.scoring.tailor as tailor_mod
+        import scoutpilot.scoring.tailor as tailor_mod
 
         monkeypatch.setattr(tailor_mod, "get_client", lambda: _FakeClient())
 
@@ -282,7 +282,7 @@ class TestGuardFailureFallsBack:
 
 class TestRewordedFactBullets:
     def _bank(self):
-        from applypilot.facts import Fact, FactBank
+        from scoutpilot.facts import Fact, FactBank
         return FactBank(
             [
                 Fact(
@@ -353,7 +353,7 @@ class TestCrossSectionDedup:
     hard-fails generation if a duplicate ever reaches the assembled text)."""
 
     def _data_and_bank(self, dup: bool):
-        from applypilot.facts import Fact, FactBank
+        from scoutpilot.facts import Fact, FactBank
         facts = [
             Fact(id="emg.dual", tier="verified", numbers=[2],
                  variants={"short": "Built 2 parallel ML pipelines on EMG signals",
@@ -372,8 +372,8 @@ class TestCrossSectionDedup:
 
     def test_repeated_fact_is_dropped_from_the_later_section(self):
         """The duplicate bullet goes; the entry survives on its other one."""
-        from applypilot.facts import Fact, FactBank
-        from applypilot.scoring.tailor import _resolve_fact_bullets
+        from scoutpilot.facts import Fact, FactBank
+        from scoutpilot.scoring.tailor import _resolve_fact_bullets
 
         bank = FactBank(
             [
@@ -401,7 +401,7 @@ class TestCrossSectionDedup:
         empty -- validate_json_fields will require a retry for it, but the
         retry note explains why (write new bullets, don't repeat
         experience) instead of the run silently shipping the fact twice."""
-        from applypilot.scoring.tailor import _resolve_fact_bullets
+        from scoutpilot.scoring.tailor import _resolve_fact_bullets
         data, bank = self._data_and_bank(dup=True)
         resolved, errors = _resolve_fact_bullets(data, bank)
         assert resolved["projects"] == []
@@ -414,7 +414,7 @@ class TestBulletOwnership:
     exact VIOFEEL/EMG misattribution seen live 2026-08-26."""
 
     def _bank(self):
-        from applypilot.facts import Fact, FactBank
+        from scoutpilot.facts import Fact, FactBank
         return FactBank(
             [
                 Fact(id="emg.dual", tier="verified", numbers=[2], source="emg",
@@ -428,7 +428,7 @@ class TestBulletOwnership:
         )
 
     def test_fact_under_the_wrong_entry_is_dropped_not_moved(self):
-        from applypilot.scoring.tailor import _resolve_fact_bullets
+        from scoutpilot.scoring.tailor import _resolve_fact_bullets
         data = {
             "experience": [
                 {"header": "Co-Founder & Shareholder | VIOFEEL Ltd", "bullets": [
@@ -450,7 +450,7 @@ class TestBulletOwnership:
     def test_fact_under_an_uncanonicalized_entry_is_allowed(self):
         """No canonical record matched this entry -- there's no ground
         truth to check it against, so it passes through untouched."""
-        from applypilot.scoring.tailor import _resolve_fact_bullets
+        from scoutpilot.scoring.tailor import _resolve_fact_bullets
         data = {
             "experience": [{"header": "Freelance Consulting", "bullets": [{"fact": "emg.dual", "form": "short"}]}],
             "projects": [],
@@ -466,8 +466,8 @@ class TestCrossSectionDuplicateAssertion:
     never actually ship with the same bullet under two headings."""
 
     def test_raises_on_identical_bullet_in_both_sections(self):
-        from applypilot.facts import BulletPlacementViolation
-        from applypilot.scoring.tailor import check_no_cross_section_duplicates
+        from scoutpilot.facts import BulletPlacementViolation
+        from scoutpilot.scoring.tailor import check_no_cross_section_duplicates
         data = {
             "experience": [{"header": "VIOFEEL", "bullets": ["Built two parallel ML pipelines on EMG signals."]}],
             "projects": [{"header": "EMG Project", "bullets": ["Built two parallel ML pipelines on EMG signals."]}],
@@ -479,7 +479,7 @@ class TestCrossSectionDuplicateAssertion:
             assert "VIOFEEL" in e.reasons[0] and "EMG Project" in e.reasons[0]
 
     def test_passes_on_distinct_bullets(self):
-        from applypilot.scoring.tailor import check_no_cross_section_duplicates
+        from scoutpilot.scoring.tailor import check_no_cross_section_duplicates
         data = {
             "experience": [{"header": "VIOFEEL", "bullets": ["1st place, QUB Dragon's Den 2024"]}],
             "projects": [{"header": "EMG Project", "bullets": ["Built two parallel ML pipelines on EMG signals."]}],
@@ -491,8 +491,8 @@ class TestCrossSectionDuplicateAssertion:
         fact, worded differently in each section, with too little word
         overlap for _bullets_similar and too little for match_similar to
         assign a shared fact id during resolution either."""
-        from applypilot.facts import BulletPlacementViolation, Fact, FactBank
-        from applypilot.scoring.tailor import check_no_cross_section_duplicates
+        from scoutpilot.facts import BulletPlacementViolation, Fact, FactBank
+        from scoutpilot.scoring.tailor import check_no_cross_section_duplicates
 
         bank = FactBank(
             [
@@ -520,8 +520,8 @@ class TestCrossSectionDuplicateAssertion:
         """The blind spot the projects-vs-experience loop had by
         construction: two bullets under the SAME heading were never held up
         against each other at all."""
-        from applypilot.facts import BulletPlacementViolation
-        from applypilot.scoring.tailor import check_no_cross_section_duplicates
+        from scoutpilot.facts import BulletPlacementViolation
+        from scoutpilot.scoring.tailor import check_no_cross_section_duplicates
         data = {
             "projects": [{"header": "EMG Project", "bullets": [
                 "Built two parallel ML pipelines on EMG signals.",
@@ -541,8 +541,8 @@ class TestCrossSectionDuplicateAssertion:
         pipelines...'. No shared fact id at resolution time and too little
         literal overlap for text equality -- only _likely_fact_id unifies
         them, and only an all-pairs loop ever compares them."""
-        from applypilot.facts import BulletPlacementViolation, Fact, FactBank
-        from applypilot.scoring.tailor import check_no_cross_section_duplicates
+        from scoutpilot.facts import BulletPlacementViolation, Fact, FactBank
+        from scoutpilot.scoring.tailor import check_no_cross_section_duplicates
 
         bank = FactBank(
             [
@@ -568,8 +568,8 @@ class TestCrossSectionDuplicateAssertion:
     def test_raises_on_reworded_duplicate_across_entries_in_one_section(self):
         """Same section, two different headings -- also invisible to the old
         loop, which only ever walked projects against experience."""
-        from applypilot.facts import BulletPlacementViolation, Fact, FactBank
-        from applypilot.scoring.tailor import check_no_cross_section_duplicates
+        from scoutpilot.facts import BulletPlacementViolation, Fact, FactBank
+        from scoutpilot.scoring.tailor import check_no_cross_section_duplicates
 
         bank = FactBank(
             [
@@ -601,8 +601,8 @@ class TestCrossSectionDuplicateAssertion:
         """All-pairs must not turn every multi-bullet entry into a finding.
         Every CV in the 2026-08-26 corpus had 2-9 bullets under one heading
         and none of them was a self-duplicate."""
-        from applypilot.facts import Fact, FactBank
-        from applypilot.scoring.tailor import check_no_cross_section_duplicates
+        from scoutpilot.facts import Fact, FactBank
+        from scoutpilot.scoring.tailor import check_no_cross_section_duplicates
 
         bank = FactBank(
             [
@@ -626,7 +626,7 @@ class TestCrossSectionDuplicateAssertion:
     def test_no_fact_bank_falls_back_to_exact_text_only(self):
         """Backward compatible: omitting fact_bank still catches exact
         duplicates, just not paraphrased ones."""
-        from applypilot.scoring.tailor import check_no_cross_section_duplicates
+        from scoutpilot.scoring.tailor import check_no_cross_section_duplicates
         data = {
             "experience": [{"header": "VIOFEEL", "bullets": ["A genuinely different bullet entirely"]}],
             "projects": [{"header": "EMG Project", "bullets": ["Built two parallel ML pipelines on EMG signals."]}],
@@ -653,7 +653,7 @@ class TestCanonicalExperienceRejection:
     def test_invented_experience_entry_is_dropped(self):
         """The exact incident: the model filed the candidate's own degree
         as a job once EMG bullets could no longer land on VIOFEEL."""
-        from applypilot.scoring.tailor import _apply_canonical_entries
+        from scoutpilot.scoring.tailor import _apply_canonical_entries
         data = {
             "experience": [
                 {"header": "Software Engineering Intern | Kraydel LTD", "bullets": ["Shipped an audit-event system"]},
@@ -669,7 +669,7 @@ class TestCanonicalExperienceRejection:
     def test_projects_stay_additive_when_unmatched(self):
         """The same unmatched-entry situation in PROJECTS is kept, not
         rejected -- a profile can have real projects not yet registered."""
-        from applypilot.scoring.tailor import _apply_canonical_entries
+        from scoutpilot.scoring.tailor import _apply_canonical_entries
         profile = self._profile()
         profile["resume_facts"]["canonical_entries"]["projects"] = [
             {"match": ["EMG"], "header": "EMG Project", "subtitle": "2020 - 2025"},
@@ -698,7 +698,7 @@ class TestCanonicalSkillsLines:
         """The exact incident: the model added 'LangChain (agent frameworks)'
         and 'Kubernetes' to categories that never listed them, lifted
         straight from the job's own requirements."""
-        from applypilot.scoring.tailor import _canonical_skills_lines
+        from scoutpilot.scoring.tailor import _canonical_skills_lines
         data = {"skills": {"Programming Languages": "Python (LLM integration, LangChain), Java, Kubernetes"}}
         lines = _canonical_skills_lines(data, self._profile())
         assert len(lines) == 1
@@ -707,13 +707,13 @@ class TestCanonicalSkillsLines:
         assert "Python" in lines[0] and "Java" in lines[0] and "Kotlin" in lines[0]
 
     def test_llm_text_only_reorders(self):
-        from applypilot.scoring.tailor import _canonical_skills_lines
+        from scoutpilot.scoring.tailor import _canonical_skills_lines
         data = {"skills": {"Programming Languages": "Kotlin is the main one, then Java, then Python."}}
         lines = _canonical_skills_lines(data, self._profile())
         assert lines[0] == "Programming Languages: Kotlin, Java, Python"
 
     def test_no_skills_boundary_returns_empty(self):
-        from applypilot.scoring.tailor import _canonical_skills_lines
+        from scoutpilot.scoring.tailor import _canonical_skills_lines
         assert _canonical_skills_lines({"skills": {}}, {}) == []
 
 
@@ -727,7 +727,7 @@ class TestFindSummaryDuplicateBullets:
     raise."""
 
     def test_summary_repeating_a_bullet_verbatim_is_flagged(self):
-        from applypilot.scoring.tailor import find_summary_duplicate_bullets
+        from scoutpilot.scoring.tailor import find_summary_duplicate_bullets
         data = {
             "summary": "Built two parallel ML pipelines on surface-EMG signals in Python. "
                        "Now looking for backend work in Belfast.",
@@ -744,7 +744,7 @@ class TestFindSummaryDuplicateBullets:
         achievement over a bullet that elaborates it is what the tailoring
         prompt asks for. Sharing a claim with a bullet is fine; being the
         same sentence is not."""
-        from applypilot.scoring.tailor import find_summary_duplicate_bullets
+        from scoutpilot.scoring.tailor import find_summary_duplicate_bullets
         data = {
             "summary": "Built two parallel ML pipelines on surface-EMG signals in Python, "
                        "addressing class imbalance and noisy real-world signals.",
@@ -757,7 +757,7 @@ class TestFindSummaryDuplicateBullets:
         assert find_summary_duplicate_bullets(data) == []
 
     def test_a_summary_that_says_something_else_is_not_flagged(self):
-        from applypilot.scoring.tailor import find_summary_duplicate_bullets
+        from scoutpilot.scoring.tailor import find_summary_duplicate_bullets
         data = {
             "summary": "Backend engineer who has run production services on AWS. "
                        "Comfortable owning deployment and on-call.",
@@ -771,7 +771,7 @@ class TestFindSummaryDuplicateBullets:
         """The pair that motivated _SUMMARY_DUP_MIN_COVERAGE, from the
         2026-09-01 sample: the elaborating bullet scored 0.59 and must not
         fire, the containing one scored 0.67 and must."""
-        from applypilot.scoring.tailor import _word_coverage, find_summary_duplicate_bullets
+        from scoutpilot.scoring.tailor import _word_coverage, find_summary_duplicate_bullets
         sentence = ("Diagnosed and corrected evaluation data-leakage that had inflated "
                     "reported accuracy, re-establishing honest, leakage-free performance.")
         contains = "Diagnosed and corrected evaluation data-leakage that had inflated reported accuracy"
@@ -787,7 +787,7 @@ class TestFindSummaryDuplicateBullets:
     def test_each_summary_sentence_reports_at_most_once(self):
         """One sentence duplicated across three bullets is one problem to
         fix, not three retry notes telling the model the same thing."""
-        from applypilot.scoring.tailor import find_summary_duplicate_bullets
+        from scoutpilot.scoring.tailor import find_summary_duplicate_bullets
         bullet = "Built two parallel ML pipelines on surface-EMG signals in Python"
         data = {
             "summary": "Built two parallel ML pipelines on surface-EMG signals in Python.",
@@ -797,7 +797,7 @@ class TestFindSummaryDuplicateBullets:
         assert len(find_summary_duplicate_bullets(data)) == 1
 
     def test_empty_summary_or_no_bullets_is_never_a_finding(self):
-        from applypilot.scoring.tailor import find_summary_duplicate_bullets
+        from scoutpilot.scoring.tailor import find_summary_duplicate_bullets
         bullet = "Built two parallel ML pipelines on surface-EMG signals in Python"
         assert find_summary_duplicate_bullets({"projects": [{"header": "P", "bullets": [bullet]}]}) == []
         assert find_summary_duplicate_bullets({"summary": bullet, "projects": []}) == []
@@ -819,7 +819,7 @@ class TestRepairSummary:
             return self.reply
 
     def _guard(self):
-        from applypilot.facts import NumericGuard
+        from scoutpilot.facts import NumericGuard
         return NumericGuard(_bank(), profile=None)
 
     def _data(self):
@@ -831,7 +831,7 @@ class TestRepairSummary:
         }
 
     def test_a_clean_summary_never_calls_the_model(self):
-        from applypilot.scoring.tailor import _repair_summary
+        from scoutpilot.scoring.tailor import _repair_summary
         data = self._data()
         data["summary"] = "Backend engineer who has run production services on AWS and owned on-call."
         client = self._Client("unused")
@@ -839,7 +839,7 @@ class TestRepairSummary:
         assert client.calls == 0
 
     def test_a_summary_repeating_a_bullet_is_rewritten(self):
-        from applypilot.scoring.tailor import _repair_summary
+        from scoutpilot.scoring.tailor import _repair_summary
         data = self._data()
         client = self._Client(
             "Backend engineer who has run production services on AWS. Comfortable "
@@ -852,7 +852,7 @@ class TestRepairSummary:
     def test_the_rewrite_prompt_names_the_bullets_it_must_avoid(self):
         """Describing the rule isn't enough -- the model has to see the
         sentences it is being kept off."""
-        from applypilot.scoring.tailor import _repair_summary
+        from scoutpilot.scoring.tailor import _repair_summary
         data = self._data()
         client = self._Client("Backend engineer who has run production services on AWS and owned on-call.")
         _repair_summary(data, client, {}, self._guard())
@@ -860,7 +860,7 @@ class TestRepairSummary:
         assert "Built two parallel ML pipelines on surface-EMG signals in Python" in sent
 
     def test_a_rewrite_that_still_duplicates_is_discarded(self):
-        from applypilot.scoring.tailor import _repair_summary
+        from scoutpilot.scoring.tailor import _repair_summary
         data = self._data()
         original = data["summary"]
         client = self._Client(
@@ -871,7 +871,7 @@ class TestRepairSummary:
         assert problems and data["summary"] == original
 
     def test_a_failing_call_leaves_the_summary_alone(self):
-        from applypilot.scoring.tailor import _repair_summary
+        from scoutpilot.scoring.tailor import _repair_summary
 
         class Boom:
             def chat(self, *a, **kw):
@@ -885,7 +885,7 @@ class TestRepairSummary:
     def test_a_rewrite_with_an_unverified_number_is_discarded(self):
         """A rewrite is LLM-authored text like any other and gets the same
         numeric scrutiny as the bullets around it."""
-        from applypilot.scoring.tailor import _repair_summary
+        from scoutpilot.scoring.tailor import _repair_summary
         data = self._data()
         original = data["summary"]
         client = self._Client("Backend engineer who has cut deployment time by 47 percent across 9 services.")
@@ -897,7 +897,7 @@ class TestRepairSummary:
 
 class TestFormatFactsBlockOwner:
     def _fact(self):
-        from applypilot.facts import Fact
+        from scoutpilot.facts import Fact
         return Fact(
             id="emg.dual", tier="verified", numbers=[2], source="emg",
             variants={"short": "Built 2 parallel ML pipelines on surface-EMG signals",
@@ -909,7 +909,7 @@ class TestFormatFactsBlockOwner:
         """Once on the id line isn't enough: the variant text is what the
         model reads when deciding what a fact says, and by then a qualifier
         two lines up has stopped being in view."""
-        from applypilot.facts import format_facts_block
+        from scoutpilot.facts import format_facts_block
         block = format_facts_block([self._fact()], show_owner=True)
         for line in block.splitlines():
             if line.strip().startswith(("short", "long")):
@@ -917,20 +917,20 @@ class TestFormatFactsBlockOwner:
 
     def test_cover_letters_get_no_owner_at_all(self):
         """A letter has no entries, so ownership is meaningless there."""
-        from applypilot.facts import format_facts_block
+        from scoutpilot.facts import format_facts_block
         block = format_facts_block([self._fact()], show_owner=False)
         assert "emg" not in block.replace("emg.dual", "")
         assert "only under" not in block
 
     def test_education_facts_are_never_owned_by_an_entry(self):
-        from applypilot.facts import Fact, format_facts_block
+        from scoutpilot.facts import Fact, format_facts_block
         edu = Fact(id="edu.meng", tier="verified", numbers=[2025], source="education",
                    variants={"short": "MEng, first class"}, evidence="2025 graduation")
         block = format_facts_block([edu], show_owner=True)
         assert "only under" not in block
 
     def test_variant_text_itself_is_unchanged(self):
-        from applypilot.facts import format_facts_block
+        from scoutpilot.facts import format_facts_block
         block = format_facts_block([self._fact()], show_owner=True)
         assert '"Built 2 parallel ML pipelines on surface-EMG signals"' in block
 
@@ -973,7 +973,7 @@ class TestInventedExperienceEntryShipsAnyway:
         ]}}}
 
     def _run(self, monkeypatch):
-        import applypilot.scoring.tailor as tailor_mod
+        import scoutpilot.scoring.tailor as tailor_mod
         monkeypatch.setattr(tailor_mod, "get_client", lambda: _DegreeAsJobClient())
         return tailor_mod.tailor_resume(
             "SUMMARY\nExperienced engineer.\n",
