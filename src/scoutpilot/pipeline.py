@@ -174,6 +174,20 @@ def _run_discover(workers: int = 1) -> dict:
         console.print(f"  [red]Smart extract error:[/red] {e}")
         stats["smartextract"] = f"error: {e}"
 
+    # Flag reposts: the same real-world ad discovered again (a new URL, or
+    # picked up from a second board) so it doesn't get scored/tailored a
+    # second time. Strict -- normalised title AND >=0.85 description
+    # similarity. See database.find_duplicate_groups.
+    try:
+        from scoutpilot.database import apply_duplicate_marks
+        marked = apply_duplicate_marks(conn)
+        stats["dedupe"] = f"ok ({marked} reposts flagged)"
+        if marked:
+            console.print(f"  [cyan]Dedupe:[/cyan] flagged {marked} repost(s) of ads already in the DB")
+    except Exception as e:
+        log.error("Dedupe pass failed: %s", e)
+        stats["dedupe"] = f"error: {e}"
+
     errored = any(isinstance(v, str) and v.startswith("error") for v in stats.values())
     end_run(conn, run_id, status="partial" if errored else "completed", stats=stats)
     return stats

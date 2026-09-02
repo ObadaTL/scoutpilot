@@ -395,6 +395,20 @@ def score(
 
 
 @app.command()
+def dedupe() -> None:
+    """Flag reposts: the same ad discovered again under a new URL or from a
+    second board. Strict match (normalised title + >=0.85 description
+    similarity); the older / more-progressed copy is kept, the rest get
+    duplicate_of set so score/tailor/apply skip them.
+    """
+    _bootstrap()
+    from scoutpilot.database import apply_duplicate_marks
+    console.print("\n[bold blue]Scanning for reposts...[/bold blue]")
+    n = apply_duplicate_marks()
+    console.print(f"[bold green]Flagged {n} repost(s).[/bold green]\n")
+
+
+@app.command()
 def clean() -> None:
     """Clean the queue by hiding irrelevant non-engineering roles (Sales, Marketing, HR, etc.)."""
     _bootstrap()
