@@ -1018,6 +1018,14 @@ def store_jobs(conn: sqlite3.Connection, jobs: list[dict],
             new += 1
         except sqlite3.IntegrityError:
             existing += 1
+            # Re-discovering a job that was archived (search restarted) brings
+            # it back into the live set -- it's a current result again. Only
+            # if nothing downstream has touched it.
+            conn.execute(
+                "UPDATE jobs SET archived_at = NULL WHERE url = ? AND archived_at IS NOT NULL "
+                "AND tailored_resume_path IS NULL AND applied_at IS NULL",
+                (url,),
+            )
 
     conn.commit()
     return new, existing

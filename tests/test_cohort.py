@@ -127,6 +127,30 @@ def test_archive_scopes_to_untouched_discovery_rows(db, tmp_path):
     assert [j["url"] for j in get_jobs_by_stage(db, stage="pending_score")] == ["raw2"]
 
 
+def test_rediscovery_revives_archived_row(db, tmp_path):
+    store_jobs(db, [{"url": "j", "title": "Engineer", "location": "UK", "full_description": "x" * 300}],
+               site="B", strategy="t")
+    archive_discovery_results(db, note_path=tmp_path / "n.txt")
+    assert get_jobs_by_stage(db, stage="pending_score") == []
+
+    # the fresh discovery run finds it again
+    new, existing = store_jobs(
+        db, [{"url": "j", "title": "Engineer", "location": "UK", "full_description": "x" * 300}],
+        site="B", strategy="t")
+    assert (new, existing) == (0, 1)
+    assert [j["url"] for j in get_jobs_by_stage(db, stage="pending_score")] == ["j"]
+
+
+def test_rediscovery_does_not_revive_applied_row(db, tmp_path):
+    store_jobs(db, [{"url": "a", "title": "Engineer", "location": "UK", "full_description": "x" * 300}],
+               site="B", strategy="t")
+    db.execute("UPDATE jobs SET archived_at = '2026-01-01', applied_at = '2026-01-02' WHERE url = 'a'")
+    db.commit()
+    store_jobs(db, [{"url": "a", "title": "Engineer", "location": "UK", "full_description": "x" * 300}],
+               site="B", strategy="t")
+    assert db.execute("SELECT archived_at FROM jobs WHERE url = 'a'").fetchone()[0] == "2026-01-01"
+
+
 def test_archive_is_idempotent(db, tmp_path):
     store_jobs(db, [{"url": "a", "title": "Engineer", "location": "UK", "full_description": "x" * 300}],
                site="B", strategy="t")

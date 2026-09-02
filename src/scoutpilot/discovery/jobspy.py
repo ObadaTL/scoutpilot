@@ -195,6 +195,12 @@ def store_jobspy_results(conn: sqlite3.Connection, df, source_label: str) -> tup
             new += 1
         except sqlite3.IntegrityError:
             existing += 1
+            # Re-discovering an archived job (search restarted) revives it.
+            conn.execute(
+                "UPDATE jobs SET archived_at = NULL WHERE url = ? AND archived_at IS NOT NULL "
+                "AND tailored_resume_path IS NULL AND applied_at IS NULL",
+                (url,),
+            )
 
     conn.commit()
     return new, existing

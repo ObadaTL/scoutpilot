@@ -1,25 +1,29 @@
 # Graduate Schemes & Funded Training Programs Registry
-# Curated discovery sources for Graduate Technology Schemes, Apprenticeships,
-# Skills Bootcamps (UK DfE), and funded tech cohorts.
+# Curated discovery sources for graduate technology schemes, apprenticeships,
+# skills bootcamps (UK DfE), and funded tech cohorts.
+#
+# Every url here was checked returning a live 200 page on 2026-09-02 (a few
+# 301-redirect to a current path -- noted inline). Re-verify before adding
+# any entry; a dead landing page produces a junk job row.
 
 schemes:
-  # ── Major UK & Northern Ireland Graduate Employers & Schemes ──────────
+  # ── Major UK & Northern Ireland graduate employers & schemes ─────────
   graduate_schemes:
-    - name: "Kainos Earn as you Learn & Graduate Tech"
+    - name: "Kainos Early Careers (Graduate & Earn as you Learn)"
       company: "Kainos"
       location: "Belfast, Northern Ireland / UK Remote"
-      url: "https://www.kainos.com/careers/early-careers"
+      url: "https://careers.kainos.com/gb/en"          # was kainos.com/careers/early-careers (now 404)
       opportunity_type: "graduate_scheme"
       funding_status: "standard_salary"
       description: "Graduate software engineering and tech consulting academy based in Belfast and across the UK."
-    
+
     - name: "Allstate Northern Ireland Early Careers"
       company: "Allstate Northern Ireland"
       location: "Belfast / Derry, Northern Ireland"
-      url: "https://www.allstate.com/careers/northern-ireland"
+      url: "https://www.allstateni.com/careers"        # was allstate.com/careers/northern-ireland (now 404)
       opportunity_type: "graduate_scheme"
       funding_status: "standard_salary"
-      description: "Early career software development, cybersecurity, and cloud infrastructure roles in Belfast."
+      description: "Early career software development, cybersecurity, and cloud infrastructure roles in Belfast and Derry."
 
     - name: "Citi Belfast Technology Graduate Programme"
       company: "Citi"
@@ -35,7 +39,127 @@ schemes:
       url: "https://www.liberty-it.co.uk/careers"
       opportunity_type: "graduate_scheme"
       funding_status: "standard_salary"
-      description: "Graduate software development and engineering program in Belfast creating enterprise cloud platforms."
+      description: "Graduate software development and engineering program in Belfast building enterprise cloud platforms."
+
+    - name: "FinTrU Academy & Early Careers"
+      company: "FinTrU"
+      location: "Belfast / Derry, Northern Ireland"
+      url: "https://www.fintru.com/careers/"
+      opportunity_type: "graduate_scheme"
+      funding_status: "standard_salary"
+      description: "Belfast and Derry financial-services technology firm running a structured academy for graduates in software, data, and technology."
+
+    - name: "Version 1 Early Careers Programme"
+      company: "Version 1"
+      location: "Belfast / UK / Ireland"
+      url: "https://www.version1.com/careers/early-careers/"
+      opportunity_type: "graduate_scheme"
+      funding_status: "standard_salary"
+      description: "Graduate and placement software engineering, cloud, and data roles across Belfast, the UK, and Ireland."
+
+    - name: "Instil Software Graduate & Placement"
+      company: "Instil"
+      location: "Belfast, Northern Ireland"
+      url: "https://www.instil.com/careers"
+      opportunity_type: "graduate_scheme"
+      funding_status: "standard_salary"
+      description: "Belfast software consultancy hiring graduate and placement engineers across JVM, mobile, and cloud."
+
+    - name: "Options Technology Early Careers"
+      company: "Options Technology"
+      location: "Belfast, Northern Ireland"
+      url: "https://www.optionstechnology.com/careers"
+      opportunity_type: "graduate_scheme"
+      funding_status: "standard_salary"
+      description: "Capital-markets infrastructure and cloud provider headquartered in Belfast, hiring graduate engineers and analysts."
+
+    - name: "Datactics Graduate Software Engineer"
+      company: "Datactics"
+      location: "Belfast, Northern Ireland"
+      url: "https://www.datactics.com/careers/"
+      opportunity_type: "graduate_scheme"
+      funding_status: "standard_salary"
+      description: "Belfast data-quality and matching software vendor hiring graduate software and data engineers."
+
+    - name: "B-Secur Engineering Careers"
+      company: "B-Secur"
+      location: "Belfast, Northern Ireland"
+      url: "https://www.b-secur.com/careers/"
+      opportunity_type: "graduate_scheme"
+      funding_status: "standard_salary"
+      description: "Belfast biometrics / ECG signal-processing company hiring embedded, algorithm, and software engineers."
+
+    - name: "Cirdan Careers"
+      company: "Cirdan"
+      location: "Lisburn, Northern Ireland"
+      url: "https://cirdan.com/careers/"
+      opportunity_type: "graduate_scheme"
+      funding_status: "standard_salary"
+      description: "Lisburn medical-imaging and laboratory information-systems company hiring software and test engineers."
+
+    - name: "ANGOKA Careers"
+      company: "ANGOKA"
+      location: "Belfast, Northern Ireland"
+      url: "https://www.angoka.io/jobs"
+      opportunity_type: "graduate_scheme"
+      funding_status: "standard_salary"
+      description: "Belfast cybersecurity company securing machine-to-machine communications for mobility and IoT."
+
+    - name: "Analytics Engines Careers"
+      company: "Analytics Engines"
+      location: "Belfast, Northern Ireland"
+      url: "https://analyticsengines.com/company/careers/"
+      opportunity_type: "graduate_scheme"
+      funding_status: "standard_salary"
+      description: "Belfast data engineering and AI consultancy hiring software, data, and ML engineers."
+
+    - name: "Signifyd Belfast Engineering"
+      company: "Signifyd"
+      location: "Belfast, Northern Ireland"
+      url: "https://www.signifyd.com/careers/"
+      opportunity_type: "graduate_scheme"
+      funding_status: "standard_salary"
+      description: "Commerce-protection platform with a Belfast engineering hub hiring backend and data engineers."
+
+    - name: "Bazaarvoice Belfast Engineering"
+      company: "Bazaarvoice"
+      location: "Belfast, Northern Ireland"
+      url: "https://www.bazaarvoice.com/company/careers/"
+      opportunity_type: "graduate_scheme"
+      funding_status: "standard_salary"
+      description: "Retail and brand UGC platform with a large Belfast R&D centre hiring software engineers."
+
+    - name: "Perforce (Puppet) Belfast Engineering"
+      company: "Perforce"
+      location: "Belfast, Northern Ireland"
+      url: "https://www.perforce.com/careers"       # 301 from puppet.com/company/careers
+      opportunity_type: "graduate_scheme"
+      funding_status: "standard_salary"
+      description: "DevOps and infrastructure automation (Puppet) engineering team based in Belfast."
+
+    - name: "KX (First Derivatives) Early Careers"
+      company: "KX"
+      location: "Newry, Northern Ireland / UK"
+      url: "https://kx.com/careers/"                 # 301 to kx.com/life-at-kx
+      opportunity_type: "graduate_scheme"
+      funding_status: "standard_salary"
+      description: "Newry-headquartered time-series database (kdb+) and capital-markets consultancy hiring graduate engineers and consultants."
+
+    - name: "Neueda Graduate Academy"
+      company: "Neueda"
+      location: "Belfast, Northern Ireland"
+      url: "https://neueda.com/careers/"
+      opportunity_type: "graduate_scheme"
+      funding_status: "standard_salary"
+      description: "Belfast technology consultancy and training provider running a graduate software academy."
+
+    - name: "Data Intellect (formerly AquaQ) Careers"
+      company: "Data Intellect"
+      location: "Belfast, Northern Ireland"
+      url: "https://dataintellect.com/join-us/open-positions/"   # AquaQ rebranded
+      opportunity_type: "graduate_scheme"
+      funding_status: "standard_salary"
+      description: "Belfast data-analytics consultancy (kdb+/Python) hiring graduate and experienced data engineers."
 
     - name: "BBC Technology & Software Engineering Scheme"
       company: "BBC"
@@ -43,25 +167,49 @@ schemes:
       url: "https://www.bbc.co.uk/careers/trainee-schemes-and-apprenticeships"
       opportunity_type: "graduate_scheme"
       funding_status: "standard_salary"
-      description: "BBC Software Engineering and Digital Media Graduate and Apprenticeship schemes."
+      description: "BBC software engineering and digital-media graduate and apprenticeship schemes."
 
     - name: "Civil Service Fast Stream - Digital, Data & Technology"
       company: "UK Civil Service"
       location: "Belfast / UK Wide / Hybrid"
-      url: "https://www.faststream.gov.uk/digital-data-technology"
+      url: "https://www.civil-service-careers.gov.uk/fast-stream/fs-all-schemes/fs-digital-scheme/"  # was faststream.gov.uk (301)
       opportunity_type: "graduate_scheme"
       funding_status: "standard_salary"
       description: "UK Civil Service leadership and technical graduate scheme in digital, data, and technology."
 
-    - name: "BT & EE Digital Technology Graduate"
-      company: "BT Group"
-      location: "Belfast / London / Bristol / Hybrid"
-      url: "https://www.bt.com/careers/early-careers/graduates"
+    - name: "PwC UK Technology Early Careers"
+      company: "PwC"
+      location: "Belfast / UK Wide"
+      url: "https://www.pwc.co.uk/careers/early-careers.html"
       opportunity_type: "graduate_scheme"
       funding_status: "standard_salary"
-      description: "Software engineering, cloud, networks, and data analytics graduate programmes."
+      description: "Graduate, undergraduate, and school-leaver technology and technology-consulting programmes across the UK including Belfast."
 
-  # ── Government-Funded Training, Reskilling & Tech Bootcamps ───────────
+    - name: "EY UK Student & Graduate Programmes"
+      company: "EY"
+      location: "Belfast / UK Wide"
+      url: "https://www.ey.com/en_uk/careers/students"
+      opportunity_type: "graduate_scheme"
+      funding_status: "standard_salary"
+      description: "Graduate and apprenticeship technology, data, and consulting programmes across the UK including Belfast."
+
+    - name: "IBM UK Early Careers"
+      company: "IBM"
+      location: "UK Wide / Hybrid"
+      url: "https://www.ibm.com/uk-en/careers/career-opportunities"   # was /employment/entrylevel (301)
+      opportunity_type: "graduate_scheme"
+      funding_status: "standard_salary"
+      description: "IBM UK graduate and apprenticeship roles in software, cloud, and consulting."
+
+    - name: "BAE Systems UK Graduate Programme"
+      company: "BAE Systems"
+      location: "UK Wide"
+      url: "https://www.baesystems.com/en/careers/careers-in-the-uk/graduates"
+      opportunity_type: "graduate_scheme"
+      funding_status: "standard_salary"
+      description: "UK graduate programme with software, cyber, and systems engineering streams."
+
+  # ── Government-funded training, reskilling & tech bootcamps ───────────
   funded_training:
     - name: "UK DfE Skills Bootcamps in Software Development"
       company: "Department for Education (DfE)"
@@ -69,7 +217,7 @@ schemes:
       url: "https://www.gov.uk/guidance/find-a-skills-bootcamp"
       opportunity_type: "funded_training"
       funding_status: "fully_funded"
-      description: "Free, flexible courses of up to 16 weeks for adults, giving people the opportunity to build up sector-specific tech skills with guaranteed job interviews."
+      description: "Free, flexible courses of up to 16 weeks for adults building sector-specific tech skills, with guaranteed job interviews."
 
     - name: "AWS re/Start Cloud Training Program"
       company: "Amazon Web Services (AWS)"
@@ -77,40 +225,35 @@ schemes:
       url: "https://aws.amazon.com/training/restart/"
       opportunity_type: "funded_training"
       funding_status: "fully_funded"
-      description: "Full-time, 12-week skills development program that prepares individuals for careers in the cloud and connects them to potential employers."
+      description: "Full-time 12-week skills programme preparing individuals for cloud careers and connecting them to employers."
 
-    - name: "Generation UK Tech Programmes"
+    - name: "Generation UK & Ireland Tech Programmes"
       company: "Generation UK & Ireland"
       location: "UK / Remote"
-      url: "https://uk.generation.org/programmes/"
+      url: "https://uk.generation.org/"      # was uk.generation.org/programmes (404)
       opportunity_type: "funded_training"
       funding_status: "fully_funded"
-      description: "Free, cohort-based tech training in Software Engineering, Data Analytics, and Cloud Engineering with direct employer interviews."
+      description: "Free cohort-based tech training in software engineering, data, and cloud with direct employer interviews."
 
-    - name: "Northcoders Fully Funded Coding Bootcamps"
+    - name: "Northcoders Fully Funded Coding Bootcamp"
       company: "Northcoders"
       location: "UK / Remote"
       url: "https://northcoders.com/our-courses/coding-bootcamp"
       opportunity_type: "funded_training"
       funding_status: "fully_funded"
-      description: "Department for Education funded 13-week coding bootcamp covering full-stack software development with dedicated career support."
+      description: "DfE-funded 13-week full-stack software development bootcamp with dedicated career support."
 
-    - name: "Ada National College for Digital Skills - Apprenticeships"
+    - name: "Ada, the National College for Digital Skills - Apprenticeships"
       company: "Ada College"
       location: "UK / Hybrid"
       url: "https://www.ada.ac.uk/apprenticeships/"
       opportunity_type: "apprenticeship"
       funding_status: "paid_stipend"
-      description: "Higher and Degree apprenticeships in Software Engineering and Data Analytics with leading tech employers."
+      description: "Higher and degree apprenticeships in software engineering and data analytics with leading tech employers."
 
-  # ── Curated Community Feeds & Repositories ────────────────────────────
+  # ── Curated community feeds & repositories ───────────────────────────
   curated_feeds:
     - name: "SimplifyJobs New Grad SWE"
       url: "https://raw.githubusercontent.com/SimplifyJobs/New-Grad-Positions/dev/README.md"
       type: "markdown_table"
-      opportunity_type: "graduate_scheme"
-
-    - name: "UK Tech Graduate Schemes Index"
-      url: "https://raw.githubusercontent.com/search?q=uk+tech+graduate+schemes"
-      type: "curated_list"
       opportunity_type: "graduate_scheme"
