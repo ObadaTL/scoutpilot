@@ -282,6 +282,7 @@ def discover(
     jobspy: bool = typer.Option(False, "--jobspy", help="Run JobSpy boards crawl."),
     workday: bool = typer.Option(False, "--workday", help="Run Workday corporate scraper."),
     remote_boards: bool = typer.Option(False, "--remote", help="Run remote-first board harvesters (remote.com, WeWorkRemotely)."),
+    targetjobs: bool = typer.Option(False, "--targetjobs", help="Run the targetjobs.co.uk graduate-board harvester (sitemap-based)."),
     all_channels: bool = typer.Option(False, "--all", "-a", help="Run all discovery channels."),
     workers: int = typer.Option(4, "--workers", "-w", help="Number of worker threads."),
 ) -> None:
@@ -289,7 +290,8 @@ def discover(
     _bootstrap()
 
     run_all = all_channels or not (
-        ats or hn or schemes or companies or gradboards or dorking or jobspy or workday or remote_boards
+        ats or hn or schemes or companies or gradboards or dorking or jobspy or workday
+        or remote_boards or targetjobs
     )
 
     console.print("\n[bold blue]Starting Opportunity Discovery[/bold blue]\n")
@@ -349,6 +351,12 @@ def discover(
         from scoutpilot.discovery.remote_boards import run_remote_boards_discovery
         res = run_remote_boards_discovery()
         console.print(f"  [green]Remote Boards Result:[/green] {res.get('new', 0)} new / {res.get('total_found', 0)} found")
+
+    if run_all or targetjobs:
+        console.print("[cyan]Running targetjobs.co.uk Harvester (sitemap-based)...[/cyan]")
+        from scoutpilot.discovery.targetjobs import run_targetjobs_discovery
+        res = run_targetjobs_discovery()
+        console.print(f"  [green]targetjobs Result:[/green] {res.get('new', 0)} new / {res.get('total_found', 0)} found")
 
     console.print("\n[bold green]Discovery complete. Check status with `scoutpilot status`.[/bold green]\n")
 

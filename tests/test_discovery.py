@@ -26,6 +26,12 @@ from scoutpilot.discovery.remote_boards import (
     fetch_remote_com_jobs,
     fetch_weworkremotely_jobs,
 )
+from scoutpilot.discovery.targetjobs import (
+    _title_from_slug,
+    _is_tech_role_strict,
+    fetch_targetjobs_urls,
+    fetch_targetjobs_jobs,
+)
 from scoutpilot.discovery.schemes_and_training import (
     parse_github_jobs_markdown,
     run_schemes_discovery,
@@ -284,6 +290,65 @@ def test_fetch_weworkremotely_jobs_mocked():
         assert jobs[0]["company"] == "Acme"
         assert jobs[0]["location"] == "Anywhere in the World (Remote)"
         assert "Build backend services with Python." in jobs[0]["full_description"]
+
+
+# ── targetjobs.co.uk Harvester Tests ────────────────────────────────────────
+
+def test_title_from_slug():
+    assert _title_from_slug("graduate-credit-analyst-214082".rsplit("-", 1)[0]) == "Graduate Credit Analyst"
+    assert _title_from_slug("ai-engineer-uk") == "AI Engineer UK"
+
+
+def test_is_tech_role_strict_excludes_non_software_engineering():
+    # Real slugs measured live 2026-09-22 -- bare "engineer"/"graduate" is
+    # not enough on a general (non-tech-specific) board.
+    assert _is_tech_role_strict("Graduate Software Engineer") is True
+    assert _is_tech_role_strict("Graduate Data Engineer Databricks Pyspark") is True
+    assert _is_tech_role_strict("Fuel Systems Fluid Mechanical Engineering Placement") is False
+    assert _is_tech_role_strict("Graduate Credit Analyst") is False
+    assert _is_tech_role_strict("Graduate Trainee Social Worker") is False
+    assert _is_tech_role_strict("Graduate Landscape Architect") is False
+    assert _is_tech_role_strict("Complex Warheads Lethality Engineer Summer Placement") is False
+
+
+def test_fetch_targetjobs_urls_parses_sitemap_index_and_sitemap():
+    index_xml = (
+        '<?xml version="1.0" encoding="UTF-8"?>'
+        '<sitemapindex xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">'
+        '<sitemap><loc>https://targetjobs.co.uk/sitemap-0.xml</loc></sitemap>'
+        '</sitemapindex>'
+    )
+    sitemap_xml = (
+        '<?xml version="1.0" encoding="UTF-8"?>'
+        '<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">'
+        '<url><loc>https://targetjobs.co.uk/jobs/graduate-software-engineer-214082</loc></url>'
+        '<url><loc>https://targetjobs.co.uk/graduate-jobs/engineering</loc></url>'
+        '</urlset>'
+    )
+    with patch("scoutpilot.discovery.targetjobs._http_get_text", side_effect=[index_xml, sitemap_xml]):
+        urls = fetch_targetjobs_urls()
+    assert urls == ["https://targetjobs.co.uk/jobs/graduate-software-engineer-214082"]
+
+
+def test_fetch_targetjobs_jobs_filters_and_has_no_full_description():
+    index_xml = (
+        '<sitemapindex xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">'
+        '<sitemap><loc>https://targetjobs.co.uk/sitemap-0.xml</loc></sitemap>'
+        '</sitemapindex>'
+    )
+    sitemap_xml = (
+        '<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">'
+        '<url><loc>https://targetjobs.co.uk/jobs/graduate-software-engineer-214082</loc></url>'
+        '<url><loc>https://targetjobs.co.uk/jobs/graduate-credit-analyst-214083</loc></url>'
+        '</urlset>'
+    )
+    with patch("scoutpilot.discovery.targetjobs._http_get_text", side_effect=[index_xml, sitemap_xml]):
+        jobs = fetch_targetjobs_jobs()
+    assert len(jobs) == 1
+    assert jobs[0]["title"] == "Graduate Software Engineer"
+    assert jobs[0]["channel"] == "targetjobs"
+    assert "full_description" not in jobs[0]   # shallow row -- detail.py's
+    # Playwright fallback fills it in (full JD is client-rendered)
 
 
 # ── Hacker News Harvester Tests ─────────────────────────────────────────────
