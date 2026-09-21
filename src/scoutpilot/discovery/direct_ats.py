@@ -7,6 +7,7 @@ Extracts complete job descriptions, location metadata, and application URLs dire
 import json
 import logging
 import re
+import xml.etree.ElementTree as ET
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 import urllib.request
@@ -109,6 +110,18 @@ def _http_get_json(url: str, timeout: int = 15) -> dict | list | None:
             if response.status == 200:
                 data = response.read().decode("utf-8", errors="replace")
                 return json.loads(data)
+    except Exception as e:
+        log.debug("HTTP GET failed for %s: %s", url, e)
+    return None
+
+
+def _http_get_text(url: str, timeout: int = 15) -> str | None:
+    """Helper to fetch raw text (XML feeds, etc.) from a public endpoint."""
+    req = urllib.request.Request(url, headers={"User-Agent": UA, "Accept": "*/*"})
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as response:
+            if response.status == 200:
+                return response.read().decode("utf-8", errors="replace")
     except Exception as e:
         log.debug("HTTP GET failed for %s: %s", url, e)
     return None
@@ -251,6 +264,197 @@ def fetch_lever_jobs(board_name: str, company_name: str | None = None) -> list[d
             "full_description": content_desc,
             "application_url": item.get("applyUrl") or job_url,
             "site": f"Lever ({company})",
+            "opportunity_type": opp_type,
+            "channel": "direct_ats",
+            "deadline": None,
+            "funding_status": "standard_salary",
+        })
+    return results
+
+
+# ── SmartRecruiters API ─────────────────────────────────────────────────
+# Endpoint: https://api.smartrecruiters.com/v1/companies/{companyIdentifier}/postings
+# `companyIdentifier` is NOT the display name -- it's whatever slug the
+# employer's career site actually uses (case-insensitive), and the API
+# returns HTTP 200 + an empty result for a wrong slug just as readily as for
+# a company with zero current openings, so a guessed identifier can't be
+# trusted without checking the *company* endpoint too (404s on a truly
+# invalid slug). Confirmed live 2026-09-21 against companyIdentifier
+# "smartrecruiters" (SmartRecruiters' own board).
+
+def fetch_smartrecruiters_jobs(company_id: str, company_name: str | None = None) -> list[dict]:
+    company = company_name or company_id
+    data = _http_get_json(f"https://api.smartrecruiters.com/v1/companies/{company_id}/postings?limit=100")
+    if not data or not isinstance(data, dict):
+        return []
+
+    results = []
+    for item in data.get("content", []):
+        posting_id = item.get("id")
+        if not posting_id:
+            continue
+        job_url = f"https://jobs.smartrecruiters.com/{company_id}/{posting_id}"
+
+        title = item.get("name", "")
+        location_obj = item.get("location", {}) or {}
+        location_name = ", ".join(filter(None, [location_obj.get("city"), location_obj.get("country")]))
+        # The postings-list endpoint doesn't carry the full JD -- that lives
+        # behind a second per-posting request this harvester doesn't make
+        # (same shallow-row tradeoff as jobspy.py); left for enrichment.
+        if not is_relevant_tech_role(title):
+            continue
+
+        opp_type = infer_opportunity_type(title)
+        results.append({
+            "url": job_url,
+            "title": title,
+            "company": company,
+            "location": location_name or "Remote / Unspecified",
+            "description": f"{title} at {company}. Location: {location_name}",
+            "application_url": job_url,
+            "site": f"SmartRecruiters ({company})",
+            "opportunity_type": opp_type,
+            "channel": "direct_ats",
+            "deadline": None,
+            "funding_status": "standard_salary",
+        })
+    return results
+
+
+# ── Pinpoint API ───────────────────────────────────────────────────────────
+# Endpoint: https://{board}.pinpointhq.com/postings.json -- unauthenticated,
+# full JD + location + deadline in one response. Confirmed live 2026-09-21
+# against board "cazoo".
+
+def fetch_pinpoint_jobs(board_name: str, company_name: str | None = None) -> list[dict]:
+    company = company_name or board_name.capitalize()
+    data = _http_get_json(f"https://{board_name}.pinpointhq.com/postings.json")
+    if not data or not isinstance(data, dict):
+        return []
+
+    results = []
+    for item in data.get("data", []):
+        job_url = item.get("url")
+        if not job_url:
+            continue
+
+        title = item.get("title", "")
+        description = item.get("description") or ""
+        if not is_relevant_tech_role(title, description):
+            continue
+
+        location_obj = item.get("location") or {}
+        location_name = location_obj.get("name") or location_obj.get("city") or ""
+        workplace_type = item.get("workplace_type_text") or ""
+        if workplace_type and "remote" in workplace_type.lower() and "remote" not in location_name.lower():
+            location_name = f"{location_name} (Remote)" if location_name else "Remote"
+
+        opp_type = infer_opportunity_type(title, description)
+
+        results.append({
+            "url": job_url,
+            "title": title,
+            "company": company,
+            "location": location_name or "Remote / Unspecified",
+            "description": f"{title} at {company}. Location: {location_name}",
+            "full_description": description,
+            "application_url": job_url,
+            "site": f"Pinpoint ({company})",
+            "opportunity_type": opp_type,
+            "channel": "direct_ats",
+            "deadline": item.get("deadline_at"),
+            "funding_status": "standard_salary",
+        })
+    return results
+
+
+# ── Personio XML feed ───────────────────────────────────────────────────
+# Endpoint: https://{board}.jobs.personio.de/xml -- a syndication feed
+# (Personio's own "workzag-jobs" schema), unauthenticated. Confirmed live
+# 2026-09-21 against board "personio" (Personio's own board); an invalid
+# board 307-redirects to the personio.com marketing site instead of
+# returning XML, which _http_get_text's plain-text return can't tell apart
+# from a real empty feed -- callers should treat zero results here with
+# more suspicion than the JSON-API fetchers above.
+
+def fetch_personio_jobs(board_name: str, company_name: str | None = None) -> list[dict]:
+    company = company_name or board_name.capitalize()
+    xml_text = _http_get_text(f"https://{board_name}.jobs.personio.de/xml")
+    if not xml_text:
+        return []
+    try:
+        root = ET.fromstring(xml_text)
+    except ET.ParseError as e:
+        log.debug("Personio feed for %s failed to parse: %s", board_name, e)
+        return []
+
+    results = []
+    for position in root.findall(".//position"):
+        posting_id = position.findtext("id")
+        if not posting_id:
+            continue
+        job_url = f"https://{board_name}.jobs.personio.de/job/{posting_id}"
+
+        title = (position.findtext("name") or "").strip()
+        office = (position.findtext("office") or "").strip()
+        jd_parts = [
+            (position.findtext(tag) or "")
+            for tag in ("jobDescriptions", "yourProfile", "whatWeOffer")
+        ]
+        description = "\n\n".join(p for p in jd_parts if p).strip()
+        if not is_relevant_tech_role(title, description):
+            continue
+
+        opp_type = infer_opportunity_type(title, description)
+        results.append({
+            "url": job_url,
+            "title": title,
+            "company": company,
+            "location": office or "Remote / Unspecified",
+            "description": f"{title} at {company}. Location: {office}",
+            "full_description": description or None,
+            "application_url": job_url,
+            "site": f"Personio ({company})",
+            "opportunity_type": opp_type,
+            "channel": "direct_ats",
+            "deadline": None,
+            "funding_status": "standard_salary",
+        })
+    return results
+
+
+# ── Teamtailor JSON Feed ─────────────────────────────────────────────────
+# Endpoint: https://{board}.teamtailor.com/jobs.json -- a JSON Feed
+# (jsonfeed.org: top-level `items`, not `jobs`/`data`), unauthenticated.
+# Confirmed live 2026-09-21 against board "storytel".
+
+def fetch_teamtailor_jobs(board_name: str, company_name: str | None = None) -> list[dict]:
+    company = company_name or board_name.capitalize()
+    data = _http_get_json(f"https://{board_name}.teamtailor.com/jobs.json")
+    if not data or not isinstance(data, dict):
+        return []
+
+    results = []
+    for item in data.get("items", []):
+        job_url = item.get("url") or item.get("id")
+        if not job_url:
+            continue
+
+        title = item.get("title", "")
+        summary = item.get("summary") or item.get("content_text") or ""
+        if not is_relevant_tech_role(title, summary):
+            continue
+
+        opp_type = infer_opportunity_type(title, summary)
+        results.append({
+            "url": job_url,
+            "title": title,
+            "company": company,
+            "location": "Remote / Unspecified",
+            "description": f"{title} at {company}.",
+            "full_description": summary or None,
+            "application_url": job_url,
+            "site": f"Teamtailor ({company})",
             "opportunity_type": opp_type,
             "channel": "direct_ats",
             "deadline": None,

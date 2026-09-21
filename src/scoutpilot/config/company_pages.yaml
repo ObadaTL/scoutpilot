@@ -43,6 +43,9 @@ company_pages:
     - name: "Graphcore"
       location: "Bristol / London, UK"
       ats: {type: greenhouse, board: "graphcore"}
+    - name: "Cazoo"
+      location: "London, UK"
+      ats: {type: pinpoint, board: "cazoo"}
     - name: "ComplyAdvantage"
       location: "London, UK / Remote"
       ats: {type: greenhouse, board: "complyadvantage"}
@@ -73,6 +76,18 @@ company_pages:
     - name: "Capgemini UK"
       location: "UK Wide"
       careers_url: "https://www.capgemini.com/gb-en/careers/"
+
+  # Fetchers also exist (discovery/direct_ats.py) for smartrecruiters,
+  # personio, and teamtailor -- proven live 2026-09-21 against real boards
+  # (companyIdentifier "smartrecruiters", board "personio", board
+  # "storytel"), but none of those three is a UK/candidate-relevant
+  # employer, so none is added to the registry here. Unlike greenhouse/
+  # ashby/lever, none of these three platforms uses a guessable, shared
+  # subdomain scheme (Pinpoint does: "{board}.pinpointhq.com") -- the
+  # correct board/companyIdentifier for a specific real employer has to be
+  # read off that employer's own career-page network calls, not guessed.
+  # Add an entry once one is found; the fetcher is already wired into
+  # _FETCHERS above.
 
   # ── DB-seed map: jobs.company value -> ATS board ──────────────────
   # Employers the pipeline has already discovered, re-harvested from source

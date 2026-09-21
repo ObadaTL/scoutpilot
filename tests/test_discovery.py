@@ -11,12 +11,20 @@ from scoutpilot.discovery.direct_ats import (
     fetch_greenhouse_jobs,
     fetch_ashby_jobs,
     fetch_lever_jobs,
+    fetch_smartrecruiters_jobs,
+    fetch_pinpoint_jobs,
+    fetch_personio_jobs,
+    fetch_teamtailor_jobs,
     run_direct_ats_discovery,
 )
 from scoutpilot.discovery.hacker_news import (
     parse_hn_comment,
     _clean_hn_html,
     run_hn_discovery,
+)
+from scoutpilot.discovery.remote_boards import (
+    fetch_remote_com_jobs,
+    fetch_weworkremotely_jobs,
 )
 from scoutpilot.discovery.schemes_and_training import (
     parse_github_jobs_markdown,
@@ -129,6 +137,153 @@ def test_fetch_lever_jobs_mocked():
         assert len(jobs) == 1
         assert jobs[0]["title"] == "Software Engineering Trainee"
         assert jobs[0]["opportunity_type"] == "graduate_scheme"
+
+
+def test_fetch_smartrecruiters_jobs_mocked():
+    # Shape confirmed live 2026-09-21 against
+    # api.smartrecruiters.com/v1/companies/smartrecruiters/postings
+    sample_response = {
+        "totalFound": 1,
+        "content": [
+            {
+                "id": "744000148454651",
+                "name": "Graduate Software Engineer",
+                "location": {"city": "London", "country": "uk"},
+            }
+        ],
+    }
+    with patch("scoutpilot.discovery.direct_ats._http_get_json", return_value=sample_response):
+        jobs = fetch_smartrecruiters_jobs("acme", "Acme")
+        assert len(jobs) == 1
+        assert jobs[0]["title"] == "Graduate Software Engineer"
+        assert jobs[0]["company"] == "Acme"
+        assert jobs[0]["url"] == "https://jobs.smartrecruiters.com/acme/744000148454651"
+        assert jobs[0]["opportunity_type"] == "graduate_scheme"
+        assert "full_description" not in jobs[0]   # shallow row -- enrichment fills it in
+
+
+def test_fetch_pinpoint_jobs_mocked():
+    # Shape confirmed live 2026-09-21 against cazoo.pinpointhq.com/postings.json
+    sample_response = {
+        "data": [
+            {
+                "title": "Junior Backend Engineer",
+                "url": "https://cazoo.pinpointhq.com/en/postings/abc123",
+                "description": "Build backend services with Python.",
+                "location": {"name": "London"},
+                "workplace_type_text": "Remote",
+                "deadline_at": "2026-12-01",
+            }
+        ]
+    }
+    with patch("scoutpilot.discovery.direct_ats._http_get_json", return_value=sample_response):
+        jobs = fetch_pinpoint_jobs("cazoo", "Cazoo")
+        assert len(jobs) == 1
+        assert jobs[0]["title"] == "Junior Backend Engineer"
+        assert jobs[0]["company"] == "Cazoo"
+        assert "Remote" in jobs[0]["location"]
+        assert jobs[0]["full_description"] == "Build backend services with Python."
+        assert jobs[0]["deadline"] == "2026-12-01"
+
+
+def test_fetch_personio_jobs_mocked():
+    # Schema confirmed live 2026-09-21 against personio.jobs.personio.de/xml
+    sample_xml = """<?xml version="1.0" encoding="UTF-8"?>
+<workzag-jobs>
+<position>
+    <id>1834171</id>
+    <office>Munich</office>
+    <name>Graduate Software Engineer</name>
+    <jobDescriptions>Build data pipelines.</jobDescriptions>
+    <yourProfile>Python experience.</yourProfile>
+    <whatWeOffer>Great benefits.</whatWeOffer>
+</position>
+</workzag-jobs>"""
+    with patch("scoutpilot.discovery.direct_ats._http_get_text", return_value=sample_xml):
+        jobs = fetch_personio_jobs("acme", "Acme")
+        assert len(jobs) == 1
+        assert jobs[0]["title"] == "Graduate Software Engineer"
+        assert jobs[0]["company"] == "Acme"
+        assert jobs[0]["location"] == "Munich"
+        assert jobs[0]["url"] == "https://acme.jobs.personio.de/job/1834171"
+        assert "Build data pipelines." in jobs[0]["full_description"]
+        assert jobs[0]["opportunity_type"] == "graduate_scheme"
+
+    with patch("scoutpilot.discovery.direct_ats._http_get_text", return_value=None):
+        assert fetch_personio_jobs("dead-board") == []
+
+
+def test_fetch_teamtailor_jobs_mocked():
+    # JSON Feed shape (jsonfeed.org) confirmed live 2026-09-21 against
+    # storytel.teamtailor.com/jobs.json
+    sample_response = {
+        "version": "https://jsonfeed.org/version/1",
+        "title": "Acme",
+        "items": [
+            {
+                "title": "Senior Data Engineer",
+                "url": "https://acme.teamtailor.com/jobs/123-senior-data-engineer",
+                "summary": "Own the data platform.",
+            }
+        ],
+    }
+    with patch("scoutpilot.discovery.direct_ats._http_get_json", return_value=sample_response):
+        jobs = fetch_teamtailor_jobs("acme", "Acme")
+        assert len(jobs) == 1
+        assert jobs[0]["title"] == "Senior Data Engineer"
+        assert jobs[0]["full_description"] == "Own the data platform."
+
+
+# ── Remote Boards Harvester Tests ───────────────────────────────────────────
+
+def test_fetch_remote_com_jobs_mocked():
+    # Row shape confirmed live 2026-09-21 against remote.com/jobs/all?page=1
+    page1_html = (
+        'href="/jobs/acme-c1/junior-software-engineer-j1"><span>Junior Software Engineer</span>'
+        '</a><span>Acme</span>'
+        'href="/jobs/acme-c1/sales-manager-j2"><span>Sales Manager</span></a><span>Acme</span>'
+    )
+    with patch("scoutpilot.discovery.remote_boards._http_get_text", side_effect=[page1_html, None]):
+        jobs = fetch_remote_com_jobs(pages=3)
+        assert len(jobs) == 1   # Sales Manager filtered out by is_relevant_tech_role
+        assert jobs[0]["title"] == "Junior Software Engineer"
+        assert jobs[0]["company"] == "Acme"
+        assert jobs[0]["url"] == "https://remote.com/jobs/acme-c1/junior-software-engineer-j1"
+        assert "full_description" not in jobs[0]   # shallow row -- enrichment fills it in
+
+
+def test_fetch_remote_com_jobs_dedupes_and_stops_on_empty_page():
+    page1_html = 'href="/jobs/acme-c1/junior-software-engineer-j1"><span>Junior Software Engineer</span></a><span>Acme</span>'
+    with patch("scoutpilot.discovery.remote_boards._http_get_text", side_effect=[page1_html, page1_html, ""]):
+        jobs = fetch_remote_com_jobs(pages=5)
+        assert len(jobs) == 1   # same URL on "page 2" -> deduped, then empty page stops the loop
+
+
+def test_fetch_weworkremotely_jobs_mocked():
+    # Item shape confirmed live 2026-09-21 against
+    # weworkremotely.com/categories/remote-back-end-programming-jobs.rss
+    sample_rss = """<?xml version="1.0" encoding="UTF-8"?>
+<rss version="2.0"><channel>
+<item>
+  <title>Acme: Junior Backend Engineer</title>
+  <link>https://weworkremotely.com/remote-jobs/acme-junior-backend-engineer</link>
+  <region>Anywhere in the World</region>
+  <description>&lt;p&gt;Build backend services with Python.&lt;/p&gt;</description>
+</item>
+<item>
+  <title>Acme: Sales Manager</title>
+  <link>https://weworkremotely.com/remote-jobs/acme-sales-manager</link>
+  <region>USA Only</region>
+  <description>&lt;p&gt;Own the sales pipeline.&lt;/p&gt;</description>
+</item>
+</channel></rss>"""
+    with patch("scoutpilot.discovery.remote_boards._http_get_text", return_value=sample_rss):
+        jobs = fetch_weworkremotely_jobs(categories=["remote-back-end-programming-jobs"])
+        assert len(jobs) == 1   # Sales Manager filtered out by is_relevant_tech_role
+        assert jobs[0]["title"] == "Junior Backend Engineer"
+        assert jobs[0]["company"] == "Acme"
+        assert jobs[0]["location"] == "Anywhere in the World (Remote)"
+        assert "Build backend services with Python." in jobs[0]["full_description"]
 
 
 # ── Hacker News Harvester Tests ─────────────────────────────────────────────

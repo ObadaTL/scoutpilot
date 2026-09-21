@@ -22,6 +22,10 @@ from scoutpilot.discovery.direct_ats import (
     fetch_ashby_jobs,
     fetch_greenhouse_jobs,
     fetch_lever_jobs,
+    fetch_personio_jobs,
+    fetch_pinpoint_jobs,
+    fetch_smartrecruiters_jobs,
+    fetch_teamtailor_jobs,
 )
 
 log = logging.getLogger(__name__)
@@ -30,6 +34,10 @@ _FETCHERS = {
     "greenhouse": fetch_greenhouse_jobs,
     "ashby": fetch_ashby_jobs,
     "lever": fetch_lever_jobs,
+    "smartrecruiters": fetch_smartrecruiters_jobs,
+    "pinpoint": fetch_pinpoint_jobs,
+    "personio": fetch_personio_jobs,
+    "teamtailor": fetch_teamtailor_jobs,
 }
 
 CHANNEL = "company_pages"
