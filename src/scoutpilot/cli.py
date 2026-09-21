@@ -495,6 +495,33 @@ def archive_discovery(
     )
 
 
+@app.command(name="backfill-cohort")
+def backfill_cohort(
+    where: Optional[str] = typer.Option(
+        None, "--where", help="SQL WHERE fragment scoping which existing rows to check, "
+        "e.g. 'fit_score >= 7'. Omit to check the whole table."
+    ),
+) -> None:
+    """Re-run cohort/start-date inference against rows that already exist
+    in the DB but never had it run on them.
+
+    cohort_start is only ever computed at discovery/insert time -- a row
+    discovered before that feature shipped (or before an inference
+    improvement landed) keeps cohort_start=NULL forever otherwise. Only
+    ever fills in a currently-NULL cohort_start; nothing is deleted, no
+    existing value is overwritten. Undo instructions are written to
+    ~/.applypilot/last_cohort_backfill.txt.
+    """
+    _bootstrap()
+    from scoutpilot.database import get_connection, backfill_cohort_start
+
+    res = backfill_cohort_start(get_connection(), where_extra=where)
+    console.print(
+        f"[bold green]{res['updated']} of {res['checked']}[/bold green] checked rows got a cohort_start.\n"
+        f"Undo instructions: {res['note_path']}"
+    )
+
+
 @app.command(name="refresh-prefilter")
 def refresh_prefilter_cmd() -> None:
     """Re-apply the ingest pre-filter to the live unscored backlog.

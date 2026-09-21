@@ -14,6 +14,7 @@ from scoutpilot.database import (
     scoring_queue,
     archive_discovery_results,
     unarchive_discovery_results,
+    backfill_cohort_start,
     close_connection,
 )
 
@@ -54,6 +55,33 @@ def test_infer_cohort_start_misses(text):
 
 def test_infer_cohort_start_from_title():
     assert infer_cohort_start("Graduate Engineer - September 2026 start", None) == "2026-09"
+
+
+@pytest.mark.parametrize("title,expected", [
+    ("AGGP2027 - Graduate Software Engineer", "2027"),          # year glued to letters
+    ("Graduate Programme 2027: Software Engineer (Android)", "2027"),  # keyword before, no adjacency
+    ("2027 BNY Internship Program -Engineering (Data Science)", "2027"),
+])
+def test_infer_cohort_start_bare_year_in_title(title, expected):
+    assert infer_cohort_start(title, None) == expected
+
+
+def test_bare_year_fallback_is_title_only_not_description():
+    # A bare year in the DESCRIPTION must not trigger this fallback -- only
+    # the keyword-adjacent patterns should fire there (see misses above).
+    assert infer_cohort_start("Software Engineer", "We were founded in 2019 and have grown fast") is None
+
+
+def test_start_labeled_date_wins_over_unrelated_earlier_month_year():
+    # Real JD shape (Revolut): an application-deadline month+year appears
+    # BEFORE the actual "Programme start" date in the text. The deadline
+    # must not win just because .search() finds it first.
+    desc = (
+        "Key dates: Applications open from May 2026. Recruitment process: "
+        "July-December 2026. Programme start: early 2027 (January-June) or "
+        "late 2027 (July-December)."
+    )
+    assert infer_cohort_start("Graduate Programme 2027: Software Engineer", desc) == "2027"
 
 
 def test_year_window_rejects_far_future():
@@ -213,6 +241,34 @@ def test_cohort_filter_and_queue_order(db):
     assert q == ["imm", "y26", "none"]
     assert "y28" not in q
     assert {j["url"] for j in get_jobs_by_stage(db, stage="pending_score")} == {"imm", "y26", "none"}
+
+
+def test_backfill_cohort_start(db, tmp_path):
+    store_jobs(db, [
+        {"url": "old-2027", "title": "AGGP2027 - Graduate Software Engineer", "location": "UK",
+         "full_description": "x" * 300},
+        {"url": "old-none", "title": "Software Engineer", "location": "UK", "full_description": "x" * 300},
+    ], site="B", strategy="t")
+    # Simulate a pre-feature row: cohort_start never got a chance to run.
+    db.execute("UPDATE jobs SET cohort_start = NULL")
+    db.commit()
+
+    note = tmp_path / "backfill.txt"
+    res = backfill_cohort_start(db, note_path=note)
+    assert res["checked"] == 2
+    assert res["updated"] == 1   # only old-2027 (bare-year title fallback) gets one
+
+    got = {r["url"]: r["cohort_start"] for r in db.execute("SELECT url, cohort_start FROM jobs").fetchall()}
+    assert got["old-2027"] == "2027"
+    assert got["old-none"] is None
+
+    text = note.read_text()
+    assert "UPDATE jobs SET cohort_start = NULL WHERE url IN" in text
+    assert "'old-2027'" in text
+
+    # scoped where_extra + idempotent (never overwrites an existing value)
+    res2 = backfill_cohort_start(db, where_extra="url = 'old-2027'", note_path=tmp_path / "n2.txt")
+    assert res2["checked"] == 0   # cohort_start is no longer NULL for it
 
 
 def test_cohort_horizon_disabled_restores_old_behavior(db, monkeypatch, tmp_path):

@@ -1416,6 +1416,64 @@ def scoring_queue(conn: sqlite3.Connection | None = None,
     return urls[:limit] if limit and limit > 0 else urls
 
 
+_COHORT_BACKFILL_NOTE_PATH = APP_DIR / "last_cohort_backfill.txt"
+
+
+def backfill_cohort_start(conn: sqlite3.Connection | None = None,
+                          where_extra: str | None = None,
+                          note_path: Path | str | None = None) -> dict:
+    """Run discovery.cohort.infer_cohort_start against rows that already
+    exist in the DB but have never had it run on them.
+
+    cohort_start is only ever computed inside store_jobs(), at INSERT time
+    -- a row discovered before that feature shipped (or before an
+    inference improvement landed) keeps cohort_start=NULL forever unless
+    something re-runs inference against it. This does that, for existing
+    rows only (WHERE cohort_start IS NULL), never overwriting a value
+    that's already set.
+
+    `where_extra` scopes which existing rows to touch (e.g.
+    "fit_score >= 7"); omit it to backfill the whole table. Nothing is
+    deleted and no row not matching a positive re-inference is touched.
+
+    Writes the list of updated URLs to `note_path`
+    (~/.applypilot/last_cohort_backfill.txt by default) with the one-line
+    undo command.
+
+    Returns {"checked": int, "updated": int, "note_path": str}.
+    """
+    if conn is None:
+        conn = get_connection()
+    from scoutpilot.discovery.cohort import infer_cohort_start
+
+    where = "cohort_start IS NULL"
+    if where_extra:
+        where += f" AND ({where_extra})"
+    rows = conn.execute(
+        f"SELECT url, title, full_description, description FROM jobs WHERE {where}"
+    ).fetchall()
+
+    updated_urls: list[str] = []
+    for r in rows:
+        guess = infer_cohort_start(r["title"], r["full_description"] or r["description"])
+        if guess:
+            conn.execute("UPDATE jobs SET cohort_start = ? WHERE url = ?", (guess, r["url"]))
+            updated_urls.append(r["url"])
+    conn.commit()
+
+    path = Path(note_path) if note_path else _COHORT_BACKFILL_NOTE_PATH
+    urls_list = "\n".join(f"'{u}'" for u in updated_urls)
+    path.write_text(
+        f"# Cohort backfill {datetime.now(timezone.utc).isoformat()}\n"
+        f"# {len(updated_urls)} of {len(rows)} checked rows got a cohort_start "
+        f"(where_extra={where_extra!r}). Nothing was deleted, no existing value overwritten.\n"
+        f"# To undo, run this against {DB_PATH}:\n"
+        f"UPDATE jobs SET cohort_start = NULL WHERE url IN (\n{urls_list}\n);\n",
+        encoding="utf-8",
+    )
+    return {"checked": len(rows), "updated": len(updated_urls), "note_path": str(path)}
+
+
 _ARCHIVE_NOTE_PATH = APP_DIR / "last_discovery_archive.txt"
 
 

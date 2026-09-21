@@ -53,6 +53,32 @@ _KEYWORD_YEAR_RE = re.compile(
     r"\b(?:intake|cohort|start(?:ing|s)?|commencing|begins?|entry)\b[^.\n]{0,25}?\b(20\d\d)\b",
     re.IGNORECASE,
 )
+# Highest-priority pair: the word "start" itself (not just "intake"/
+# "cohort"/etc.) sitting close to a month+year or bare year. Checked BEFORE
+# the generic _MONTH_YEAR_RE below because a posting can name an unrelated
+# month+year earlier in the text -- an application-deadline date, not a
+# start date -- and .search() takes the first match it finds regardless of
+# relevance. Confirmed live: "Applications: open from May 2026 ... "
+# appeared before "Programme start: early 2027" in the same JD, and the
+# generic month+year check alone returned the deadline's year, not the
+# actual start year the title itself already named ("Programme 2027").
+_START_MONTH_YEAR_RE = re.compile(
+    rf"\bstart[a-z]*\b[^.\n]{{0,30}}?\b({_MONTH_ALT}|{_SEASON_ALT})\.?\s+(20\d\d)\b",
+    re.IGNORECASE,
+)
+_START_YEAR_RE = re.compile(r"\bstart[a-z]*\b[^.\n]{0,30}?\b(20\d\d)\b", re.IGNORECASE)
+# A bare trusted-window year sitting in the TITLE on its own, with no
+# keyword next to it and no word boundary required on its left (recruiter
+# programme codes glue the year onto letters: "AGGP2027 - Graduate
+# Software Engineer"). Title-only, not description -- a description's
+# random years (founding dates, copyright notices, "3+ years experience")
+# are exactly the noise _YEAR_KEYWORD_RE/_KEYWORD_YEAR_RE already guard
+# against by requiring a keyword; a bare year in a short recruiter-authored
+# title ("Graduate Programme 2027: Software Engineer", "2027 BNY
+# Internship Program") is reliable enough on its own. Same title-only
+# reasoning as the experience_years prefilter's default scan (config/
+# prefilter.yaml) -- body-scanning caught boilerplate there too.
+_BARE_YEAR_RE = re.compile(r"(?<!\d)(20\d\d)(?!\d)")
 
 
 def infer_cohort_start(title: str | None,
@@ -77,6 +103,20 @@ def infer_cohort_start(title: str | None,
     def _ok(y: int) -> bool:
         return lo <= y <= hi
 
+    m = _START_MONTH_YEAR_RE.search(text)
+    if m:
+        y = int(m.group(2))
+        if _ok(y):
+            token = m.group(1).lower()
+            month = _MONTHS.get(token) or _SEASONS.get(token)
+            return f"{y:04d}-{month:02d}"
+
+    m = _START_YEAR_RE.search(text)
+    if m:
+        y = int(m.group(1))
+        if _ok(y):
+            return f"{y:04d}"
+
     m = _MONTH_YEAR_RE.search(text)
     if m:
         y = int(m.group(2))
@@ -87,6 +127,13 @@ def infer_cohort_start(title: str | None,
 
     for rx in (_YEAR_KEYWORD_RE, _KEYWORD_YEAR_RE):
         m = rx.search(text)
+        if m:
+            y = int(m.group(1))
+            if _ok(y):
+                return f"{y:04d}"
+
+    if title:
+        m = _BARE_YEAR_RE.search(title)
         if m:
             y = int(m.group(1))
             if _ok(y):
