@@ -524,6 +524,7 @@ def run_scoring(
     opp_type: str | None = None,
     keywords: str | list[str] | None = None,
     cohort: str | None = None,
+    sample: bool = True,
 ) -> dict:
     """Score unscored jobs that have full descriptions.
 
@@ -533,6 +534,9 @@ def run_scoring(
         channel: Optional channel filter (e.g. 'direct_ats', 'hacker_news', 'graduate_schemes').
         opp_type: Optional opportunity type filter (e.g. 'graduate_scheme', 'funded_training').
         keywords: Optional keyword filter (e.g. 'AI, python, signal processing, machine learning').
+        sample: On the default (no channel/opp_type/keywords/cohort) path, whether
+            low-yield sources are sampled (see database.scoring_queue). False
+            scores the whole eligible backlog instead of ~1-in-6 of it.
 
     Returns:
         {"scored": int, "errors": int, "elapsed": float, "distribution": list}
@@ -561,7 +565,7 @@ def run_scoring(
         # Default run: order the backlog by each source's live hit rate, so
         # high-yield sources are scored first and low-yield ones are sampled
         # (see database.scoring_queue).
-        urls = scoring_queue(conn=conn, limit=limit)
+        urls = scoring_queue(conn=conn, limit=limit, sample=sample)
         if urls:
             placeholders = ",".join("?" for _ in urls)
             fetched = conn.execute(

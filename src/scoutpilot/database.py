@@ -1325,7 +1325,8 @@ def source_hit_rates(conn: sqlite3.Connection | None = None,
 
 def scoring_queue(conn: sqlite3.Connection | None = None,
                   limit: int = 0,
-                  cfg: dict | None = None) -> list[str]:
+                  cfg: dict | None = None,
+                  sample: bool = True) -> list[str]:
     """Ordered list of job URLs to score next, highest-yield source first.
 
     Ordering: high-yield sources (trusted history, hit rate above ``floor``)
@@ -1335,6 +1336,12 @@ def scoring_queue(conn: sqlite3.Connection | None = None,
     exhausting a source that doesn't produce, while still feeding it enough
     new data points to keep its rate honest. Within every bucket, the
     candidate's profile-domain title ordering breaks ties.
+
+    ``sample=False`` includes every low-yield row instead of sampling it --
+    still ordered behind the high-yield and unknown buckets, just not
+    dropped. For an explicit "score the whole eligible backlog" request,
+    where under-delivering silently would be worse than the LLM cost of
+    scoring a low-yield source in full.
 
     Reads only ``url``/``site``/``title`` for the pending rows (never the
     descriptions) so it stays cheap on a large backlog.
@@ -1403,8 +1410,8 @@ def scoring_queue(conn: sqlite3.Connection | None = None,
         elif not info["trusted"]:
             bucket = 1  # unknown
         else:
-            bucket = 2  # low yield -> sampled
-            if _url_bucket(r["url"], divisor) != 0:
+            bucket = 2  # low yield -> sampled (unless sample=False)
+            if sample and _url_bucket(r["url"], divisor) != 0:
                 continue
         c_rank = cohort_rank(r["cohort_start"], r["deadline"])
         ranked.append(

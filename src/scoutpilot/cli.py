@@ -361,6 +361,7 @@ def score(
     keywords: Optional[str] = typer.Option(None, "--keywords", "-k", help="Filter scoring to specific keywords (e.g. 'ai, python, signal processing, machine learning')."),
     cohort: Optional[str] = typer.Option(None, "--cohort", help="Filter by start date/cohort: 'immediate', a year like '2026', or 'future'."),
     rescore: bool = typer.Option(False, "--rescore", help="Re-score already scored jobs."),
+    no_sample: bool = typer.Option(False, "--no-sample", help="Score the whole eligible backlog instead of sampling ~1-in-6 of low-yield sources."),
 ) -> None:
     """Score unscored jobs with the LLM in prioritized, manageable batches."""
     _bootstrap()
@@ -398,6 +399,7 @@ def score(
         opp_type=opp_type,
         keywords=keywords,
         cohort=cohort,
+        sample=not no_sample,
     )
 
     console.print(f"\n[bold green]Scored {result.get('scored', 0)} jobs in {result.get('elapsed', 0.0):.1f}s ({result.get('errors', 0)} errors).[/bold green]\n")

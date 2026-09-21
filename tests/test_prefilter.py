@@ -317,6 +317,24 @@ def test_scoring_queue_orders_by_yield_and_samples_low(db):
     assert q.index(new[-1]) < q.index(bad[0])
 
 
+def test_scoring_queue_sample_false_includes_low_yield_in_full(db):
+    for i in range(12):
+        _add_scored(db, f"h{i}", "GoodBoard", 8 if i < 6 else 3)
+    for i in range(20):
+        _add_scored(db, f"l{i}", "BadBoard", 8 if i == 0 else 2)
+    db.commit()
+
+    pend = [{"url": f"b{i}", "title": "Engineer", "location": "UK", "full_description": "x" * 300}
+            for i in range(10)]
+    store_jobs(db, pend, site="BadBoard", strategy="t")
+
+    q_sampled = scoring_queue(db, limit=0, cfg=CFG)
+    q_full = scoring_queue(db, limit=0, cfg=CFG, sample=False)
+
+    assert 0 < len(q_sampled) < 10   # default: still sampled
+    assert len(q_full) == 10         # sample=False: every low-yield row included
+
+
 def test_scoring_queue_excludes_prefiltered_and_respects_limit(db):
     pend = [
         {"url": "keep1", "title": "Engineer", "location": "UK", "full_description": "x" * 300},
