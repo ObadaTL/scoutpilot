@@ -132,3 +132,41 @@ _BUCKET_RANK = {
 
 def cohort_rank(cohort_start: str | None, deadline: str | None = None) -> int:
     return _BUCKET_RANK.get(cohort_bucket(cohort_start, deadline), 2)
+
+
+def _cohort_effective_month(cohort_start: str | None) -> tuple[int, int] | None:
+    """(year, month) a positively-inferred cohort_start resolves to, or None
+    for 'immediate' / unknown (no start date was ever inferred -- those are
+    never "later than" anything). A year-only value ("YYYY", no month
+    stated) resolves to January of that year: the earliest date consistent
+    with the text, so the horizon filter below only ever hides a year-only
+    row once even that earliest reading is past the horizon.
+    """
+    if not cohort_start or cohort_start == "immediate":
+        return None
+    m = re.match(r"^(20\d\d)(?:-(\d\d))?$", cohort_start)
+    if not m:
+        return None
+    year = int(m.group(1))
+    month = int(m.group(2)) if m.group(2) else 1
+    return (year, month)
+
+
+def within_cohort_horizon(cohort_start: str | None, horizon_months: int = 3,
+                          now: datetime | None = None) -> bool:
+    """True unless `cohort_start` names a start later than `horizon_months`
+    from now (calendar-month granularity, not exact days).
+
+    'immediate' and unknown (None) are always True -- this only hides a
+    *positively inferred* future date; it never treats "we don't know" as
+    "later". Used to keep a graduate cohort a year out from dominating the
+    active queue without deleting the row or touching cohort inference.
+    """
+    ym = _cohort_effective_month(cohort_start)
+    if ym is None:
+        return True
+    year, month = ym
+    now = now or _now()
+    now_idx = now.year * 12 + (now.month - 1)
+    target_idx = year * 12 + (month - 1)
+    return target_idx <= now_idx + horizon_months

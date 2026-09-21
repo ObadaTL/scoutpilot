@@ -268,7 +268,8 @@ def generate_dashboard(output_path: str | None = None, serve_base_url: str | Non
                tailored_resume_path, tailored_at, tailor_attempts,
                cover_letter_path, cover_letter_at, cover_attempts,
                applied_at, apply_status, apply_error, apply_attempts,
-               last_attempted_at, verification_confidence, hidden, discovered_at
+               last_attempted_at, verification_confidence, hidden, discovered_at,
+               cohort_start, deadline
         FROM jobs
         WHERE fit_score IS NOT NULL OR tailored_resume_path IS NOT NULL
         ORDER BY fit_score DESC, site, title
@@ -312,6 +313,21 @@ def generate_dashboard(output_path: str | None = None, serve_base_url: str | Non
             dup_marks[url] = mark
 
     dup_group_sizes = Counter(dup_marks.values())
+
+    # Cohort/start-date: same rank the scoring queue orders by (immediate
+    # first, unknown in the middle, far-future last) plus whether each job
+    # falls inside the configured horizon (config/prefilter.yaml `cohort:`),
+    # so the "hide beyond-horizon" toggle below can match the same rows the
+    # scoring queue already keeps out of the active backlog.
+    from scoutpilot.config import load_prefilter_config
+    from scoutpilot.discovery.cohort import cohort_rank, within_cohort_horizon
+
+    cohort_cfg = (load_prefilter_config() or {}).get("cohort", {}) or {}
+    cohort_horizon_months = int(cohort_cfg.get("horizon_months", 3))
+    cohort_ranks = {j["url"]: cohort_rank(j["cohort_start"], j["deadline"]) for j in jobs}
+    cohort_in_horizon = {
+        j["url"]: within_cohort_horizon(j["cohort_start"], cohort_horizon_months) for j in jobs
+    }
 
     place_labels = {j["url"]: classify_location(j["location"]) for j in jobs}
     place_counts = Counter(place_labels.values())
@@ -657,7 +673,7 @@ def generate_dashboard(output_path: str | None = None, serve_base_url: str | Non
             )
 
         job_sections += f"""
-        <div class="job-card" data-url="{url}" data-score="{score}" data-site="{escape(j['site'] or '')}" data-status="{data_status}" data-hidden="{1 if is_hidden else 0}" data-place="{escape(place_labels[j['url']])}" data-company="{escape(company_name)}" data-dup="{dup_mark or ''}" data-has-cv="{1 if tailored_cv else 0}" data-has-cl="{1 if cover_letter else 0}" data-order="{card_order}" data-discovered="{escape(j['discovered_at'] or '')}" data-tailored="{escape(j['tailored_at'] or '')}" data-applied="{escape(applied_at or '')}" data-gated="{1 if gate_reason else 0}">
+        <div class="job-card" data-url="{url}" data-score="{score}" data-site="{escape(j['site'] or '')}" data-status="{data_status}" data-hidden="{1 if is_hidden else 0}" data-place="{escape(place_labels[j['url']])}" data-company="{escape(company_name)}" data-dup="{dup_mark or ''}" data-has-cv="{1 if tailored_cv else 0}" data-has-cl="{1 if cover_letter else 0}" data-order="{card_order}" data-discovered="{escape(j['discovered_at'] or '')}" data-tailored="{escape(j['tailored_at'] or '')}" data-applied="{escape(applied_at or '')}" data-gated="{1 if gate_reason else 0}" data-cohort="{cohort_ranks[j['url']]}" data-cohort-horizon="{1 if cohort_in_horizon[j['url']] else 0}">
           <div class="card-header">
             <div class="card-title-group">
               <input type="checkbox" class="card-select" title="Select for bulk actions" onchange="onCardSelect()">
@@ -1061,6 +1077,7 @@ def generate_dashboard(output_path: str | None = None, serve_base_url: str | Non
       <option value="discovered-asc">Oldest Discovered</option>
       <option value="tailored-desc">Recently Tailored</option>
       <option value="applied-desc">Recently Applied</option>
+      <option value="cohort-asc">Start Date (immediate first, future cohorts last)</option>
     </select>
   </div>
 
@@ -1072,6 +1089,10 @@ def generate_dashboard(output_path: str | None = None, serve_base_url: str | Non
     <label class="hide-toggle">
       <input type="checkbox" id="compact-toggle-input" onchange="toggleCompactMode(this.checked)">
       Compact view (collapse card details; expand one via its "Details" link)
+    </label>
+    <label class="hide-toggle">
+      <input type="checkbox" id="cohort-horizon-toggle-input" checked onchange="toggleHideFutureCohort(this.checked)">
+      Hide cohorts starting beyond {cohort_horizon_months} month{'s' if cohort_horizon_months != 1 else ''} out (config: prefilter.yaml cohort.horizon_months)
     </label>
   </div>
 </div>
@@ -1427,11 +1448,18 @@ let activeStatusFilter = 'all';
 let activePlaceFilter = 'all';
 let searchText = '';
 let hideAppliedUnavailable = true;
+let hideFutureCohort = true;
 let compactMode = false;
 let activeSort = 'score';
 
 function toggleHideAppliedUnavailable(checked) {{
   hideAppliedUnavailable = checked;
+  saveFilterState();
+  applyFilters();
+}}
+
+function toggleHideFutureCohort(checked) {{
+  hideFutureCohort = checked;
   saveFilterState();
   applyFilters();
 }}
@@ -1563,6 +1591,7 @@ function saveFilterState() {{
       company: activeCompanyFilter,
       search: searchText,
       hideAppliedUnavailable: hideAppliedUnavailable,
+      hideFutureCohort: hideFutureCohort,
       compactMode: compactMode,
       sort: activeSort,
     }}));
@@ -1594,6 +1623,7 @@ function restoreFilterState() {{
   activeCompanyFilter = saved.company || 'all';
   searchText = saved.search || '';
   hideAppliedUnavailable = saved.hideAppliedUnavailable !== false;
+  hideFutureCohort = saved.hideFutureCohort !== false;
   compactMode = saved.compactMode === true;
   activeSort = saved.sort || 'score';
 
@@ -1601,6 +1631,8 @@ function restoreFilterState() {{
   if (searchInput) searchInput.value = saved.search || '';
   const hideToggle = document.getElementById('hide-toggle-input');
   if (hideToggle) hideToggle.checked = hideAppliedUnavailable;
+  const cohortHorizonToggle = document.getElementById('cohort-horizon-toggle-input');
+  if (cohortHorizonToggle) cohortHorizonToggle.checked = hideFutureCohort;
   const compactToggle = document.getElementById('compact-toggle-input');
   if (compactToggle) compactToggle.checked = compactMode;
   document.body.classList.toggle('compact-mode', compactMode);
@@ -1671,6 +1703,12 @@ function applyFilters() {{
     const hideMatch = activeStatusFilter !== 'all' || !hideAppliedUnavailable
       || (status !== 'applied' && status !== 'closed' && status !== 'manual' && !isHidden);
 
+    // Beyond-horizon cohort toggle (default on): same "explicit filter
+    // always wins" rule as hideMatch above -- picking a specific Status
+    // still shows the card even if its cohort is past the horizon.
+    const cohortMatch = activeStatusFilter !== 'all' || !hideFutureCohort
+      || card.dataset.cohortHorizon !== '0';
+
     // Search Text Match
     // Server-side when served (serverMatches null = answer not in yet, so
     // don't filter), client-side against the card's own text otherwise.
@@ -1678,7 +1716,7 @@ function applyFilters() {{
       || (SERVER_SEARCH ? (serverMatches === null || serverMatches.has(card.dataset.url))
                         : text.includes(searchText));
 
-    if (scoreMatch && statusMatch && placeMatch && companyMatch && hideMatch && textMatch) {{
+    if (scoreMatch && statusMatch && placeMatch && companyMatch && hideMatch && cohortMatch && textMatch) {{
       card.classList.remove('hidden');
       shown++;
     }} else {{

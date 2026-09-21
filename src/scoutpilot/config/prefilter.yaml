@@ -160,3 +160,16 @@ scoring_queue:
   floor: 0.05            # a source at/below this hit rate is sampled, not exhausted
   min_sample: 15         # scored jobs a source needs before its rate is trusted
   sample_divisor: 6      # sampled sources: queue ~1 in N of their pending rows
+
+# Cohort-start horizon: hides (never deletes) any pending_score/scoring_queue
+# row whose inferred cohort_start (discovery/cohort.py) names a start date
+# later than `horizon_months` from today -- e.g. a "September 2027 intake"
+# row sitting in a queue you're working today. A row with no inferred
+# cohort_start (the ~85% "unknown" majority) is NEVER hidden by this: only a
+# positively-inferred future date counts. Purely a query-time filter -- no
+# DB column is written, no row is ever touched -- so `enabled: false` here
+# (or in ~/.applypilot/searches.yaml, deep-merged over this default) turns
+# it off instantly with nothing to undo.
+cohort:
+  enabled: true
+  horizon_months: 3

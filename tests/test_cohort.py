@@ -6,7 +6,7 @@ from datetime import datetime, timezone
 import pytest
 
 from scoutpilot.discovery import cohort
-from scoutpilot.discovery.cohort import infer_cohort_start, cohort_bucket, cohort_rank
+from scoutpilot.discovery.cohort import infer_cohort_start, cohort_bucket, cohort_rank, within_cohort_horizon
 from scoutpilot.database import (
     init_db,
     store_jobs,
@@ -74,6 +74,23 @@ def test_cohort_bucket_and_rank():
 
     assert cohort_rank("immediate") < cohort_rank("2026-09") < cohort_rank(None)
     assert cohort_rank(None) < cohort_rank("2027") < cohort_rank("2029")
+
+
+# ── within_cohort_horizon ─────────────────────────────────────────────
+
+def test_within_cohort_horizon():
+    # FIXED_NOW = 2026-09-02; default 3-month horizon -> cutoff month is 2026-12
+    assert within_cohort_horizon(None) is True                # unknown never hidden
+    assert within_cohort_horizon("immediate") is True
+    assert within_cohort_horizon("2026-09") is True            # this month
+    assert within_cohort_horizon("2026-12") is True            # exactly at the edge
+    assert within_cohort_horizon("2027-01") is False           # one month past the edge
+    assert within_cohort_horizon("2029") is False              # far future
+    # year-only resolves to January of that year (earliest reading)
+    assert within_cohort_horizon("2026") is True               # already in the past this year
+    assert within_cohort_horizon("2027") is False              # Jan 2027 > Dec 2026 cutoff
+    # horizon is configurable
+    assert within_cohort_horizon("2027-01", horizon_months=6) is True
 
 
 # ── archive_discovery_results ─────────────────────────────────────────
@@ -184,7 +201,32 @@ def test_cohort_filter_and_queue_order(db):
     assert [j["url"] for j in imm_only] == ["imm"]
     y26_only = get_jobs_by_stage(db, stage="pending_score", cohort="2026")
     assert [j["url"] for j in y26_only] == ["y26"]
+    # explicit cohort="future" still surfaces the row the horizon filter
+    # hides by default below -- an explicit ask always wins over it.
+    future_only = get_jobs_by_stage(db, stage="pending_score", cohort="future")
+    assert [j["url"] for j in future_only] == ["y28"]
 
-    # queue: immediate before this-year before unknown before far-future
+    # queue: immediate before this-year before unknown; y28 (2028, ~2 years
+    # out) is past the default 3-month horizon so it's hidden, not just
+    # ranked last -- see database.applied_companies-style query-time filter.
     q = scoring_queue(db)
-    assert q.index("imm") < q.index("y26") < q.index("none") < q.index("y28")
+    assert q == ["imm", "y26", "none"]
+    assert "y28" not in q
+    assert {j["url"] for j in get_jobs_by_stage(db, stage="pending_score")} == {"imm", "y26", "none"}
+
+
+def test_cohort_horizon_disabled_restores_old_behavior(db, monkeypatch, tmp_path):
+    store_jobs(db, [
+        {"url": "y28", "title": "Graduate Engineer", "location": "UK",
+         "full_description": "Join our 2028 cohort. " + "x" * 300},
+    ], site="B", strategy="t")
+
+    monkeypatch.setattr(
+        "scoutpilot.config.load_prefilter_config",
+        lambda: {"prefilter": {"enabled": False},
+                 "scoring_queue": {"enabled": True, "hit_score": 7, "floor": 0.05,
+                                    "min_sample": 15, "sample_divisor": 6},
+                 "cohort": {"enabled": False, "horizon_months": 3}},
+    )
+    assert scoring_queue(db) == ["y28"]
+    assert [j["url"] for j in get_jobs_by_stage(db, stage="pending_score")] == ["y28"]

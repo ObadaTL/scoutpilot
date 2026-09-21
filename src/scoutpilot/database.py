@@ -100,9 +100,19 @@ def classify_location(location: str | None) -> str:
 # Boards that list many employers: their `site` is a job board, never a
 # company. Anything else in `site` IS the employer (the Workday-style
 # per-company scrapers store it that way).
+#
+# "manual" belongs here for the same reason, not because it's a board --
+# manual.py stamps every manually-added job's site as the literal string
+# "Manual" (never the employer), so treating it like a real per-company
+# site returned "Manual" itself as the derived company. Confirmed live
+# 2026-09-15: a cover letter for a manually-added IBM posting was told to
+# mention the company "Manual" and, correctly, never did -- an unwinnable
+# check for every manually-added job until this fell through to the
+# company_summary fallback below instead.
 _AGGREGATOR_SITES = {
     "linkedin", "indeed", "glassdoor", "ziprecruiter", "google", "remoteok",
     "welcometothejungle", "job bank canada", "careerjet canada", "hacker news",
+    "nijobs", "gradireland", "manual",
 }
 
 # "Greenhouse (GitLab)", "Ashby (Supabase)", "Lever (Spotify)".
@@ -184,6 +194,35 @@ def derive_company(job: dict | sqlite3.Row) -> str:
             return match.group(1).strip()
 
     return UNKNOWN_COMPANY
+
+
+def _normalize_company(name: str) -> str:
+    """Loose key for matching employer names across postings: lowercased,
+    whitespace-collapsed, with the legal-suffix noise that makes the same
+    employer look different ("Foo Ltd" vs "Foo") stripped."""
+    key = re.sub(r"\s+", " ", (name or "").strip().lower())
+    key = re.sub(r"\b(ltd|limited|plc|inc|llc|group|uk|ireland)\b\.?", "", key)
+    return re.sub(r"\s+", " ", key).strip()
+
+
+def applied_companies(conn: sqlite3.Connection | None = None) -> set[str]:
+    """Normalized employer names (via derive_company()) for every job with
+    apply_status = 'applied' -- used to keep a company the user has already
+    applied to out of scoring/tailoring for a *different* role there.
+    """
+    if conn is None:
+        conn = get_connection()
+    rows = conn.execute(
+        "SELECT company, site, company_summary FROM jobs WHERE apply_status = 'applied'"
+    ).fetchall()
+    companies: set[str] = set()
+    for r in rows:
+        name = derive_company(r)
+        if name and name != UNKNOWN_COMPANY:
+            norm = _normalize_company(name)
+            if norm:
+                companies.add(norm)
+    return companies
 
 
 _SHINGLE_WORD_RE = re.compile(r"[a-z0-9]+")
@@ -1122,8 +1161,19 @@ def get_jobs_by_stage(conn: sqlite3.Connection | None = None,
             where += " AND (cohort_start LIKE ? OR deadline LIKE ?)"
             params.extend([f"{cohort}%", f"%{cohort}%"])
         elif cohort == "future":
+            # Mirrors cohort_bucket()'s own fallback order: deadline only
+            # stands in for a *missing* cohort_start, it never overrides a
+            # cohort_start that's already present. And "immediate" has to be
+            # excluded explicitly -- substr(cohort_start,1,4) > '2027' is a
+            # lexical string compare, and the letter 'i' sorts after any
+            # digit, so an unguarded compare here matched every
+            # immediate-start row too.
             fy = datetime.now(timezone.utc).year + 1
-            where += " AND (substr(cohort_start,1,4) > ? OR substr(deadline,1,4) > ?)"
+            where += (
+                " AND ((cohort_start IS NOT NULL AND cohort_start != 'immediate' "
+                "AND substr(cohort_start,1,4) > ?) "
+                "OR (cohort_start IS NULL AND deadline IS NOT NULL AND substr(deadline,1,4) > ?))"
+            )
             params.extend([str(fy), str(fy)])
 
     if keywords:
@@ -1178,8 +1228,28 @@ def get_jobs_by_stage(conn: sqlite3.Connection | None = None,
     # Convert sqlite3.Row objects to dicts
     if rows:
         columns = rows[0].keys()
-        return [dict(zip(columns, row)) for row in rows]
-    return []
+        jobs = [dict(zip(columns, row)) for row in rows]
+    else:
+        jobs = []
+
+    if stage == "pending_score" and jobs:
+        applied = applied_companies(conn)
+        if applied:
+            jobs = [j for j in jobs if _normalize_company(derive_company(j)) not in applied]
+
+        # Cohort horizon: only when the caller didn't already ask for a
+        # specific cohort bucket (the `cohort` param above) -- e.g.
+        # cohort="future" is an explicit request to see exactly the rows
+        # this would otherwise hide. See config/prefilter.yaml `cohort:`.
+        if cohort is None:
+            from scoutpilot.config import load_prefilter_config
+            from scoutpilot.discovery.cohort import within_cohort_horizon
+            cohort_cfg = (load_prefilter_config() or {}).get("cohort", {}) or {}
+            if cohort_cfg.get("enabled", True):
+                horizon = int(cohort_cfg.get("horizon_months", 3))
+                jobs = [j for j in jobs if within_cohort_horizon(j.get("cohort_start"), horizon)]
+
+    return jobs
 
 
 # ── Per-source hit rate & scoring-queue budget ───────────────────────────
@@ -1291,9 +1361,29 @@ def scoring_queue(conn: sqlite3.Connection | None = None,
         where += f" AND loc_priority(location) < {tier_count}"
 
     rows = conn.execute(
-        f"SELECT url, COALESCE(site, '?') AS site, title, cohort_start, deadline, discovered_at "
+        f"SELECT url, COALESCE(site, '?') AS site, title, cohort_start, deadline, discovered_at, company "
         f"FROM jobs WHERE {where} ORDER BY discovered_at DESC"
     ).fetchall()
+    if not rows:
+        return []
+
+    # Never queue a job at a company the user has already applied to for a
+    # different role -- see database.applied_companies().
+    applied = applied_companies(conn)
+    if applied:
+        rows = [r for r in rows if _normalize_company(derive_company(r)) not in applied]
+    if not rows:
+        return []
+
+    # Cohort horizon: drop rows whose inferred cohort_start is later than
+    # `horizon_months` from now (config/prefilter.yaml `cohort:`). A row
+    # with no inferred cohort_start is never dropped by this -- see
+    # discovery.cohort.within_cohort_horizon.
+    cohort_cfg = cfg.get("cohort", {}) or {}
+    if cohort_cfg.get("enabled", True):
+        from scoutpilot.discovery.cohort import within_cohort_horizon
+        horizon = int(cohort_cfg.get("horizon_months", 3))
+        rows = [r for r in rows if within_cohort_horizon(r["cohort_start"], horizon)]
     if not rows:
         return []
 
