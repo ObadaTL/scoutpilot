@@ -975,6 +975,9 @@ def generate_dashboard(output_path: str | None = None, serve_base_url: str | Non
   .bulk-btn:hover {{ background: #4338ca; }}
   .bulk-btn.bulk-hide {{ background: #7c2d12; border-color: #b45309; color: #fed7aa; }}
   .bulk-btn.bulk-hide:hover {{ background: #9a3412; }}
+  .bulk-btn.bulk-tailor {{ background: #4c1d95; border-color: #7c3aed; color: #ede9fe; }}
+  .bulk-btn.bulk-tailor:hover {{ background: #5b21b6; }}
+  .bulk-btn:disabled {{ opacity: 0.6; cursor: not-allowed; }}
 
   /* Add job by URL */
   #add-job-row input {{ flex: 1; min-width: 320px; }}
@@ -1112,6 +1115,7 @@ def generate_dashboard(output_path: str | None = None, serve_base_url: str | Non
 
 <div id="bulk-bar" class="bulk-bar">
   <span id="bulk-count">0 selected</span>
+  <button class="bulk-btn bulk-tailor" onclick="bulkTailor()">🪄 Tailor selected</button>
   <button class="bulk-btn bulk-hide" onclick="bulkHide()">🙈 Hide selected</button>
   <button class="bulk-btn" onclick="clearSelection()">Clear</button>
 </div>
@@ -1261,6 +1265,66 @@ function bulkHide() {{
   apiPost('/api/status', {{urls: urls, action: 'hide'}})
     .then(() => location.reload())
     .catch(err => {{ alert('Bulk hide failed: ' + err.message); btn.disabled = false; btn.textContent = '🙈 Hide selected'; }});
+}}
+
+// ---- Bulk tailor ----
+// Reuses the exact same per-job endpoints the single "Tailor CV + Cover
+// Letter" button uses (/api/tailor-one, /api/tailor-status) -- run one at a
+// time, not in parallel, since these all hit the same local LLM and
+// concurrent requests would just queue up behind each other anyway while
+// making progress harder to report. Waits for the CV specifically (not the
+// cover letter) before moving to the next job, matching tailorJob()'s own
+// "show the CV the moment it's ready" behavior; a cover letter still
+// running when the bulk run ends keeps going in the background exactly
+// like it would after a single-job tailor.
+function bulkTailor() {{
+  const urls = selectedCards().map(c => c.dataset.url);
+  if (!urls.length) return;
+  if (!confirm(
+    'Tailor CV + cover letter for ' + urls.length + ' selected job' + (urls.length === 1 ? '' : 's') +
+    '? This runs one at a time and can take a while (roughly a minute or more per job).'
+  )) return;
+
+  const btn = document.querySelector('.bulk-tailor');
+  btn.disabled = true;
+  const total = urls.length;
+  const failures = [];
+  let index = 0;
+
+  function waitForCv(url) {{
+    return new Promise(resolve => {{
+      (function poll() {{
+        fetch('/api/tailor-status?url=' + encodeURIComponent(url))
+          .then(r => r.json())
+          .then(data => {{
+            if (data.cv === 'done') {{ resolve(); return; }}
+            if (data.cv === 'error') {{ failures.push(url); resolve(); return; }}
+            setTimeout(poll, 3000);
+          }})
+          .catch(() => setTimeout(poll, 3000));
+      }})();
+    }});
+  }}
+
+  function next() {{
+    if (index >= total) {{
+      btn.disabled = false;
+      btn.textContent = '🪄 Tailor selected';
+      if (failures.length) {{
+        alert('Tailored ' + (total - failures.length) + ' of ' + total + '. Failed: ' + failures.length + '.');
+      }}
+      location.reload();
+      return;
+    }}
+    const url = urls[index];
+    btn.textContent = '⏳ Tailoring ' + (index + 1) + '/' + total + '...';
+    apiPost('/api/tailor-one', {{url}})
+      .then(() => waitForCv(url))
+      .catch(() => {{ failures.push(url); }})
+      .then(() => {{ index++; next(); }});
+  }}
+
+  next();
 }}
 
 // ---- Add job by URL ----
