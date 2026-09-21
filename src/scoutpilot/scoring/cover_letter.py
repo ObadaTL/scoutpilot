@@ -39,7 +39,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from scoutpilot.config import COVER_LETTER_DIR, DEFAULTS, RESUME_PATH, get_locale_style, load_profile
-from scoutpilot.database import get_connection
+from scoutpilot.database import UNKNOWN_COMPANY, derive_company, get_connection
 from scoutpilot.facts import FactBank, NumericGuard, NumericGuardViolation, format_facts_block
 from scoutpilot.llm import get_client, is_local_provider
 from scoutpilot.scoring.validator import (
@@ -67,22 +67,6 @@ _PROMPT_BANNED_SAMPLE = [
 _PROMPT_LEAK_SAMPLE = [
     "i am sorry", "here is the", "as requested", "note:", "i have rewritten",
 ]
-
-# job['site'] is the *source* the posting was scraped from, not necessarily
-# the hiring company -- true for jobs pulled straight from a company's own
-# careers page (e.g. "Motorola Solutions", "NVIDIA"), but false for postings
-# aggregated through a job board, where site is the board's own name and the
-# real employer (if identifiable at all) is buried in free-text
-# full_description. Checking for the board's name in the letter is not just
-# unhelpful there, it's actively wrong -- and a hard-fails-every-retry check,
-# since a job board name will never legitimately appear in a cover letter
-# addressed to the actual employer. Skip the company-mention check for known
-# aggregators/boards rather than block generation on an unwinnable check.
-_AGGREGATOR_SITES = {
-    "linkedin", "indeed", "glassdoor", "dice", "remoteok", "welcometothejungle",
-    "job bank canada", "careerjet canada", "hacker news jobs", "builtin remote",
-}
-
 
 # ── Prompt Builder (profile-driven) ──────────────────────────────────────
 
@@ -150,11 +134,27 @@ def _build_cover_letter_prompt(profile: dict, job: dict, fact_bank: FactBank) ->
         # Describing the required CONTENT in the abstract, with an explicit
         # instruction not to reuse this wording, keeps the model generating
         # its own sentence instead of copying this one.
+        #
+        # "Do not reuse wording from this instruction" used to read as
+        # scoped to the scaffold text ("Name this specific detail..."), not
+        # to company_hook's own content sitting inside it -- confirmed live
+        # 2026-09-15: a FanDuel letter changed "operates FanDuel Sportsbook,
+        # FanDuel Casino, and FanDuel Racing" but carried the numeric tail
+        # "a presence across all 50 states" straight through unchanged, the
+        # same six words verbatim from company_hook. Numbers are exactly
+        # the phrase a model is least willing to reword, for the same
+        # reason NumericGuard exists: changing the words around a number
+        # risks changing what the number means. Naming that hazard directly
+        # (and pointing at the general rule with its exact threshold) is
+        # cheaper than a fifth attempt to phrase this abstractly enough to
+        # cover it by implication.
         hook_instruction = (
-            f'Name this specific detail from the posting: {company_hook}. In your own words -- '
-            f'not a compliment about the company in general, this exact thing -- explain the '
-            f'concrete reason it matters to the work you want next. Do not reuse any wording from '
-            f'this instruction itself; write a sentence that does not exist anywhere above.'
+            f'Name this specific detail from the posting: {company_hook}. Explain, in your own '
+            f'words, the concrete reason this exact thing matters to the work you want next -- '
+            f'not a compliment about the company in general. Do not carry any run of the wording '
+            f'above into your sentence unchanged, the detail itself included -- reword the numbers '
+            f'and their context too, not just the sentence around them. See DO NOT COPY THE POSTING '
+            f'below for the exact rule this is checked against.'
         )
     else:
         # No scraped company fact for this job (true for well over half of
@@ -172,9 +172,12 @@ def _build_cover_letter_prompt(profile: dict, job: dict, fact_bank: FactBank) ->
             "itself: name ONE concrete requirement, system, or problem from "
             "the job description above, then write a fresh sentence -- your own "
             "words, not a restatement of this instruction -- explaining your own "
-            "reason for wanting to work on that specific thing. Quote their own "
-            "terminology for the requirement/system/problem itself. Do not praise "
-            "the company in general terms and do not invent anything about them."
+            "reason for wanting to work on that specific thing. Use their own "
+            "name for that requirement/system/problem (a word or two, e.g. "
+            "'the settlement pipeline' or 'the onboarding flow') but write the "
+            "rest of the sentence yourself -- see DO NOT COPY THE POSTING below, "
+            "it applies here too. Do not praise the company in general terms "
+            "and do not invent anything about them."
         )
 
     return f"""Write a cover letter for {sign_off_name}. The goal is to get an interview.
@@ -202,7 +205,12 @@ BANNED WORDS AND PHRASES (a sample -- an automated validator checks a much large
 ALSO BANNED (meta-commentary the validator catches):
 {leak_sample}
 
+ALSO BANNED: naming where a requirement came from ("the job description mentions...", "the posting states...", "as they describe it..."). State the fact or the requirement itself, first person, as your own claim. Never write the sentence that describes what the posting says -- write the sentence that answers it.
+
 BANNED PUNCTUATION: No em dashes (—) or en dashes (–). Use commas or periods.
+
+DO NOT COPY THE POSTING (checked automatically -- 6+ of its words in a row anywhere in your letter fails this check and throws the letter away):
+Naming a system, requirement, or piece of their own terminology in a word or two is expected. Stringing together six or more of the job description's own words in a row is not, even if you swap the subject or change one word in the middle -- that includes turning one of its sentences into a claim about yourself. If a sentence you're about to write shares a run of the posting's exact wording, stop and say the same thing shorter or in different words instead.
 
 VOICE:
 - Write like a real engineer emailing someone they respect. Not formal, not casual. Just direct.
@@ -309,39 +317,95 @@ def _strip_after_signoff(text: str, sign_off_name: str) -> str:
 _ANY_DIGIT_RE = re.compile(r"\d")
 _SENTENCE_SPLIT_RE = re.compile(r"(?<=[.!?])\s+")
 
-# Single source of truth for these two error-message prefixes: built into
-# the error string in _full_validate() below, and matched against (prefix
-# stripped, in the tool-leak case, to recover the actual tool names) in the
-# retry-exhaustion fallback further down. Keeping both ends in one place
-# means they can't drift apart the way a duplicated literal could.
+# Single source of truth for these error-message prefixes/patterns: built
+# into the error strings in _full_validate() and validate_cover_letter()
+# (validator.py), and matched against (to recover the actual tool names /
+# lifted phrase) in the retry-exhaustion fallback further down. Keeping both
+# ends in one place means they can't drift apart the way a duplicated
+# literal could.
 _NUMERIC_ERROR_PREFIX = "Unverified number(s)"
 _TOOL_LEAK_ERROR_PREFIX = "Tool(s) mentioned that aren't in the candidate's real skills:"
+_LIFTED_SPAN_ERROR_RE = re.compile(r"^Copies '(.+)' near-verbatim", re.IGNORECASE)
+_REPEATED_PHRASE_ERROR_RE = re.compile(r"^Repeats the phrase '(.+)' --", re.IGNORECASE)
+# Same idea for validator.py's two source-narration checks ("I read that you
+# need X" instead of "I have X") -- both point at a single short phrase
+# that identifies the offending sentence, same as a lifted JD span.
+_SELF_TALK_ERROR_RE = re.compile(r"^LLM self-talk: '(.+)'$")
+_META_REF_ERROR_RE = re.compile(r"^Narrates the source instead of making the claim \('(.+)'\)")
+# Recovers the exact NumericGuardViolation.numbers list from the formatted
+# error string ("Unverified number(s) [50] in: ...") so the fallback can
+# strip only the sentence(s) carrying THAT number -- see
+# _strip_number_sentences.
+_NUMERIC_ERROR_RE = re.compile(re.escape(_NUMERIC_ERROR_PREFIX) + r" \[(.*?)\] in:")
 
 
-def _strip_tool_sentences(text: str, tools: list[str]) -> str:
-    """Deterministic, code-only removal of any sentence naming one of the
-    given leaked tool tokens -- mirrors strip_numbered_sentences's
-    paragraph-preserving approach (validator.py), applied by tool-name
-    match instead of digit presence. Used alongside it in the retry-
-    exhaustion fallback when a letter fails on both a fabricated number and
-    a leaked tool mention in the same pass.
+def _strip_matching_sentences(text: str, patterns: list[re.Pattern]) -> str:
+    """Deterministic, code-only removal of any sentence matching one of the
+    given compiled patterns -- mirrors strip_numbered_sentences's
+    paragraph-preserving approach (validator.py), applied by pattern match
+    instead of digit presence. Shared by _strip_tool_sentences (leaked tool
+    tokens) and _strip_phrase_sentences (a lifted JD span or an internally
+    repeated phrase) -- same stripping mechanics, different pattern source.
     """
-    if not text or not tools:
+    if not text or not patterns:
         return text
-    tool_res = [re.compile(r"\b" + re.escape(t) + r"\b", re.IGNORECASE) for t in tools]
 
     def _strip_para(para: str) -> str:
-        if not any(r.search(para) for r in tool_res):
+        if not any(r.search(para) for r in patterns):
             return para
         sentences = _SENTENCE_SPLIT_RE.split(para)
-        kept = [s for s in sentences if not any(r.search(s) for r in tool_res)]
+        kept = [s for s in sentences if not any(r.search(s) for r in patterns)]
         return " ".join(kept).strip()
 
     sep = "\n\n" if "\n\n" in text else "\n"
-    # Drop any paragraph that comes back empty (every sentence in it named a
-    # leaked tool) instead of rejoining it as a blank gap in the letter.
+    # Drop any paragraph that comes back empty (every sentence in it matched)
+    # instead of rejoining it as a blank gap in the letter.
     stripped_paras = [_strip_para(p) for p in text.split(sep)]
     return sep.join(p for p in stripped_paras if p.strip())
+
+
+def _strip_tool_sentences(text: str, tools: list[str]) -> str:
+    """Strip any sentence naming one of the given leaked tool tokens. Used
+    alongside _strip_phrase_sentences in the retry-exhaustion fallback when
+    a letter fails on a fabricated number, a leaked tool mention, and/or a
+    JD-copy violation in the same pass.
+    """
+    tool_res = [re.compile(r"\b" + re.escape(t) + r"\b", re.IGNORECASE) for t in tools]
+    return _strip_matching_sentences(text, tool_res)
+
+
+def _strip_number_sentences(text: str, numbers: list[str]) -> str:
+    """Strip only sentences containing one of the specific unverified
+    number tokens NumericGuard flagged, rather than every digit-bearing
+    sentence (strip_numbered_sentences, validator.py's blanket last
+    resort). A letter can carry more than one number -- an already-
+    verified "11-month placement" alongside a fabricated "50 states" -- and
+    the blanket strip discards both just because they landed in the
+    fallback together. That is how a letter needing only its one bad
+    number removed came back missing a real sentence too, dropping it
+    under the 120-word floor and losing the letter entirely. Used when
+    NumericGuard's own violation numbers were recoverable from the error
+    string; the caller falls back to the blanket strip otherwise.
+    """
+    num_res = [re.compile(r"\b" + re.escape(n) + r"\b") for n in numbers]
+    return _strip_matching_sentences(text, num_res)
+
+
+def _strip_phrase_sentences(text: str, phrases: list[str]) -> str:
+    """Strip any sentence containing one of the given multi-word phrases
+    (a JD span the letter copied near-verbatim, or a phrase the letter
+    repeats across paragraphs). Matches with any run of non-word
+    characters standing in for the original single space between each
+    word -- the phrase, as reported by has_lifted_jd_span/has_repeated_phrase
+    (validator.py), is reconstructed from word tokens and so has lost
+    whatever punctuation or spacing the actual sentence used between them.
+    """
+    phrase_res = []
+    for phrase in phrases:
+        words = [re.escape(w) for w in phrase.split()]
+        if words:
+            phrase_res.append(re.compile(r"\b" + r"\W+".join(words) + r"\b", re.IGNORECASE))
+    return _strip_matching_sentences(text, phrase_res)
 
 
 def _recover_numeric_sentences(text: str, fact_bank: FactBank) -> str:
@@ -401,14 +465,23 @@ def _recover_numeric_sentences(text: str, fact_bank: FactBank) -> str:
 
 def _check_company_mentioned(letter: str, job: dict) -> str | None:
     """A cover letter that never names the company it's addressed to reads
-    as generic/templated. Reuses the same job['site']-is-the-company-name
-    convention already established for ToolLeakGuard's whitelist.
+    as generic/templated.
+
+    Uses derive_company() (database.py) rather than job['site'] -- site is
+    the *board* a posting was scraped from for aggregator postings
+    (LinkedIn, Indeed, NIJobs, ...), never the employer, so requiring the
+    board's own name to appear in a letter addressed to the actual employer
+    was an unwinnable, hard-fails-every-retry check for exactly those jobs.
+    Confirmed live: every NIJobs posting failed this check because the
+    model, correctly, never wrote "NIJobs" anywhere. Skipped when nothing
+    better than "Unknown employer" is derivable -- can't demand a name that
+    isn't known.
 
     Returns:
         An error string if the company name is missing, else None.
     """
-    company = str(job.get("site") or "").strip()
-    if not company or company.lower() in _AGGREGATOR_SITES or company.lower() in letter.lower():
+    company = derive_company(job)
+    if company == UNKNOWN_COMPANY or company.lower() in letter.lower():
         return None
     return f"Company name '{company}' is never mentioned in the letter"
 
@@ -446,9 +519,21 @@ def generate_cover_letter(
     numeric_guard = NumericGuard(fact_bank, profile)
     tool_guard = ToolLeakGuard(profile)
 
+    # derive_company(), not job['site'] -- site is the *board* a posting was
+    # scraped from for aggregator postings (LinkedIn, Indeed, NIJobs, ...),
+    # never the employer. Telling the model "COMPANY: linkedin" then asking
+    # it to name the company (see hook_instruction below) sent it hunting
+    # for the real name in the description text anyway, but the eventual
+    # _check_company_mentioned validation below still checked it against
+    # the wrong string. Falls back to job['site'] only when nothing better
+    # is derivable -- still better than nothing for the handful of
+    # per-employer scrapers this was always correct for.
+    company_name = derive_company(job)
+    if company_name == UNKNOWN_COMPANY:
+        company_name = job.get("site") or UNKNOWN_COMPANY
     job_text = (
         f"TITLE: {job['title']}\n"
-        f"COMPANY: {job['site']}\n"
+        f"COMPANY: {company_name}\n"
         f"LOCATION: {job.get('location', 'N/A')}\n\n"
         f"DESCRIPTION:\n{(job.get('full_description') or '')[:6000]}"
     )
@@ -462,6 +547,7 @@ def generate_cover_letter(
             job_description=job.get("full_description") or "", sign_off_name=sign_off_name,
         )
         errors = list(base["errors"])
+        warnings = list(base["warnings"])
         try:
             numeric_guard.check(candidate)
         except NumericGuardViolation as e:
@@ -474,10 +560,23 @@ def generate_cover_letter(
             errors.append(
                 f"{_TOOL_LEAK_ERROR_PREFIX} {', '.join(e.tools)}"
             )
+        # A warning, not an error -- confirmed live 2026-09-15, right after
+        # this check was widened to fire for aggregator-sourced postings
+        # too (previously skipped almost entirely, see
+        # _check_company_mentioned): across a 15-job regression sample it
+        # became the dominant failure, blocking 9 letters that were
+        # otherwise clean. Two real causes, neither fixable by asking
+        # harder: derive_company() sometimes names a recruiter/agency
+        # ("Skillsearch", "James Adams") instead of the (often genuinely
+        # unstated) real employer, and even a correct name isn't guaranteed
+        # to land verbatim every attempt from a 14B local model. Missing a
+        # personalization nicety is a worse outcome to ship nothing over
+        # than the failure mode NumericGuard/ToolLeakGuard exist to
+        # prevent -- those catch a false claim; this catches an omission.
         company_error = _check_company_mentioned(candidate, job)
         if company_error:
-            errors.append(company_error)
-        return {"passed": not errors, "errors": errors, "warnings": base["warnings"]}
+            warnings.append(company_error)
+        return {"passed": not errors, "errors": errors, "warnings": warnings}
 
     avoid_notes: list[str] = []
     letter = ""
@@ -564,22 +663,38 @@ def generate_cover_letter(
             attempt + 1, max_retries + 1, validation["errors"],
         )
 
-    # Retries exhausted. NumericGuard fabrication and a leaked tool mention
-    # are the two failure modes a deterministic, code-only fix can safely
-    # resolve without yet another (possibly equally unreliable) LLM call: if
-    # every remaining error is one of those two kinds, strip the offending
-    # sentences and re-validate. Any other remaining error (banned words,
-    # missing company mention, wrong salutation) still blocks -- those
-    # aren't safe to paper over mechanically.
+    # Retries exhausted. NumericGuard fabrication, a leaked tool mention, a
+    # JD span copied near-verbatim, and an internally repeated phrase are
+    # the failure modes a deterministic, code-only fix can safely resolve
+    # without yet another (possibly equally unreliable) LLM call: if every
+    # remaining error is one of those kinds, strip the offending sentences
+    # and re-validate. Any other remaining error (banned words, missing
+    # company mention, wrong salutation) still blocks -- those aren't safe
+    # to paper over mechanically.
     #
-    # Handling both together, not just numeric-only, matters in practice:
-    # confirmed live 2026-08-25 that a job posting explicitly asking for LLM
-    # experience (which this candidate's real skills don't include) got the
-    # local model fabricating BOTH an unverified stat AND an "LLM" skill
-    # claim on every one of 3 attempts -- a mixed-error case the old
-    # numeric-only check never even tried to rescue.
+    # Handling all of them together, not just numeric-only, matters in
+    # practice: confirmed live 2026-08-25 that a job posting explicitly
+    # asking for LLM experience (which this candidate's real skills don't
+    # include) got the local model fabricating BOTH an unverified stat AND
+    # an "LLM" skill claim on every one of 3 attempts -- a mixed-error case
+    # the old numeric-only check never even tried to rescue. The JD-span and
+    # repeated-phrase cases (added 2026-09-15) are the same shape of
+    # problem: confirmed live the same run, a letter failed only on a
+    # leaked "GCP" mention plus a 6-word span lifted from the job
+    # description -- a rescuable, single-sentence-each fix that used to
+    # fall straight through to "no letter at all" because neither error
+    # matched the old NUMERIC/TOOL_LEAK-only allowlist. Source-narration
+    # ("the job description mentions...") is the same shape again: always a
+    # hard error regardless of validation mode, always confined to one
+    # identifiable sentence, and the single most common failure left after
+    # the fixes above (validator.py added a whole regex, _META_REFERENCE_RE,
+    # just to keep catching new phrasings of it) -- so it gets the same
+    # rescue rather than discarding an otherwise-clean letter over one
+    # narrated sentence.
     fixable = validation["errors"] and all(
         e.startswith(_NUMERIC_ERROR_PREFIX) or e.startswith(_TOOL_LEAK_ERROR_PREFIX)
+        or _LIFTED_SPAN_ERROR_RE.match(e) or _REPEATED_PHRASE_ERROR_RE.match(e)
+        or _SELF_TALK_ERROR_RE.match(e) or _META_REF_ERROR_RE.match(e)
         for e in validation["errors"]
     )
     if fixable:
@@ -595,15 +710,43 @@ def generate_cover_letter(
         if not (has_dear and first_line.strip().lower().startswith("dear")):
             first_line, rest = "", letter
 
-        body = strip_numbered_sentences(rest)
-
+        body = rest
+        has_numeric_error = False
+        unverified_numbers: list[str] = []
         leaked_tools: list[str] = []
+        lifted_phrases: list[str] = []
         for e in validation["errors"]:
-            if e.startswith(_TOOL_LEAK_ERROR_PREFIX):
+            if e.startswith(_NUMERIC_ERROR_PREFIX):
+                has_numeric_error = True
+                m = _NUMERIC_ERROR_RE.match(e)
+                if m:
+                    unverified_numbers.extend(n.strip() for n in m.group(1).split(",") if n.strip())
+            elif e.startswith(_TOOL_LEAK_ERROR_PREFIX):
                 tools_str = e[len(_TOOL_LEAK_ERROR_PREFIX):].strip()
                 leaked_tools.extend(t.strip() for t in tools_str.split(",") if t.strip())
+            else:
+                m = (
+                    _LIFTED_SPAN_ERROR_RE.match(e) or _REPEATED_PHRASE_ERROR_RE.match(e)
+                    or _SELF_TALK_ERROR_RE.match(e) or _META_REF_ERROR_RE.match(e)
+                )
+                if m:
+                    lifted_phrases.append(m.group(1))
+
+        if has_numeric_error:
+            # Target only the number(s) NumericGuard actually flagged when
+            # they were recoverable from the error string -- see
+            # _strip_number_sentences. A blanket every-digit strip
+            # (strip_numbered_sentences) used to run unconditionally here
+            # even for a pure tool-leak/JD-copy failure with zero numeric
+            # error, discarding any already-verified number sentence
+            # (years, headcounts) purely for sharing the letter with an
+            # unrelated violation. Only falls back to the blanket strip
+            # when NumericGuard's numbers couldn't be parsed out.
+            body = _strip_number_sentences(body, unverified_numbers) if unverified_numbers else strip_numbered_sentences(body)
         if leaked_tools:
             body = _strip_tool_sentences(body, leaked_tools)
+        if lifted_phrases:
+            body = _strip_phrase_sentences(body, lifted_phrases)
 
         stripped = f"{first_line}\n{body}" if first_line else body
         # partition() above only ever consumes the FIRST newline after the
@@ -620,6 +763,11 @@ def generate_cover_letter(
             if leaked_tools:
                 fixed_notes.append(
                     f"Leaked tool mention(s) removed by deterministic fallback: {', '.join(leaked_tools)}"
+                )
+            if lifted_phrases:
+                fixed_notes.append(
+                    "Sentence(s) copied near-verbatim from the job description or repeated "
+                    "across paragraphs removed by deterministic fallback after exhausting retries"
                 )
             stripped_validation["warnings"] = list(stripped_validation["warnings"]) + fixed_notes
             return stripped, stripped_validation

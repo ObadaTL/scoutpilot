@@ -14,6 +14,8 @@ lenient -- banned words ignored; only fabrication and required structure checked
 import re
 import logging
 
+from scoutpilot.database import derive_company, UNKNOWN_COMPANY
+
 log = logging.getLogger(__name__)
 
 
@@ -594,15 +596,31 @@ class ToolLeakViolation(Exception):
 
 
 def _company_tokens(job: dict) -> set[str]:
-    """Lowercase word tokens from the job's company name.
+    """Lowercase word tokens for everything that legitimately identifies
+    this job: the real employer name and the posting's own title.
 
-    This codebase already treats job['site'] as the company name for prompt
-    purposes (see the "COMPANY: {job['site']}" job-text block) -- the prompt
-    tells the model to name the company, so those tokens must never be
-    treated as a leaked tool (e.g. an acronym employer like IBM or SAP).
+    job['site'] alone used to be treated as "the company" here, which only
+    holds for the per-employer scrapers -- for anything scraped off an
+    aggregator board (LinkedIn, Indeed, NIJobs, ...) site is the *board*,
+    not the employer, and the real name lives in job['company'] /
+    company_summary instead (see database.derive_company). Confirmed live:
+    a cover letter correctly naming "FanDuel", "THG Ingenuity" or "Milltech
+    FX" -- exactly what the prompt tells it to do -- got flagged as a
+    leaked tool on every retry, because none of those tokens matched
+    site="linkedin"/"indeed". One job (site="linkedin", company="THG
+    Ingenuity") burned 8 attempts on this exact, deterministic false
+    positive before it was ever going to be fixed by retrying.
+
+    Also includes job['title'] tokens: a posting's own reference/programme
+    code repeated back at it (e.g. "AGGP2027" from an "AGGP2027 - Graduate
+    AI Engineer" title) is the candidate citing the job, not claiming a
+    skill, and belongs in the same exemption.
     """
-    site = str(job.get("site") or "")
-    return {w.lower() for w in re.findall(r"[A-Za-z0-9]+", site)}
+    text = str(job.get("site") or "") + " " + str(job.get("title") or "")
+    company = derive_company(job)
+    if company and company != UNKNOWN_COMPANY:
+        text += " " + company
+    return {w.lower() for w in re.findall(r"[A-Za-z0-9]+", text)}
 
 
 class ToolLeakGuard:
