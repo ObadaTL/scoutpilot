@@ -90,9 +90,9 @@
     "semantic_hash": ""
   },
   "tests/test_discovery.py": {
-    "mtime": 1790031909.864892,
-    "seen": 1790040154.262055,
-    "ast_hash": "ce1b9ea2f7b15ab0fb37d4d363be1101",
+    "mtime": 1788359778.9123595,
+    "seen": 1788360039.6787012,
+    "ast_hash": "daaabae6554931ad95a5f0a9657bbee9",
     "semantic_hash": ""
   },
   "tools/corpus/build_corpus.py": {
@@ -162,9 +162,9 @@
     "semantic_hash": ""
   },
   "src/scoutpilot/cli.py": {
-    "mtime": 1790031935.5414524,
-    "seen": 1790040154.262055,
-    "ast_hash": "5469daa2203a6da099a0f63a3fb40dc4",
+    "mtime": 1788371646.6780565,
+    "seen": 1788385972.1616898,
+    "ast_hash": "cfa39d7fce9afee6fce0365bd3e80209",
     "semantic_hash": ""
   },
   "src/scoutpilot/config.py": {
@@ -174,9 +174,9 @@
     "semantic_hash": ""
   },
   "src/scoutpilot/database.py": {
-    "mtime": 1790030626.435348,
-    "seen": 1790040154.262055,
-    "ast_hash": "53954c51c03b154210fb19d5160102ac",
+    "mtime": 1788364595.8443317,
+    "seen": 1788368719.4673545,
+    "ast_hash": "e99408292767012e1c95cb0e03d27f78",
     "semantic_hash": ""
   },
   "src/scoutpilot/discovery/__init__.py": {
@@ -186,9 +186,9 @@
     "semantic_hash": ""
   },
   "src/scoutpilot/discovery/direct_ats.py": {
-    "mtime": 1790028854.611545,
-    "seen": 1790040154.262055,
-    "ast_hash": "59f3486335797b410579286d380db3d7",
+    "mtime": 1788359778.8928392,
+    "seen": 1788360039.6787012,
+    "ast_hash": "2c475c051b6883773d5130e11ddacb4f",
     "semantic_hash": ""
   },
   "src/scoutpilot/discovery/dorking.py": {
@@ -264,9 +264,9 @@
     "semantic_hash": ""
   },
   "src/scoutpilot/scoring/cover_letter.py": {
-    "mtime": 1789476551.617266,
-    "seen": 1790040154.262055,
-    "ast_hash": "9256e3a0ffdd959ab6031b447e5b877b",
+    "mtime": 1788359778.9003472,
+    "seen": 1788360039.6787012,
+    "ast_hash": "75752e28b64699bc5636622efff9a831",
     "semantic_hash": ""
   },
   "src/scoutpilot/scoring/critic.py": {
@@ -282,9 +282,9 @@
     "semantic_hash": ""
   },
   "src/scoutpilot/scoring/scorer.py": {
-    "mtime": 1790030645.0242488,
-    "seen": 1790040154.262055,
-    "ast_hash": "a6127d1b33bd206319f47ba86dbb6c38",
+    "mtime": 1788367296.2094235,
+    "seen": 1788368719.4673545,
+    "ast_hash": "776c83e5c89ae67349bebe080d20a904",
     "semantic_hash": ""
   },
   "src/scoutpilot/scoring/tailor.py": {
@@ -294,9 +294,9 @@
     "semantic_hash": ""
   },
   "src/scoutpilot/scoring/validator.py": {
-    "mtime": 1789475344.4831216,
-    "seen": 1790040154.262055,
-    "ast_hash": "bcc208c87aed98aff07868aa34dee953",
+    "mtime": 1788369232.771556,
+    "seen": 1788385972.1616898,
+    "ast_hash": "031233920a25c105ec4f61579c4d8d43",
     "semantic_hash": ""
   },
   "src/scoutpilot/terminal_view.py": {
@@ -306,9 +306,9 @@
     "semantic_hash": ""
   },
   "src/scoutpilot/view.py": {
-    "mtime": 1790032059.7169166,
-    "seen": 1790040154.262055,
-    "ast_hash": "5bc9851d994b26fac60c1d2eb0187c6a",
+    "mtime": 1788368678.9833243,
+    "seen": 1788368719.4673545,
+    "ast_hash": "ce3f5be527fb226d0c1e05b4cef60f18",
     "semantic_hash": ""
   },
   "src/scoutpilot/wizard/__init__.py": {
@@ -360,27 +360,27 @@
     "semantic_hash": ""
   },
   "tests/test_prefilter.py": {
-    "mtime": 1790030673.5679739,
-    "seen": 1790040154.262055,
-    "ast_hash": "414ac7edfcb498f45a06e4e88a7ecafb",
+    "mtime": 1788363833.522107,
+    "seen": 1788363862.1385355,
+    "ast_hash": "620e3e8a33ce7524b47611b1fa5af659",
     "semantic_hash": ""
   },
   "src/scoutpilot/config/prefilter.yaml": {
-    "mtime": 1790027943.4558382,
-    "seen": 1790040154.262055,
-    "ast_hash": "cca8af666a3b6d84791dda2421738701",
+    "mtime": 1788363565.6719651,
+    "seen": 1788363862.1385355,
+    "ast_hash": "4c28f6af3aad297210dabd50eb86d47f",
     "semantic_hash": ""
   },
   "src/scoutpilot/discovery/cohort.py": {
-    "mtime": 1790029719.4421253,
-    "seen": 1790040154.262055,
-    "ast_hash": "4ff0ba6aa4935dddef557837513f64ef",
+    "mtime": 1788362258.4440627,
+    "seen": 1788363862.1385355,
+    "ast_hash": "7848132ae63a28d91308698b09b16e87",
     "semantic_hash": ""
   },
   "src/scoutpilot/discovery/company_pages.py": {
-    "mtime": 1790028865.8191643,
-    "seen": 1790040154.262055,
-    "ast_hash": "b84111a1d06a269fad21f989485da57c",
+    "mtime": 1788363052.4795218,
+    "seen": 1788363862.1385355,
+    "ast_hash": "7eec36e01cbe1d195aeb62f2402282f7",
     "semantic_hash": ""
   },
   "src/scoutpilot/discovery/grad_boards.py": {
@@ -390,9 +390,9 @@
     "semantic_hash": ""
   },
   "tests/test_cohort.py": {
-    "mtime": 1790029805.3725288,
-    "seen": 1790040154.262055,
-    "ast_hash": "c01eb0933bcb1a8a279ec663826d07d4",
+    "mtime": 1788362810.76622,
+    "seen": 1788363862.1385355,
+    "ast_hash": "566606705c9747ab9a3a5cbcaf3fe86c",
     "semantic_hash": ""
   },
   "tests/test_company_pages.py": {
@@ -408,9 +408,9 @@
     "semantic_hash": ""
   },
   "src/scoutpilot/config/company_pages.yaml": {
-    "mtime": 1790028884.2133403,
-    "seen": 1790040154.262055,
-    "ast_hash": "27d42dbe81376badf837d2a3122007a5",
+    "mtime": 1788363017.2405858,
+    "seen": 1788363862.1385355,
+    "ast_hash": "9572d5dea8ba2fae40a9272c20b74a7d",
     "semantic_hash": ""
   },
   "src/scoutpilot/config/grad_boards.yaml": {
@@ -429,18 +429,6 @@
     "mtime": 1788369452.9143255,
     "seen": 1788385972.1616898,
     "ast_hash": "eff26bf93e568741c808768b34cf9247",
-    "semantic_hash": ""
-  },
-  "src/scoutpilot/discovery/remote_boards.py": {
-    "mtime": 1790028605.191885,
-    "seen": 1790040154.262055,
-    "ast_hash": "25317fb0d1f2cd51c276eeef0fe63dc7",
-    "semantic_hash": ""
-  },
-  "src/scoutpilot/discovery/targetjobs.py": {
-    "mtime": 1790031877.695918,
-    "seen": 1790040154.262055,
-    "ast_hash": "b5c560ee2ae0fdb86ba0472fb79126bd",
     "semantic_hash": ""
   }
 }
