@@ -27,7 +27,7 @@ def _make_source(tmp_path):
     db.execute("PRAGMA journal_mode=WAL")
     db.execute("CREATE TABLE jobs (url TEXT PRIMARY KEY, tailored_resume_path TEXT, cover_letter_path TEXT)")
     db.executemany("INSERT INTO jobs VALUES (?,?,?)", [
-        ("u1", r"C:\Users\obada\.applypilot\tailored_resumes\a.txt", r"C:\Users\obada\.applypilot\cover_letters\a_CL.txt"),
+        ("u1", r"C:\Users\someone\.applypilot\tailored_resumes\a.txt", r"C:\Users\someone\.applypilot\cover_letters\a_CL.txt"),
         ("u2", "/home/old/.applypilot/tailored_resumes/sub/b.txt", None),
         ("u3", None, None),
     ])
