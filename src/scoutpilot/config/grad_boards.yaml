@@ -21,7 +21,7 @@ grad_boards:
     max_pages: 2
 
   gradireland:
-    enabled: true
+    enabled: false          # 2026-09-30: Republic of Ireland board; search is NI-only now
     base_url: "https://gradireland.com"
     list_paths:
       - "/s/jobs/all"

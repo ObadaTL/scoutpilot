@@ -283,15 +283,20 @@ def discover(
     workday: bool = typer.Option(False, "--workday", help="Run Workday corporate scraper."),
     remote_boards: bool = typer.Option(False, "--remote", help="Run remote-first board harvesters (remote.com, WeWorkRemotely)."),
     targetjobs: bool = typer.Option(False, "--targetjobs", help="Run the targetjobs.co.uk graduate-board harvester (sitemap-based)."),
+    builtinbelfast: bool = typer.Option(False, "--builtinbelfast", help="Run the Built In Belfast (builtinbelfast.uk) harvester."),
+    ni: bool = typer.Option(False, "--ni", help="Northern Ireland only: JobSpy (Belfast/NI), NIJobs, Built In Belfast and NI company pages. Skips UK-wide and remote channels."),
     all_channels: bool = typer.Option(False, "--all", "-a", help="Run all discovery channels."),
     workers: int = typer.Option(4, "--workers", "-w", help="Number of worker threads."),
 ) -> None:
     """Run specific or all discovery harvesters to find jobs, graduate schemes, and funded training."""
     _bootstrap()
 
+    if ni:
+        companies = gradboards = jobspy = builtinbelfast = True
+
     run_all = all_channels or not (
         ats or hn or schemes or companies or gradboards or dorking or jobspy or workday
-        or remote_boards or targetjobs
+        or remote_boards or targetjobs or builtinbelfast
     )
 
     console.print("\n[bold blue]Starting Opportunity Discovery[/bold blue]\n")
@@ -358,7 +363,69 @@ def discover(
         res = run_targetjobs_discovery()
         console.print(f"  [green]targetjobs Result:[/green] {res.get('new', 0)} new / {res.get('total_found', 0)} found")
 
+    if run_all or builtinbelfast:
+        console.print("[cyan]Running Built In Belfast Harvester...[/cyan]")
+        from scoutpilot.discovery.builtinbelfast import run_builtinbelfast_discovery
+        res = run_builtinbelfast_discovery(workers=workers)
+        console.print(f"  [green]Built In Belfast Result:[/green] {res.get('new', 0)} new / {res.get('total_found', 0)} tech of {res.get('listed', 0)} listed")
+
     console.print("\n[bold green]Discovery complete. Check status with `scoutpilot status`.[/bold green]\n")
+
+
+@app.command("export")
+def export_cmd(
+    out: Optional[str] = typer.Option(None, "--out", "-o", help="Output .zip path or folder (default: ./scoutpilot-export-<date>.zip)."),
+    include_env: bool = typer.Option(False, "--include-env", help="Also bundle ~/.applypilot/.env (contains API keys; off by default)."),
+) -> None:
+    """Pack your database, CV/profile/config and generated files into one zip for another PC."""
+    from pathlib import Path
+    from scoutpilot.config import APP_DIR
+    from scoutpilot.facts import FACTS_PATH
+    from scoutpilot.transfer import TransferError, export_bundle
+
+    try:
+        path, m = export_bundle(APP_DIR, FACTS_PATH.parent, Path(out) if out else None, include_env)
+    except TransferError as e:
+        console.print(f"[red]{e}[/red]")
+        raise typer.Exit(1)
+    size = path.stat().st_size / 1_048_576
+    console.print(f"[green]Exported {m['jobs']} jobs, {m['files']} files ({size:.0f} MB):[/green] {path}")
+    console.print("[yellow]This zip contains your CV, profile and job history -- keep it private.[/yellow]")
+    if not include_env:
+        console.print("[dim].env not included; set LLM_URL / LLM_MODEL on the other PC (or re-export with --include-env).[/dim]")
+
+
+@app.command("import")
+def import_cmd(
+    bundle: str = typer.Argument(..., help="Zip made by `scoutpilot export`."),
+    yes: bool = typer.Option(False, "--yes", "-y", help="Skip the confirmation prompt."),
+    overwrite_env: bool = typer.Option(False, "--overwrite-env", help="Replace an existing .env with the bundled one."),
+) -> None:
+    """Restore an export on this PC, replacing the local database. Close any running scoutpilot first."""
+    from pathlib import Path
+    from scoutpilot.config import APP_DIR
+    from scoutpilot.facts import FACTS_PATH
+    from scoutpilot.transfer import TransferError, import_bundle, read_manifest
+
+    zip_path = Path(bundle)
+    try:
+        m = read_manifest(zip_path)
+    except (TransferError, FileNotFoundError) as e:
+        console.print(f"[red]{e}[/red]")
+        raise typer.Exit(1)
+    console.print(f"Bundle from {m['created_at']} (commit {m.get('source_commit') or '?'}): {m['jobs']} jobs, {m['files']} files.")
+    console.print(f"This REPLACES {APP_DIR / 'applypilot.db'}; the old copy goes to {APP_DIR}/import-backup-*/.")
+    if not yes and not typer.confirm("Continue?"):
+        raise typer.Abort()
+    try:
+        s = import_bundle(zip_path, APP_DIR, FACTS_PATH.parent, overwrite_env)
+    except TransferError as e:
+        console.print(f"[red]{e}[/red]")
+        raise typer.Exit(1)
+    console.print(f"[green]Imported {s['files']} files; {s['paths_rewritten']} CV/cover-letter paths re-pointed to {APP_DIR}.[/green]")
+    console.print(f".env: {s['env']}")
+    if s["backup"]:
+        console.print(f"Previous files saved to {s['backup']}")
 
 
 @app.command()
